@@ -163,7 +163,31 @@ bait-print-agent --help                 # Muestra ayuda
 
 ## Distribución (Windows .exe)
 
-El agente se distribuye como un **single binary** `bait-print-agent-win-x64.exe` (~80 MB) generado con [Node.js Single Executable Applications (SEA)](https://nodejs.org/api/single-executable-applications.html). No requiere Node instalado en la PC del cliente.
+El agente se distribuye en dos formatos:
+
+- **Instalador con UI** (`bait-print-agent-setup.exe`) — recomendado para clientes finales. Wizard en español, copia el binario a `Program Files`, lo registra como servicio Windows y lo arranca. Pide el código de pairing en una página del wizard, no en la consola.
+- **Binario pelado** (`bait-print-agent-win-x64.exe`, ~83 MB) — recomendado para integradores que quieran instalar el agente desde un script. Single binary generado con [Node.js Single Executable Applications (SEA)](https://nodejs.org/api/single-executable-applications.html). No requiere Node instalado.
+
+---
+
+## Instalación (cliente final)
+
+### Opción A: Instalador con UI (recomendado)
+
+1. Desde **bait-app.cl → Configuración → Impresoras → "+ Conectar nueva impresora"**, copia el código de 8 caracteres.
+2. Descarga `bait-print-agent-setup.exe` desde el modal (botón "Descargar instalador").
+3. Doble click → wizard en español:
+   - Elegí carpeta de instalación (por defecto `C:\Program Files\bAIt Print Agent\`).
+   - Marca "Configurar ahora".
+   - Pega el código `XXXX-XXXX`.
+   - Click "Instalar".
+4. El instalador configura el agente, lo registra como servicio Windows y lo arranca. Volvé a bait-app.cl y refrescá — el agente aparece con badge verde "online".
+
+> El instalador no está firmado todavía (Sprint 3c). SmartScreen te va a mostrar "Windows protegió tu PC" la primera vez — click en **Más información → Ejecutar de todos modos**.
+
+### Opción B: Binario pelado (avanzado / scripted)
+
+Para instalaciones via script o cuando preferís manejar el servicio a mano:
 
 ### 1. Descargar
 
@@ -266,13 +290,27 @@ Para actualizar:
 
 ### 6. Build local del .exe (sólo para desarrolladores)
 
+#### Binario pelado
+
 ```powershell
 npm install
 npm run package:win
 # Output: dist/bait-print-agent-win-x64.exe
 ```
 
-Sólo funciona en Windows (Node SEA inyecta el blob en un `node.exe`, no se puede cross-compilar). Para builds reproducibles, el flujo oficial es CI via GitHub Actions con un tag `v*.*.*`.
+Sólo funciona en Windows (Node SEA inyecta el blob en un `node.exe`, no se puede cross-compilar).
+
+#### Instalador con UI
+
+Pre-requisito: [Inno Setup 6.4+](https://jrsoftware.org/isdl.php) instalado.
+
+```powershell
+npm run package:win
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /Q /DVersion=0.3.0 scripts\bait-print-agent.iss
+# Output: dist\Output\bait-print-agent-setup-0.3.0.exe
+```
+
+El script `.iss` está en `scripts/bait-print-agent.iss`. Para builds reproducibles, el flujo oficial es CI vía GitHub Actions con un tag `v*.*.*` — el workflow corre ambos pasos y sube los dos artefactos al release.
 
 ---
 

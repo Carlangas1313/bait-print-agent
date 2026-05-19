@@ -1,6 +1,6 @@
 {
   "name": "bait-print-agent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Agente local que escucha la cola de impresión de bait-pos y manda comandas a impresoras térmicas vía ESC/POS. V0.1: modo console (stdout) sin USB todavía.",
   "engines": {

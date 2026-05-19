@@ -66,6 +66,52 @@ jobs:
             Write-Warning "El output de --version no matchea el tag, pero seguimos."
           }
 
+      - name: Compute version (strip v prefix)
+        id: version
+        shell: pwsh
+        # github.ref_name viene como "v0.3.0"; Inno Setup recibe "0.3.0".
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          Write-Host "version: $v"
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build installer with Inno Setup
+        # Inno Setup 6.x viene pre-instalado en windows-latest runners desde 2023.
+        # /Q = quiet (sin output del compiler), /D para pasar variables al .iss.
+        # Output cae en dist\Output\bait-print-agent-setup-X.Y.Z.exe (configurado
+        # con OutputDir + OutputBaseFilename en el .iss).
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup no esta preinstalado, instalando con choco..."
+            choco install innosetup -y --no-progress
+          }
+          & $iscc /Q /DVersion=${{ steps.version.outputs.version }} scripts\bait-print-agent.iss
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "ISCC fallo con exit code $LASTEXITCODE"
+            exit 1
+          }
+
+      - name: Copy installer to non-versioned filename for /latest/ URL
+        # GitHub Releases /releases/latest/download/<file> requiere un nombre
+        # fijo. Copiamos el versionado a un alias sin version para que el modal
+        # de bait-pos pueda apuntar a un URL estable.
+        shell: pwsh
+        run: |
+          $versioned = "dist\Output\bait-print-agent-setup-${{ steps.version.outputs.version }}.exe"
+          $alias = "dist\Output\bait-print-agent-setup.exe"
+          if (-not (Test-Path $versioned)) {
+            Write-Error "No existe $versioned — el Inno Setup no genero el output esperado."
+            exit 1
+          }
+          Copy-Item -Path $versioned -Destination $alias -Force
+          Write-Host "Copy OK: $alias"
+
+      - name: List release artifacts
+        shell: cmd
+        run: dir dist\ /B & dir dist\Output\ /B
+
       - name: Compute SHA256
         shell: pwsh
         run: |
@@ -82,26 +128,30 @@ jobs:
           draft: false
           prerelease: false
           files: |
+            dist/Output/bait-print-agent-setup-${{ steps.version.outputs.version }}.exe
+            dist/Output/bait-print-agent-setup.exe
             dist/bait-print-agent-win-x64.exe
             dist/bait-print-agent-win-x64.exe.sha256
           body: |
             ## bait-print-agent ${{ github.ref_name }}
 
-            Single-executable build para Windows x64 generado con Node SEA.
+            ### Instalador con UI (recomendado)
 
-            ### Descargar e instalar
+            Doble click en `bait-print-agent-setup.exe` → wizard en espanol →
+            pega el codigo de 8 caracteres que te dio bait-app.cl. El instalador
+            registra el agente como servicio Windows y lo arranca automaticamente.
 
-            1. Descarga `bait-print-agent-win-x64.exe` desde los assets de abajo.
-            2. Guardalo en `C:\bait-print-agent\` (o donde quieras).
-            3. Windows SmartScreen va a quejarse en el primer download (sin firma todavia).
-               - Click derecho en el .exe -> Propiedades -> marca "Desbloquear".
-               - O ejecuta y eligi "Mas informacion -> Ejecutar de todos modos".
-            4. Abri PowerShell en esa carpeta y corre:
-               ```
-               .\bait-print-agent-win-x64.exe setup --code XXXX-XXXX
-               ```
+            ### Binario pelado (avanzado / scripted)
 
-            Mas detalles en el README del repo.
+            Si necesitas integrar el agente en un script o lo queres correr sin
+            el wizard, descarga `bait-print-agent-win-x64.exe` y segui las
+            instrucciones del [README](https://github.com/Carlangas1313/bait-print-agent#opci%C3%B3n-b-binario-pelado-avanzado--scripted).
+
+            ### Windows SmartScreen
+
+            El .exe todavia no esta firmado (Sprint 3c). SmartScreen te va a
+            mostrar "Windows protegio tu PC" la primera vez:
+            - Click en **Mas informacion** -> **Ejecutar de todos modos**.
 
             ### Verificar integridad
 
