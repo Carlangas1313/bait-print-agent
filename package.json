@@ -1,0 +1,30 @@
+{
+  "name": "bait-print-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agente local que escucha la cola de impresión de bait-pos y manda comandas a impresoras térmicas vía ESC/POS. V0.1: modo console (stdout) sin USB todavía.",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts -- --mode console",
+    "start": "node dist/index.js",
+    "start:console": "node dist/index.js --mode console",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.46.1",
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.3.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  },
+  "author": "Carlos Olivares <carlos.xyme@gmail.com>",
+  "license": "UNLICENSED"
+}
