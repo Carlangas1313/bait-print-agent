@@ -48,6 +48,21 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Download NSSM x64
+        # NSSM (Non-Sucking Service Manager) es el wrapper estandar para
+        # correr binarios Node.js como servicios Windows. El install-service
+        # del agente lo usa por debajo. Lo dejamos en vendor/nssm.exe ANTES
+        # de correr package:win (que lo copia a dist/).
+        shell: pwsh
+        run: |
+          $nssmZip = "$env:RUNNER_TEMP/nssm.zip"
+          Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $nssmZip
+          Expand-Archive -Path $nssmZip -DestinationPath "$env:RUNNER_TEMP/nssm" -Force
+          New-Item -ItemType Directory -Path "vendor" -Force | Out-Null
+          Copy-Item "$env:RUNNER_TEMP/nssm/nssm-2.24/win64/nssm.exe" "vendor/nssm.exe" -Force
+          $sizeKB = ((Get-Item vendor/nssm.exe).Length / 1KB).ToString('F1')
+          Write-Host "NSSM x64 listo en vendor/nssm.exe ($sizeKB KB)"
+
       - name: Package for Windows
         run: npm run package:win
 

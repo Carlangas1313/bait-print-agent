@@ -310,6 +310,14 @@ Más detalles en la sección [Setup](#setup) de arriba.
 
 El agente puede correr como servicio Windows que arranca automáticamente al prender la PC. Esto es lo recomendado para producción — el cliente no tiene que abrir nada manualmente.
 
+> El instalador usa **NSSM (Non-Sucking Service Manager)** por debajo para
+> wrappear el .exe Node.js como servicio Windows válido. Sin NSSM, Windows
+> mata al servicio con error 1053 al arrancar porque Node.js no implementa
+> el protocolo nativo del Service Control Manager. NSSM también captura los
+> logs del agente a `%USERPROFILE%\.bait-print-agent\logs\` con rotación
+> automática cada 1 MB, así si algo falla podés ver el error sin tener que
+> correr el agente en foreground.
+
 #### Setup automático (recomendado)
 
 1. Abrí CMD o PowerShell **como Administrador** (click derecho → "Ejecutar como administrador").
@@ -333,6 +341,21 @@ bait-print-agent-win-x64.exe uninstall-service
 ```
 
 (necesita CMD/PowerShell como Administrador)
+
+#### Ver los logs del servicio
+
+Los logs se guardan en `%USERPROFILE%\.bait-print-agent\logs\`:
+
+- `stdout.log` — logs normales (info, debug).
+- `stderr.log` — errores.
+
+Cada archivo rota cuando llega a 1 MB. Las versiones rotadas se quedan como `stdout.log.1`, `stdout.log.2`, etc.
+
+Para ver los logs en vivo (tail):
+
+```cmd
+powershell -Command "Get-Content '%USERPROFILE%\.bait-print-agent\logs\stdout.log' -Wait -Tail 20"
+```
 
 ### 5. Actualizar el agente
 

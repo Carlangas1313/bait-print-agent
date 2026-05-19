@@ -34,6 +34,8 @@ const SEA_CONFIG = path.join(ROOT, 'sea-config.json');
 const SEA_BLOB = path.join(DIST, 'sea-prep.blob');
 const OUTPUT_EXE = path.join(DIST, 'bait-print-agent-win-x64.exe');
 const SENTINEL_FUSE = 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2';
+const NSSM_SRC = path.join(ROOT, 'vendor', 'nssm.exe');
+const NSSM_DEST = path.join(DIST, 'nssm.exe');
 
 function log(msg) {
   process.stdout.write(`[package-win] ${msg}\n`);
@@ -148,7 +150,32 @@ function injectBlob() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Verificar resultado
+// 6. Copiar nssm.exe al lado del binario empaquetado
+// ---------------------------------------------------------------------------
+// Por que: el install-service del agente usa NSSM (Non-Sucking Service Manager)
+// para wrappear el .exe Node como servicio Windows valido. El install-service
+// busca nssm.exe en path.dirname(process.execPath), asi que tiene que viajar
+// junto al .exe. Lo dejamos en dist/ para que Inno Setup lo copie en su [Files].
+//
+// El binario NSSM vive en vendor/nssm.exe; en CI lo descarga el workflow,
+// en dev local hay que bajarlo a mano (instrucciones en el README).
+function copyNssm() {
+  if (!fs.existsSync(NSSM_SRC)) {
+    log(
+      `[WARN] vendor/nssm.exe NO encontrado. El install-service NO va a funcionar en clientes finales. ` +
+        `Descarga nssm-2.24 desde https://nssm.cc/release/nssm-2.24.zip y coloca win64/nssm.exe en vendor/nssm.exe, ` +
+        `o agrega el step "Download NSSM" al workflow de CI.`
+    );
+    return;
+  }
+
+  fs.copyFileSync(NSSM_SRC, NSSM_DEST);
+  const nssmSize = (fs.statSync(NSSM_DEST).size / 1024).toFixed(1);
+  log(`nssm.exe copiado a dist/ (${nssmSize} KB)`);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Verificar resultado
 // ---------------------------------------------------------------------------
 function verifyOutput() {
   const finalSize = fs.statSync(OUTPUT_EXE).size;
@@ -173,6 +200,7 @@ function main() {
   generateBlob();
   copyNodeBinary();
   injectBlob();
+  copyNssm();
   verifyOutput();
 }
 

@@ -10,3 +10,7 @@ dist/
 
 # SEA packaging artifacts (regenerados por scripts/package-win.js)
 sea-config.json
+
+# NSSM binary descargado por el CI o manualmente en dev. No lo trackeamos
+# para evitar bloat del repo — el workflow lo baja de nssm.cc cada release.
+vendor/

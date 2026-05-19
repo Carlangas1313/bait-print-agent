@@ -71,6 +71,11 @@ Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 ; queda mas prolijo en services.msc y en los shortcuts.
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: ignoreversion
 
+; nssm.exe (Non-Sucking Service Manager) — wrapper que el install-service
+; del agente usa por debajo para registrar el .exe Node como servicio Windows
+; valido. Sin esto el servicio crashea con error 1053 al arrancar. ~300 KB.
+Source: "..\dist\nssm.exe"; DestDir: "{app}"; Flags: ignoreversion
+
 [Icons]
 ; Atajo principal: ejecuta el agente en modo virtual para que el cliente pueda
 ; mirar las comandas en una ventana sin tocar el servicio. Util para troubleshooting.
