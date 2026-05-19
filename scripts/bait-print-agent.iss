@@ -157,9 +157,12 @@ begin
   end;
   if Length(CleanCode) <> 8 then
     Exit;
+  // Uppercase del string completo en una sola pasada (Pascal Script de
+  // Inno expone Uppercase: String -> String, no tiene UpCase de Char).
+  CleanCode := Uppercase(CleanCode);
   for I := 1 to Length(CleanCode) do
   begin
-    Ch := UpCase(CleanCode[I]);
+    Ch := CleanCode[I];
     // [A-Z2-9] — letras + digitos sin 0 ni 1.
     if not (((Ch >= 'A') and (Ch <= 'Z'))
          or ((Ch >= '2') and (Ch <= '9'))) then
@@ -180,8 +183,9 @@ begin
   begin
     Ch := Code[I];
     if (Ch <> '-') and (Ch <> ' ') and (Ch <> #9) then
-      Clean := Clean + UpCase(Ch);
+      Clean := Clean + Ch;
   end;
+  Clean := Uppercase(Clean);
   if Length(Clean) = 8 then
     Result := Copy(Clean, 1, 4) + '-' + Copy(Clean, 5, 4)
   else
