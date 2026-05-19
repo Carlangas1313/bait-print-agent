@@ -19,6 +19,56 @@ import {
   getConfigPath,
   readPersistentConfig
 } from './persistent-config.js';
+import {
+  installService,
+  uninstallService,
+  serviceStatus
+} from './install-service.js';
+import {
+  checkForUpdates,
+  startPeriodicUpdateCheck
+} from './update-checker.js';
+
+/**
+ * Repo de GitHub donde publicamos los .exe. Hardcodeado porque el
+ * binario distribuido al cliente no tiene env vars que lo cambien.
+ * Si algun dia migramos a otra org, hay que tocar este valor y volver
+ * a buildear.
+ */
+const UPDATE_CHECK_REPO = 'Carlangas1313/bait-print-agent';
+
+/**
+ * Default del intervalo de check de updates en minutos. Overridable
+ * via env var `UPDATE_CHECK_INTERVAL_MINUTES`. 60 = una vez por hora,
+ * suficiente para que el usuario se entere "en el dia" sin spamear
+ * la API publica de GitHub (60 reqs/h sin auth).
+ */
+const DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES = 60;
+
+/**
+ * Lee el intervalo del env var con default fallback. Si el valor no
+ * parsea como int positivo, ignoramos y usamos el default — no queremos
+ * que un typo en la config tumbe el agente.
+ */
+function readUpdateCheckIntervalMinutes(): number {
+  const raw = process.env.UPDATE_CHECK_INTERVAL_MINUTES;
+  if (!raw) return DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES;
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 1) {
+    return DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES;
+  }
+  return parsed;
+}
+
+/**
+ * Permite desactivar el checker via `UPDATE_CHECK_ENABLED=false`.
+ * Cualquier otro valor (incluyendo unset) lo deja activo. Es opt-out
+ * porque queremos que el cliente final reciba avisos por default.
+ */
+function isUpdateCheckEnabled(): boolean {
+  const raw = process.env.UPDATE_CHECK_ENABLED?.trim().toLowerCase();
+  return raw !== 'false' && raw !== '0' && raw !== 'no';
+}
 
 /**
  * Entry point del agente. Construido con commander para que los
@@ -140,6 +190,108 @@ program
   });
 
 // -------------------------------------------------------------------
+// Comando: install-service
+// -------------------------------------------------------------------
+program
+  .command('install-service')
+  .description('Instala el agente como servicio Windows (arranca al boot)')
+  .option('--exe-path <path>', 'Path al .exe (default: auto-detectado)')
+  .option('--name <name>', 'Nombre interno del servicio', 'bAItPrintAgent')
+  .option('--display <name>', 'Nombre visible del servicio', 'bAIt Print Agent')
+  .action(async (opts: { exePath?: string; name: string; display: string }) => {
+    const logger = createLogger('info');
+    try {
+      await installService({
+        exePath: opts.exePath,
+        serviceName: opts.name,
+        serviceDisplay: opts.display,
+        logger
+      });
+      process.exit(0);
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        'install-service fallo'
+      );
+      process.exit(1);
+    }
+  });
+
+// -------------------------------------------------------------------
+// Comando: uninstall-service
+// -------------------------------------------------------------------
+program
+  .command('uninstall-service')
+  .description('Desinstala el servicio Windows del agente')
+  .option('--name <name>', 'Nombre del servicio', 'bAItPrintAgent')
+  .action(async (opts: { name: string }) => {
+    const logger = createLogger('info');
+    try {
+      await uninstallService({ serviceName: opts.name, logger });
+      process.exit(0);
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        'uninstall-service fallo'
+      );
+      process.exit(1);
+    }
+  });
+
+// -------------------------------------------------------------------
+// Comando: service-status
+// -------------------------------------------------------------------
+program
+  .command('service-status')
+  .description('Muestra el estado del servicio Windows del agente')
+  .option('--name <name>', 'Nombre del servicio', 'bAItPrintAgent')
+  .action(async (opts: { name: string }) => {
+    const logger = createLogger('info');
+    try {
+      await serviceStatus({ serviceName: opts.name, logger });
+      process.exit(0);
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        'service-status fallo'
+      );
+      process.exit(1);
+    }
+  });
+
+// -------------------------------------------------------------------
+// Comando: check-updates
+// -------------------------------------------------------------------
+program
+  .command('check-updates')
+  .description('Chequea si hay una version nueva del agente disponible')
+  .action(async () => {
+    const logger = createLogger('info');
+    const update = await checkForUpdates({
+      currentVersion: AGENT_VERSION,
+      repo: UPDATE_CHECK_REPO,
+      logger
+    });
+    if (update) {
+      logger.info(
+        {
+          currentVersion: AGENT_VERSION,
+          latestVersion: update.latestVersion,
+          releaseUrl: update.releaseUrl,
+          downloadUrl: update.downloadUrl,
+          publishedAt: update.publishedAt
+        },
+        `🆕 Hay una version nueva disponible: v${update.latestVersion} (actual: v${AGENT_VERSION}). ` +
+          `Ver detalles en ${update.releaseUrl}`
+      );
+      process.exit(0);
+    } else {
+      logger.info(`Version actual al dia (v${AGENT_VERSION})`);
+      process.exit(0);
+    }
+  });
+
+// -------------------------------------------------------------------
 // Comando default: arrancar el agente
 // -------------------------------------------------------------------
 program
@@ -248,6 +400,24 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
 
   const heartbeatId = startHeartbeat(supabase, config, logger);
 
+  // ------------------------------------------------------------------
+  // Update checker: polling cada UPDATE_CHECK_INTERVAL_MINUTES (default 60)
+  // contra GitHub Releases. Si la env var `UPDATE_CHECK_ENABLED=false`,
+  // ni siquiera arrancamos el setInterval — algunos clientes muy paranoicos
+  // pueden querer cortar todo trafico saliente fuera de Supabase.
+  // ------------------------------------------------------------------
+  let updateCheckerId: NodeJS.Timeout | null = null;
+  if (isUpdateCheckEnabled()) {
+    updateCheckerId = startPeriodicUpdateCheck({
+      intervalMinutes: readUpdateCheckIntervalMinutes(),
+      currentVersion: AGENT_VERSION,
+      repo: UPDATE_CHECK_REPO,
+      logger
+    });
+  } else {
+    logger.info('Update checker deshabilitado (UPDATE_CHECK_ENABLED=false)');
+  }
+
   const channel = await startRealtimeListener(
     supabase,
     config,
@@ -256,7 +426,7 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
   );
 
   // ------------------------------------------------------------------
-  // Cleanup ordenado: paramos heartbeat, cerramos canal, salimos.
+  // Cleanup ordenado: paramos heartbeat, update checker, cerramos canal, salimos.
   // ------------------------------------------------------------------
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -264,6 +434,7 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, 'Shutting down gracefully');
     clearInterval(heartbeatId);
+    if (updateCheckerId) clearInterval(updateCheckerId);
     try {
       await supabase.removeChannel(channel);
     } catch (err) {

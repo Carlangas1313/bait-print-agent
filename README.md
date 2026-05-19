@@ -210,34 +210,61 @@ Más detalles en la sección [Setup](#setup) de arriba.
 
 ### 4. Instalar como servicio Windows
 
-Por ahora (Sprint 3a) la instalación es manual. Dos opciones:
+El agente puede correr como servicio Windows que arranca automáticamente al prender la PC. Esto es lo recomendado para producción — el cliente no tiene que abrir nada manualmente.
 
-**Opción A: `sc.exe` (servicio nativo de Windows)**
+#### Setup automático (recomendado)
 
-```powershell
-# Como Administrador (servicios requieren elevation):
-sc.exe create bAItPrintAgent binPath= "C:\bait-print-agent\bait-print-agent-win-x64.exe" start= auto DisplayName= "bAIt Print Agent"
-sc.exe description bAItPrintAgent "Agente local de impresion de bait-pos"
-sc.exe start bAItPrintAgent
+1. Abrí CMD o PowerShell **como Administrador** (click derecho → "Ejecutar como administrador").
+2. Navega a la carpeta donde está el .exe (ej. `cd C:\Users\TU_USUARIO\Downloads`).
+3. Ejecutá:
+   ```cmd
+   bait-print-agent-win-x64.exe install-service
+   ```
+4. Listo. El agente arranca solo desde ahora.
+
+#### Verificar estado
+
+```cmd
+bait-print-agent-win-x64.exe service-status
 ```
 
-Para desinstalar:
+#### Desinstalar
 
-```powershell
-sc.exe stop bAItPrintAgent
-sc.exe delete bAItPrintAgent
+```cmd
+bait-print-agent-win-x64.exe uninstall-service
 ```
 
-**Opción B: Programador de tareas (más simple si no necesitás autostart en boot)**
+(necesita CMD/PowerShell como Administrador)
 
-1. Abrí "Programador de tareas" (taskschd.msc).
-2. Crear tarea → Disparador: "Al iniciar sesión".
-3. Acción: iniciar programa → ruta al .exe.
-4. Configuración → marca "Ejecutar tarea lo antes posible si se omite el inicio programado".
+### 5. Actualizar el agente
 
-> **TODO Sprint 3c:** comando `bait-print-agent install-service` que automatiza todo esto (probablemente con [NSSM](https://nssm.cc/) bundleado o `sc.exe` directo). Por ahora son 5 líneas a mano.
+El agente chequea automáticamente cada hora si hay una versión nueva en GitHub Releases. Si la hay, te avisa en los logs con el link de descarga.
 
-### 5. Build local del .exe (sólo para desarrolladores)
+Para chequear manualmente:
+
+```cmd
+bait-print-agent-win-x64.exe check-updates
+```
+
+Para actualizar:
+
+1. `bait-print-agent-win-x64.exe uninstall-service` (como admin)
+2. Descargar el .exe nuevo del link que apareció en los logs.
+3. Reemplazar el archivo viejo por el nuevo.
+4. `bait-print-agent-win-x64.exe install-service` (como admin)
+
+(El reemplazo automático del .exe llega en versiones posteriores.)
+
+#### Variables de entorno opcionales
+
+| Variable | Default | Notas |
+|---|---|---|
+| `UPDATE_CHECK_INTERVAL_MINUTES` | `60` | Cada cuántos minutos chequear (mínimo 1) |
+| `UPDATE_CHECK_ENABLED` | `true` | Setear a `false` desactiva el checker completo |
+
+> ⚠️ Si el repo `Carlangas1313/bait-print-agent` es privado, la API pública de GitHub responde 404 sin auth y el agente loguea un warning (una sola vez por arranque, no en cada check). En ese caso el aviso de updates no funciona hasta que el repo sea público o agreguemos soporte para tokens.
+
+### 6. Build local del .exe (sólo para desarrolladores)
 
 ```powershell
 npm install
@@ -263,7 +290,7 @@ Sólo funciona en Windows (Node SEA inyecta el blob en un `node.exe`, no se pued
 **Sprint 3c (después):**
 - Firma del .exe con certificado EV → desaparece el warning de SmartScreen.
 - `bait-print-agent install-service` para auto-instalación como servicio Windows.
-- Auto-update via GitHub Releases checks.
+- ✅ Aviso automático de updates (polling a GitHub Releases, log con link de descarga). El reemplazo del .exe sigue siendo manual.
 
 **Sprint 4:**
 - Integración SimpleAPI/OpenFactura para emisión DTE (boleta SII real).
