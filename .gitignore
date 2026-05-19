@@ -11,6 +11,6 @@ dist/
 # SEA packaging artifacts (regenerados por scripts/package-win.js)
 sea-config.json
 
-# NSSM binary descargado por el CI o manualmente en dev. No lo trackeamos
-# para evitar bloat del repo — el workflow lo baja de nssm.cc cada release.
-vendor/
+# vendor/nssm.exe se commitea (~325 KB, public domain NSSM 2.24, sin
+# updates desde 2014). Lo committeamos en lugar de descargar del CI
+# para no depender de la disponibilidad de nssm.cc.

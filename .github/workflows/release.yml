@@ -48,20 +48,20 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Download NSSM x64
-        # NSSM (Non-Sucking Service Manager) es el wrapper estandar para
-        # correr binarios Node.js como servicios Windows. El install-service
-        # del agente lo usa por debajo. Lo dejamos en vendor/nssm.exe ANTES
-        # de correr package:win (que lo copia a dist/).
+      - name: Verify NSSM is vendored
+        # NSSM (Non-Sucking Service Manager) viene commiteado en vendor/nssm.exe
+        # del repo. Es ~325 KB, public domain, sin updates desde 2014. Lo
+        # commiteamos en lugar de descargarlo del CI para no depender de la
+        # disponibilidad de nssm.cc (que se cayo en el primer intento de
+        # release v0.5.1 con HTTP 503).
         shell: pwsh
         run: |
-          $nssmZip = "$env:RUNNER_TEMP/nssm.zip"
-          Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $nssmZip
-          Expand-Archive -Path $nssmZip -DestinationPath "$env:RUNNER_TEMP/nssm" -Force
-          New-Item -ItemType Directory -Path "vendor" -Force | Out-Null
-          Copy-Item "$env:RUNNER_TEMP/nssm/nssm-2.24/win64/nssm.exe" "vendor/nssm.exe" -Force
+          if (-not (Test-Path vendor/nssm.exe)) {
+            Write-Error "vendor/nssm.exe no esta en el repo. Verifica que este commiteado."
+            exit 1
+          }
           $sizeKB = ((Get-Item vendor/nssm.exe).Length / 1KB).ToString('F1')
-          Write-Host "NSSM x64 listo en vendor/nssm.exe ($sizeKB KB)"
+          Write-Host "NSSM x64 vendored OK ($sizeKB KB)"
 
       - name: Package for Windows
         run: npm run package:win
