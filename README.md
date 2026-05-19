@@ -124,12 +124,16 @@ Deberías ver:
 ## Comandos CLI
 
 ```
-bait-print-agent --mode <console|usb>   # Modo de operación (default: console)
-bait-print-agent --version              # Imprime versión y sale
-bait-print-agent --help                 # Muestra ayuda
+bait-print-agent --mode <console|virtual|usb>   # Modo de operación (default: console)
+bait-print-agent --version                      # Imprime versión y sale
+bait-print-agent --help                         # Muestra ayuda
 ```
 
-`--mode usb` no está implementado todavía (Sprint 3). Pasarlo loguea un warning y cae a `console`.
+Modos:
+
+- `console`: vuelca cada ticket a stdout (32 chars de ancho, ASCII). Útil para dev y CI.
+- `virtual`: escribe los tickets a `~/bait-print-out/<fecha>/<hora>-<tipo>-<id>.txt`. Útil para QA visual sin hardware.
+- `usb`: imprime en impresoras térmicas físicas configuradas en bait-app.cl vía driver ESC/POS (`node-thermal-printer`). Soporta USB (cola Windows compartida), LAN (TCP 9100) y Bluetooth (COM port virtual). Ver sección **Modo USB / LAN** más abajo.
 
 ---
 
@@ -142,9 +146,10 @@ bait-print-agent --help                 # Muestra ayuda
 | `BAIT_AGENT_ID` | — | UUID de la fila en `print_agents` |
 | `BAIT_RESTAURANT_ID` | — | UUID del restaurant que atiende |
 | `BAIT_LOCATION_ID` | — | UUID de la location |
-| `BAIT_AGENT_MODE` | `console` | `console` o `usb` (USB no implementado) |
+| `BAIT_AGENT_MODE` | `console` | `console`, `virtual` o `usb` |
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `HEARTBEAT_INTERVAL_SECONDS` | `30` | Cada cuánto actualizar `last_seen_at` |
+| `PRINTERS_REFRESH_INTERVAL_MINUTES` | `5` | Cada cuántos minutos refrescar la lista de impresoras desde Supabase (solo modo `usb`) |
 
 ---
 
@@ -158,6 +163,75 @@ bait-print-agent --help                 # Muestra ayuda
 | `bill_proforma` | ✅ Implementado |
 | `cash_close` | ✅ Implementado |
 | `sii_receipt` | ⏳ Stub: log warn + dump JSON. Sprint 4 lo termina cuando integremos OpenFactura/SimpleAPI. |
+
+---
+
+## Modo USB / LAN (driver ESC/POS real)
+
+El agente puede mandar las comandas directo a impresoras térmicas físicas
+conectadas a la PC (USB, LAN o Bluetooth), no solo escribirlas a archivo.
+
+### Pre-requisitos
+
+1. **Configurá las impresoras en bait-app.cl** → Configuración → Impresoras → sección "Impresoras físicas":
+   - Nombre (ej. "Térmica Cocina")
+   - Tipo de conexión: **USB / LAN / Bluetooth**
+   - Target (depende del tipo de conexión, ver tabla más abajo)
+   - Print area asociada (Cocina, Caja, Barra)
+   - Auto-cortar papel, beep, copias
+
+2. **Arrancá el agente con `--mode usb`:**
+
+   ```cmd
+   bait-print-agent.exe --mode usb
+   ```
+
+   O si lo instalaste como servicio, exportá la env var `BAIT_AGENT_MODE=usb`
+   antes de arrancar el servicio. (Próximo Sprint: flag persistente en
+   `%USERPROFILE%\.bait-print-agent\config.json`).
+
+### Cómo configurar el `target` según el tipo de conexión
+
+| Tipo | Ejemplo de `target` | Cómo lo arma el agente | Notas |
+|---|---|---|---|
+| `network` | `192.168.1.50:9100` | `tcp://192.168.1.50:9100` | Puerto raw 9100. Si omitís `:9100`, se asume. |
+| `network` | `192.168.1.50` | `tcp://192.168.1.50:9100` | |
+| `bluetooth` | `COM7` | `\\.\COM7` | El COM virtual que crea Windows al parear la impresora BT. |
+| `usb` | `\\localhost\EPSONTM` | `\\localhost\EPSONTM` (file backend) | **Recomendado en el `.exe`.** Compartí la cola Windows con ese nombre y el agente escribe ahí en RAW. |
+| `usb` | `\\.\USB001` | `\\.\USB001` (file backend) | Device path crudo si la impresora expone su puerto. |
+| `usb` | `EPSON TM-T20III Receipt` | `printer:EPSON TM-T20III Receipt` | Solo funciona en `npm run dev` (Node normal con módulo nativo `printer` instalado). **No funciona en el `.exe` empaquetado** — usá la opción de cola compartida `\\localhost\<share>`. |
+
+> Si configurás un target inválido o la impresora no responde, el job
+> falla con mensaje claro (`Printer "X" no responde: ...`) y el realtime
+> lo manda al retry path (3 intentos con backoff lineal de 5s · intento).
+
+### Refresh de la lista de impresoras
+
+El agente recarga la lista cada 5 min desde Supabase, así que si agregás o
+modificás impresoras en bait-app.cl mientras el agente está corriendo, los
+cambios se ven a más tardar en 5 min sin reiniciar.
+
+Override del intervalo con la env var `PRINTERS_REFRESH_INTERVAL_MINUTES`
+(mínimo 1, default 5).
+
+### Hardware soportado
+
+- **Epson**: TM-T20II, TM-T20III, TM-T88V, TM-m30 y cualquier modelo con ESC/POS estándar.
+- **Star**: TSP143III, TSP100, TSP650 — funcional (detectado como tipo EPSON; ESC/POS compat).
+- **Bixolon**: SRP-330, SRP-350 — funcional.
+- **Genéricas chinas ESC/POS** (Cashino, Xprinter, etc.) — funcional con codepage PC858.
+
+### Codepage
+
+El agente envía codepage `PC858_EURO` que soporta tildes (á, é, í, ó, ú),
+ñ y €. Si tu impresora muestra caracteres raros, ajustá el codepage
+hardcodeado en `src/renderer/usb.ts` (Sprint posterior agrega UI para esto
+en bait-app.cl).
+
+### Si no tenés impresora física pero querés probar
+
+1. **LAN simulada con `netcat`/`socat`**: levantá un listener en puerto 9100 (`nc -lk 9100 > /tmp/ticket.bin`) y configurá una printer con `connection_type=network` y `target=127.0.0.1:9100`. Cada job queda en `/tmp/ticket.bin` como buffer ESC/POS crudo (ASCII + códigos de control).
+2. **Modo `virtual`**: si no necesitás validar el camino ESC/POS específicamente, `--mode virtual` te da el mismo ticket ASCII en `~/bait-print-out/`.
 
 ---
 
@@ -262,22 +336,41 @@ bait-print-agent-win-x64.exe uninstall-service
 
 ### 5. Actualizar el agente
 
-El agente chequea automáticamente cada hora si hay una versión nueva en GitHub Releases. Si la hay, te avisa en los logs con el link de descarga.
+El agente chequea automáticamente cada hora si hay una versión nueva en GitHub Releases. Tenés 3 formas de actualizar:
 
-Para chequear manualmente:
+#### Opción 1: Update automático (recomendado para producción)
+
+Como env var del servicio (o del proceso), seteá:
+
+```
+UPDATE_APPLY_ENABLED=true
+```
+
+Con ese flag prendido, cuando el checker detecta una versión nueva descarga el `.exe`, lo reemplaza solo (técnica "renombrar viejo + colocar nuevo", soportada por Windows incluso con el `.exe` en uso) y reinicia el servicio Windows con el binario nuevo. Útil para clientes que querés mantener al día sin tocar nada.
+
+#### Opción 2: Update manual con comando
+
+```cmd
+bait-print-agent-win-x64.exe update
+```
+
+Descarga el último release de GitHub, reemplaza el `.exe` actual, reinicia el servicio. Necesita admin si el agente corre como servicio Windows. Flags útiles:
+
+- `--force` — aplicar update aunque la versión actual ya sea la más nueva (útil para reinstalar el mismo binario).
+- `--service-name <name>` — nombre del servicio si lo instalaste con uno custom (default: `bAItPrintAgent`).
+
+Para chequear sin aplicar:
 
 ```cmd
 bait-print-agent-win-x64.exe check-updates
 ```
 
-Para actualizar:
+#### Opción 3: Update manual completo (legacy)
 
 1. `bait-print-agent-win-x64.exe uninstall-service` (como admin)
-2. Descargar el .exe nuevo del link que apareció en los logs.
-3. Reemplazar el archivo viejo por el nuevo.
+2. Bajás el `.exe` nuevo de [`releases/latest`](https://github.com/Carlangas13/bait-print-agent/releases/latest).
+3. Reemplazás el archivo viejo por el nuevo.
 4. `bait-print-agent-win-x64.exe install-service` (como admin)
-
-(El reemplazo automático del .exe llega en versiones posteriores.)
 
 #### Variables de entorno opcionales
 
@@ -285,8 +378,15 @@ Para actualizar:
 |---|---|---|
 | `UPDATE_CHECK_INTERVAL_MINUTES` | `60` | Cada cuántos minutos chequear (mínimo 1) |
 | `UPDATE_CHECK_ENABLED` | `true` | Setear a `false` desactiva el checker completo |
+| `UPDATE_APPLY_ENABLED` | `false` | Setear a `true` activa el reemplazo automático cuando hay versión nueva (opt-in) |
 
 > ⚠️ Si el repo `Carlangas1313/bait-print-agent` es privado, la API pública de GitHub responde 404 sin auth y el agente loguea un warning (una sola vez por arranque, no en cada check). En ese caso el aviso de updates no funciona hasta que el repo sea público o agreguemos soporte para tokens.
+
+#### Persistencia del config entre updates
+
+El config del agente vive en `%USERPROFILE%\.bait-print-agent\config.json`, **fuera** de `Program Files`. Eso significa que un update del `.exe` no toca el config — el agente nuevo lee el mismo archivo y sigue autenticado sin necesidad de re-pairing.
+
+Tradeoff: si en una versión futura cambiamos el schema de `config.json`, el agente nuevo va a tirar un error de validación al arranque. En ese caso, `bait-print-agent reset` + `bait-print-agent setup --code XXXX-XXXX` te deja al día.
 
 ### 6. Build local del .exe (sólo para desarrolladores)
 
@@ -321,9 +421,11 @@ El script `.iss` está en `scripts/bait-print-agent.iss`. Para builds reproducib
 - ✅ Auto-publish a GitHub Releases via GitHub Actions.
 - ✅ CLI `bait-print-agent setup --code XXXX-XXXX` para pairing.
 
-**Sprint 3b (próximo):**
-- Driver ESC/POS real con `node-thermal-printer`.
-- JWT scoped en lugar de service role key → safe para distribuir a clientes.
+**Sprint 3b (v0.4.0 — completo):**
+- ✅ Driver ESC/POS real con `node-thermal-printer` (USB cola Windows, LAN raw 9100, Bluetooth COM).
+- ✅ Tabla `printers` cargada por location con refresh cada 5 min.
+- ✅ Matching job→printer por `print_area_id` con fallback a `is_primary`.
+- JWT scoped en lugar de service role key → safe para distribuir a clientes (pendiente).
 
 **Sprint 3c (después):**
 - Firma del .exe con certificado EV → desaparece el warning de SmartScreen.
@@ -335,7 +437,7 @@ El script `.iss` está en `scripts/bait-print-agent.iss`. Para builds reproducib
 - Layout completo de `sii_receipt` con folio + timbre PDF417.
 
 **Sprint 5:**
-- Auto-update via GitHub Releases.
+- ✅ Auto-update via GitHub Releases (`bait-print-agent update` + `UPDATE_APPLY_ENABLED=true`).
 - Multi-printer por agente (Cocina caliente, Cocina fría, Barra, Caja).
 - Heartbeat con métricas (jobs procesados, tiempo medio).
 

@@ -14,7 +14,7 @@ export const DEFAULT_SUPABASE_URL = 'https://ladhxyybqvaevtbhelil.supabase.co';
 export const DEFAULT_SUPABASE_ANON_KEY =
   'sb_publishable_tQQbRXmLpgqpwx4jdBG2OA_b0uS8tE1';
 
-export const AGENT_VERSION = '0.3.0';
+export const AGENT_VERSION = '0.4.0';
 
 /**
  * Resuelve la URL de Supabase: env var > default hardcodeado.

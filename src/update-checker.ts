@@ -20,6 +20,7 @@
 import { z } from 'zod';
 import type { Logger } from './logger.js';
 import { AGENT_VERSION } from './constants.js';
+import { autoUpdate, isUpdateApplyEnabled } from './auto-update.js';
 
 // -------------------------------------------------------------------
 // Schema del response de GitHub
@@ -307,6 +308,12 @@ export type StartPeriodicUpdateCheckOptions = {
   currentVersion: string;
   repo: string;
   logger: Logger;
+  /**
+   * Nombre del servicio Windows del agente. Se pasa a `autoUpdate` cuando
+   * `UPDATE_APPLY_ENABLED=true` para que pueda hacer `sc stop/start`.
+   * Default: 'bAItPrintAgent' (mismo que install-service.ts).
+   */
+  serviceName?: string;
 };
 
 /**
@@ -380,6 +387,32 @@ export function startPeriodicUpdateCheck(
       };
 
       logUpdateBanner(opts.logger, opts.currentVersion, update);
+
+      // Si el operador opt-in con UPDATE_APPLY_ENABLED=true, aplicamos el
+      // update aca mismo. Si no, solo dejamos el aviso en logs (comportamiento
+      // legacy). El opt-in es por env var para que el cliente decida si quiere
+      // mantenerse al dia solo o controlar manual.
+      if (isUpdateApplyEnabled()) {
+        opts.logger.info(
+          'Aplicando update automaticamente (UPDATE_APPLY_ENABLED=true)...'
+        );
+        try {
+          await autoUpdate({
+            updateInfo: update,
+            logger: opts.logger,
+            serviceName: opts.serviceName
+          });
+          // autoUpdate restartea el servicio (o exit en standalone); si llegamos
+          // aca es porque era servicio Windows — el SCM ya levantó el binario
+          // nuevo en otro proceso y este proceso viejo va a morir en cualquier
+          // momento por el `sc stop`. No hacemos nada mas.
+        } catch (err) {
+          opts.logger.error(
+            { err: err instanceof Error ? err.message : String(err) },
+            'autoUpdate fallo; el agente sigue andando con la version vieja'
+          );
+        }
+      }
     } catch (err) {
       // Belt-and-suspenders: si por algun motivo el check rompe (no
       // deberia, todo esta en try/catch interno), atrapamos aca para no

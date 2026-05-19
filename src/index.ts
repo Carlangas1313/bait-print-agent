@@ -6,8 +6,12 @@ import { createLogger } from './logger.js';
 import { createAuthenticatedSupabase } from './supabase.js';
 import { startRealtimeListener } from './realtime.js';
 import { startHeartbeat } from './heartbeat.js';
-import { renderJob } from './renderer/console.js';
-import { renderJobToVirtual, getVirtualOutDir } from './renderer/virtual.js';
+import { getVirtualOutDir } from './renderer/virtual.js';
+import { dispatchJob } from './renderer/dispatcher.js';
+import {
+  loadPrintersForLocation,
+  type PrinterRow
+} from './printers/registry.js';
 import { setupAgent } from './setup.js';
 import {
   AGENT_VERSION,
@@ -28,6 +32,7 @@ import {
   checkForUpdates,
   startPeriodicUpdateCheck
 } from './update-checker.js';
+import { autoUpdate } from './auto-update.js';
 
 /**
  * Repo de GitHub donde publicamos los .exe. Hardcodeado porque el
@@ -292,6 +297,64 @@ program
   });
 
 // -------------------------------------------------------------------
+// Comando: update (descarga + reemplaza + restart servicio)
+// -------------------------------------------------------------------
+program
+  .command('update')
+  .description(
+    'Aplica el ultimo update disponible (descarga + reemplazo + restart servicio)'
+  )
+  .option(
+    '--force',
+    'Aplicar update aunque la version actual ya sea la mas nueva',
+    false
+  )
+  .option(
+    '--service-name <name>',
+    'Nombre del servicio Windows (default: bAItPrintAgent)',
+    'bAItPrintAgent'
+  )
+  .action(async (opts: { force: boolean; serviceName: string }) => {
+    const logger = createLogger('info');
+    const update = await checkForUpdates({
+      currentVersion: AGENT_VERSION,
+      repo: UPDATE_CHECK_REPO,
+      logger
+    });
+
+    if (!update && !opts.force) {
+      logger.info(
+        `Version actual al dia (v${AGENT_VERSION}). Para forzar, usa --force.`
+      );
+      process.exit(0);
+    }
+
+    if (!update && opts.force) {
+      logger.error(
+        'No hay info de release disponible. Verifica conectividad a GitHub.'
+      );
+      process.exit(1);
+    }
+
+    try {
+      // Si --force pero el checker no detectó nada, ya salimos arriba. Aca
+      // siempre `update` es no-null (el `if` previo cubre el null).
+      await autoUpdate({
+        updateInfo: update!,
+        logger,
+        serviceName: opts.serviceName
+      });
+      process.exit(0);
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        'update fallo'
+      );
+      process.exit(1);
+    }
+  });
+
+// -------------------------------------------------------------------
 // Comando default: arrancar el agente
 // -------------------------------------------------------------------
 program
@@ -348,6 +411,24 @@ function prompt(question: string): Promise<string> {
 }
 
 /**
+ * Default del intervalo de refresh del cache de impresoras. Overridable
+ * via env var `PRINTERS_REFRESH_INTERVAL_MINUTES`. 5 min cubre el caso
+ * tipico donde un admin agrega/modifica printers en bait-app.cl mientras
+ * el agente esta corriendo: el cambio se ve en ~5 min sin reiniciar.
+ */
+const DEFAULT_PRINTERS_REFRESH_INTERVAL_MINUTES = 5;
+
+function readPrintersRefreshIntervalMinutes(): number {
+  const raw = process.env.PRINTERS_REFRESH_INTERVAL_MINUTES;
+  if (!raw) return DEFAULT_PRINTERS_REFRESH_INTERVAL_MINUTES;
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 1) {
+    return DEFAULT_PRINTERS_REFRESH_INTERVAL_MINUTES;
+  }
+  return parsed;
+}
+
+/**
  * Arranque del agente en modo persistente o legacy. Loop principal:
  * heartbeat + realtime listener. Se queda corriendo hasta SIGINT/SIGTERM.
  */
@@ -370,15 +451,80 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
   );
 
   // ------------------------------------------------------------------
-  // Resolver el renderer efectivo.
-  // - usb: todavia no implementado, fallback a virtual con warn.
+  // Supabase autenticado (signInWithPassword en modo persistente). Hay
+  // que crearlo antes que el dispatcher porque el load de printers ya
+  // necesita el cliente.
+  // ------------------------------------------------------------------
+  const supabase = await createAuthenticatedSupabase(config);
+
+  // ------------------------------------------------------------------
+  // Resolver el modo efectivo y cargar printers si corresponde.
+  //
+  // - usb: cargamos las impresoras configuradas para la location. Si la
+  //   lista esta vacia, warning + fallback a virtual (no queremos que
+  //   se acumule la cola por falta de configuracion).
   // - virtual: archivos en ~/bait-print-out/.
   // - console: stdout.
+  //
+  // El cache de printers es mutable porque lo refrescamos cada N minutos
+  // via setInterval (ver mas abajo). El handler del realtime captura la
+  // referencia mutable a `printersCache` y lee siempre el ultimo snapshot.
   // ------------------------------------------------------------------
   let effectiveMode: RenderMode = config.agent_mode;
+  let printersCache: PrinterRow[] = [];
+  let printersRefreshId: NodeJS.Timeout | null = null;
+
   if (effectiveMode === 'usb') {
-    logger.warn('Modo USB no implementado todavia, fallback a virtual.');
-    effectiveMode = 'virtual';
+    try {
+      printersCache = await loadPrintersForLocation(
+        supabase,
+        config.location_id,
+        logger
+      );
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        'No pude cargar impresoras al arrancar, fallback a modo virtual'
+      );
+      effectiveMode = 'virtual';
+    }
+
+    if (effectiveMode === 'usb' && printersCache.length === 0) {
+      logger.warn(
+        {
+          locationId: config.location_id
+        },
+        'Modo USB pero no hay impresoras configuradas. Configurá impresoras en bait-app.cl → Configuración → Impresoras. Cayendo a modo virtual para no perder los tickets.'
+      );
+      effectiveMode = 'virtual';
+    }
+
+    // Si seguimos en modo usb tras los chequeos, arrancamos el refresh.
+    if (effectiveMode === 'usb') {
+      const refreshMinutes = readPrintersRefreshIntervalMinutes();
+      logger.info(
+        { intervalMinutes: refreshMinutes },
+        `Refresh de impresoras cada ${refreshMinutes} min`
+      );
+      printersRefreshId = setInterval(() => {
+        void loadPrintersForLocation(
+          supabase,
+          config.location_id,
+          logger
+        )
+          .then((fresh) => {
+            printersCache = fresh;
+          })
+          .catch((err) => {
+            // Mantener el cache anterior si el refresh falla — preferible
+            // a vaciarlo y que todos los jobs caigan al retry path.
+            logger.warn(
+              { err: err instanceof Error ? err.message : String(err) },
+              'Refresh de impresoras fallo, mantengo cache anterior'
+            );
+          });
+      }, refreshMinutes * 60 * 1000);
+    }
   }
 
   if (effectiveMode === 'virtual') {
@@ -388,15 +534,13 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
     );
   }
 
-  const jobHandler =
-    effectiveMode === 'virtual'
-      ? (job: Parameters<typeof renderJob>[0]) => renderJobToVirtual(job, logger)
-      : (job: Parameters<typeof renderJob>[0]) => renderJob(job, logger);
-
   // ------------------------------------------------------------------
-  // Supabase autenticado (signInWithPassword en modo persistente).
+  // Job handler unificado: el dispatcher decide segun el modo efectivo.
+  // Captura `printersCache` por referencia para que el refresh interval
+  // se vea reflejado al instante.
   // ------------------------------------------------------------------
-  const supabase = await createAuthenticatedSupabase(config);
+  const jobHandler = (job: Parameters<typeof dispatchJob>[0]) =>
+    dispatchJob(job, effectiveMode, printersCache, logger);
 
   const heartbeatId = startHeartbeat(supabase, config, logger);
 
@@ -412,7 +556,10 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
       intervalMinutes: readUpdateCheckIntervalMinutes(),
       currentVersion: AGENT_VERSION,
       repo: UPDATE_CHECK_REPO,
-      logger
+      logger,
+      // Pasamos el nombre del servicio para que cuando UPDATE_APPLY_ENABLED=true,
+      // el auto-update pueda reiniciar el servicio Windows con el binario nuevo.
+      serviceName: 'bAItPrintAgent'
     });
   } else {
     logger.info('Update checker deshabilitado (UPDATE_CHECK_ENABLED=false)');
@@ -426,7 +573,8 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
   );
 
   // ------------------------------------------------------------------
-  // Cleanup ordenado: paramos heartbeat, update checker, cerramos canal, salimos.
+  // Cleanup ordenado: paramos heartbeat, update checker, refresh de printers,
+  // cerramos canal, salimos.
   // ------------------------------------------------------------------
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -435,6 +583,7 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
     logger.info({ signal }, 'Shutting down gracefully');
     clearInterval(heartbeatId);
     if (updateCheckerId) clearInterval(updateCheckerId);
+    if (printersRefreshId) clearInterval(printersRefreshId);
     try {
       await supabase.removeChannel(channel);
     } catch (err) {
