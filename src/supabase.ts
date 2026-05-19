@@ -4,24 +4,65 @@ import type { AgentConfig } from './config.js';
 /**
  * Cliente Supabase del agente.
  *
- * Sprint 2: usa SUPABASE_SERVICE_ROLE_KEY que bypassa RLS. Solo para
- * dev local mientras el flujo de JWT scoped (Sprint 3) no está listo.
- * No distribuir el .env a clientes finales — el service role tiene
- * acceso TOTAL a todos los restaurants del proyecto.
+ * Hay dos caminos posibles:
+ *  1. Modo persistente (post-Sprint 3): config trae `auth_email` y
+ *     `auth_password` que fueron entregados por el RPC claim_pairing_code.
+ *     Creamos el client con anon key y autenticamos via signInWithPassword.
+ *     RLS aplica como a cualquier user normal.
+ *  2. Modo env-legacy (dev/testing): config trae `service_role_key` y
+ *     creamos directamente con esa key. Bypassa RLS — NO distribuir a
+ *     clientes finales.
  *
- * Sprint 3 reemplazará esto con un JWT firmado por bait-pos backend
- * que incluya el restaurant_id y location_id como claims, y las RLS
- * los validarán como cualquier otro user authenticated.
+ * En ambos casos retornamos el SupabaseClient listo para hacer queries
+ * (en el modo persistente, despues de que el sign-in completo).
  */
-export function createSupabase(config: AgentConfig): SupabaseClient {
-  return createClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY, {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-      detectSessionInUrl: false
-    },
-    realtime: {
-      params: { eventsPerSecond: 10 }
+export async function createAuthenticatedSupabase(
+  config: AgentConfig
+): Promise<SupabaseClient> {
+  // ------------------------------------------------------------------
+  // Modo persistente: anon key + signInWithPassword.
+  // ------------------------------------------------------------------
+  if (config.auth_email && config.auth_password) {
+    const client = createClient(config.supabase_url, config.supabase_anon_key, {
+      auth: {
+        autoRefreshToken: true,
+        persistSession: false,
+        detectSessionInUrl: false
+      },
+      realtime: {
+        params: { eventsPerSecond: 10 }
+      }
+    });
+
+    const { error } = await client.auth.signInWithPassword({
+      email: config.auth_email,
+      password: config.auth_password
+    });
+
+    if (error) {
+      throw new Error(`Auth falló: ${error.message}`);
     }
-  });
+
+    return client;
+  }
+
+  // ------------------------------------------------------------------
+  // Modo env-legacy: service role key.
+  // ------------------------------------------------------------------
+  if (config.service_role_key) {
+    return createClient(config.supabase_url, config.service_role_key, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+        detectSessionInUrl: false
+      },
+      realtime: {
+        params: { eventsPerSecond: 10 }
+      }
+    });
+  }
+
+  throw new Error(
+    'Config inválida: ni hay credenciales de pairing ni service_role_key.'
+  );
 }

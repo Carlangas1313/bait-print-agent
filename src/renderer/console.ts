@@ -31,74 +31,70 @@ import {
 const WIDTH = 32;
 
 /**
- * Punto de entrada del renderer. Discrimina por job_type, arma el ASCII
- * y lo imprime como un solo bloque (un unico console.log con '\n' embebido).
+ * Construye el string ASCII completo del job (sin imprimirlo). Es la
+ * funcion compartida entre el renderer de consola y el virtual: ambos
+ * generan el mismo bloque y deciden donde mandarlo (stdout vs archivo).
  *
- * Si el job_type no tiene layout implementado todavia, log warn + dump
- * del payload y sigue adelante para que el caller pueda marcarlo printed
- * (no queremos bloquear el loop por un layout faltante).
+ * Si el job_type no tiene layout, retorna un fallback con dump del
+ * payload + warning, asi el caller puede igual marcarlo como printed.
  */
-export async function renderJob(job: PrintJobRow, logger: Logger): Promise<void> {
-  logger.info(`Renderizando job ${job.id} tipo ${job.job_type}`);
-
+export function formatJob(job: PrintJobRow, logger: Logger): string {
   switch (job.job_type) {
     case 'kitchen_order':
     case 'bar_order': {
       if (isKitchenJobPayload(job.payload)) {
-        console.log(renderKitchenOrder(job.job_type, job.payload));
-      } else {
-        logUnsupported(job, logger, 'payload no matchea KitchenJobPayload');
+        return renderKitchenOrder(job.job_type, job.payload);
       }
-      return;
+      return unsupportedFallback(job, logger, 'payload no matchea KitchenJobPayload');
     }
 
     case 'kitchen_cancel': {
       if (isKitchenJobPayload(job.payload)) {
-        console.log(renderKitchenCancel(job.payload));
-      } else {
-        logUnsupported(job, logger, 'payload no matchea KitchenJobPayload');
+        return renderKitchenCancel(job.payload);
       }
-      return;
+      return unsupportedFallback(job, logger, 'payload no matchea KitchenJobPayload');
     }
 
     case 'bill_proforma': {
       if (isBillProformaPayload(job.payload)) {
-        console.log(renderBillProforma(job.payload));
-      } else {
-        logUnsupported(job, logger, 'payload no matchea BillProformaPayload');
+        return renderBillProforma(job.payload);
       }
-      return;
+      return unsupportedFallback(job, logger, 'payload no matchea BillProformaPayload');
     }
 
     case 'cash_close': {
       if (isCashClosePayload(job.payload)) {
-        console.log(renderCashClose(job.payload));
-      } else {
-        logUnsupported(job, logger, 'payload no matchea CashClosePayload');
+        return renderCashClose(job.payload);
       }
-      return;
+      return unsupportedFallback(job, logger, 'payload no matchea CashClosePayload');
     }
 
     case 'sii_receipt': {
       // El payload de sii_receipt no esta cerrado todavia (Sprint 4).
-      // Por ahora dumpeamos y damos un mensaje informativo.
-      logger.warn(`job_type sii_receipt no soportado en console renderer todavia (Sprint 4)`);
-      console.log(line(WIDTH));
-      console.log(padCenter('TODO: SII RECEIPT', WIDTH));
-      console.log(padCenter('Implementar en Sprint 4', WIDTH));
-      console.log(line(WIDTH));
-      console.log(JSON.stringify(job.payload, null, 2));
-      console.log('');
-      return;
+      logger.warn(`job_type sii_receipt no soportado todavia (Sprint 4)`);
+      const out: string[] = [];
+      out.push(line(WIDTH));
+      out.push(padCenter('TODO: SII RECEIPT', WIDTH));
+      out.push(padCenter('Implementar en Sprint 4', WIDTH));
+      out.push(line(WIDTH));
+      out.push(JSON.stringify(job.payload, null, 2));
+      out.push('');
+      return out.join('\n');
     }
 
     default: {
-      // Si llega un job_type que no esta en la union (forzado por TS),
-      // mantenemos el comportamiento de no crashear.
-      logUnsupported(job, logger, 'job_type desconocido');
-      return;
+      return unsupportedFallback(job, logger, 'job_type desconocido');
     }
   }
+}
+
+/**
+ * Punto de entrada del renderer de consola. Construye el bloque ASCII
+ * y lo manda a stdout como un unico console.log con '\n' embebido.
+ */
+export async function renderJob(job: PrintJobRow, logger: Logger): Promise<void> {
+  logger.info(`Renderizando job ${job.id} tipo ${job.job_type}`);
+  console.log(formatJob(job, logger));
 }
 
 // ====================================================================
@@ -106,13 +102,13 @@ export async function renderJob(job: PrintJobRow, logger: Logger): Promise<void>
 // ====================================================================
 
 /**
- * Log + dump cuando un payload no matchea su type guard o llega un
- * job_type sin layout. El caller seguira con success (no tiramos).
+ * Fallback string cuando un payload no matchea su type guard o llega un
+ * job_type sin layout. Loguea warning y retorna el dump del payload para
+ * que igual quede visible en el output.
  */
-function logUnsupported(job: PrintJobRow, logger: Logger, reason: string): void {
-  logger.warn(`job_type ${job.job_type} no soportado en console renderer todavia: ${reason}`);
-  console.log(JSON.stringify(job.payload, null, 2));
-  console.log('');
+function unsupportedFallback(job: PrintJobRow, logger: Logger, reason: string): string {
+  logger.warn(`job_type ${job.job_type} no soportado en renderer todavia: ${reason}`);
+  return JSON.stringify(job.payload, null, 2) + '\n';
 }
 
 /**

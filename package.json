@@ -9,19 +9,26 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "dev": "tsx watch src/index.ts -- --mode console",
+    "dev": "tsx watch src/index.ts",
+    "dev:setup": "tsx src/index.ts setup",
     "start": "node dist/index.js",
     "start:console": "node dist/index.js --mode console",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "bundle": "esbuild src/index.ts --bundle --platform=node --target=node20 --outfile=dist/bundle.cjs --format=cjs --external:pino-pretty",
+    "package:win": "npm run build && npm run bundle && node scripts/package-win.js",
+    "release": "npm run package:win"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.46.1",
+    "commander": "^12.1.0",
     "pino": "^9.5.0",
     "pino-pretty": "^11.3.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
+    "esbuild": "^0.24.0",
+    "postject": "^1.0.0-alpha.6",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   },

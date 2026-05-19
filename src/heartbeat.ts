@@ -2,6 +2,7 @@ import { networkInterfaces } from 'node:os';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AgentConfig } from './config.js';
 import type { Logger } from './logger.js';
+import { AGENT_VERSION } from './constants.js';
 
 /**
  * Heartbeat periodico contra la tabla `print_agents`.
@@ -12,14 +13,12 @@ import type { Logger } from './logger.js';
  * el agente debe seguir imprimiendo aunque pierda el heartbeat un rato.
  */
 
-const AGENT_VERSION = '0.1.0';
-
 export function startHeartbeat(
   supabase: SupabaseClient,
   config: AgentConfig,
   logger: Logger
 ): NodeJS.Timeout {
-  const intervalMs = config.HEARTBEAT_INTERVAL_SECONDS * 1_000;
+  const intervalMs = config.heartbeat_interval_seconds * 1_000;
 
   // Primer ping inmediato — no esperamos el primer intervalo para
   // marcar el agente como vivo.
@@ -30,7 +29,7 @@ export function startHeartbeat(
   }, intervalMs);
 
   logger.info(
-    { intervalSeconds: config.HEARTBEAT_INTERVAL_SECONDS },
+    { intervalSeconds: config.heartbeat_interval_seconds },
     'Heartbeat iniciado'
   );
 
@@ -51,11 +50,11 @@ async function sendHeartbeat(
       agent_version: AGENT_VERSION,
       last_seen_ip: ip
     })
-    .eq('id', config.BAIT_AGENT_ID);
+    .eq('id', config.agent_id);
 
   if (error) {
     logger.warn(
-      { err: error, agentId: config.BAIT_AGENT_ID },
+      { err: error, agentId: config.agent_id },
       'Heartbeat fallo (seguimos andando)'
     );
     return;

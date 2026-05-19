@@ -1,0 +1,112 @@
+name: Release Windows .exe
+
+# Trigger: cualquier tag con formato v*.*.* (ej. v0.1.0).
+# El job corre en windows-latest porque Node SEA necesita el binary del
+# OS target para inyectar el blob (no se puede cross-compilar desde Linux).
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  # Necesario para que softprops/action-gh-release pueda crear el release.
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build SEA executable (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify package version matches tag
+        # Sanity check: el version del package.json debe coincidir con el tag,
+        # asi no publicamos un .exe que diga "0.1.0" cuando el tag dice "v0.2.0".
+        shell: pwsh
+        run: |
+          $pkgVersion = (Get-Content package.json | ConvertFrom-Json).version
+          $tagVersion = "${{ github.ref_name }}".TrimStart('v')
+          Write-Host "package.json version: $pkgVersion"
+          Write-Host "tag version:          $tagVersion"
+          if ($pkgVersion -ne $tagVersion) {
+            Write-Error "Mismatch: package.json ($pkgVersion) != tag ($tagVersion). Actualiza package.json antes de tagear."
+            exit 1
+          }
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Package for Windows
+        run: npm run package:win
+
+      - name: Verify .exe runs
+        # Smoke test minimo: el .exe debe poder imprimir su version sin crashear.
+        shell: pwsh
+        run: |
+          $exe = "dist/bait-print-agent-win-x64.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "No existe $exe"
+            exit 1
+          }
+          $output = & $exe --version
+          Write-Host "Output de --version: $output"
+          if ($output -notmatch "0\.1\.0|${{ github.ref_name }}".TrimStart('v')) {
+            Write-Warning "El output de --version no matchea el tag, pero seguimos."
+          }
+
+      - name: Compute SHA256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist/bait-print-agent-win-x64.exe -Algorithm SHA256).Hash
+          Write-Host "SHA256: $hash"
+          $hash | Out-File -FilePath dist/bait-print-agent-win-x64.exe.sha256 -Encoding ascii
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            dist/bait-print-agent-win-x64.exe
+            dist/bait-print-agent-win-x64.exe.sha256
+          body: |
+            ## bait-print-agent ${{ github.ref_name }}
+
+            Single-executable build para Windows x64 generado con Node SEA.
+
+            ### Descargar e instalar
+
+            1. Descarga `bait-print-agent-win-x64.exe` desde los assets de abajo.
+            2. Guardalo en `C:\bait-print-agent\` (o donde quieras).
+            3. Windows SmartScreen va a quejarse en el primer download (sin firma todavia).
+               - Click derecho en el .exe -> Propiedades -> marca "Desbloquear".
+               - O ejecuta y eligi "Mas informacion -> Ejecutar de todos modos".
+            4. Abri PowerShell en esa carpeta y corre:
+               ```
+               .\bait-print-agent-win-x64.exe setup --code XXXX-XXXX
+               ```
+
+            Mas detalles en el README del repo.
+
+            ### Verificar integridad
+
+            ```
+            certutil -hashfile bait-print-agent-win-x64.exe SHA256
+            ```
+
+            Compara con el contenido de `bait-print-agent-win-x64.exe.sha256`.

@@ -33,7 +33,7 @@ export async function startRealtimeListener(
     .from('print_jobs')
     .select('*')
     .eq('status', 'pending')
-    .eq('location_id', config.BAIT_LOCATION_ID)
+    .eq('location_id', config.location_id)
     .order('created_at', { ascending: true });
 
   if (backfillError) {
@@ -57,10 +57,10 @@ export async function startRealtimeListener(
   // ------------------------------------------------------------------
   // 2) Streaming via postgres_changes.
   // ------------------------------------------------------------------
-  const channelName = `print-jobs-${config.BAIT_LOCATION_ID}`;
+  const channelName = `print-jobs-${config.location_id}`;
   const channel = supabase.channel(channelName);
 
-  const filter = `location_id=eq.${config.BAIT_LOCATION_ID}`;
+  const filter = `location_id=eq.${config.location_id}`;
 
   channel.on(
     'postgres_changes',
@@ -113,8 +113,8 @@ export async function startRealtimeListener(
       return;
     }
     logger.info(
-      { status, locationId: config.BAIT_LOCATION_ID },
-      'Realtime listener iniciado en location_id=' + config.BAIT_LOCATION_ID
+      { status, locationId: config.location_id },
+      'Realtime listener iniciado en location_id=' + config.location_id
     );
   });
 

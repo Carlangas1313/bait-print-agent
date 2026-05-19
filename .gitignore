@@ -7,3 +7,6 @@ dist/
 .DS_Store
 .vscode/
 .idea/
+
+# SEA packaging artifacts (regenerados por scripts/package-win.js)
+sea-config.json

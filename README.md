@@ -161,14 +161,109 @@ bait-print-agent --help                 # Muestra ayuda
 
 ---
 
+## Distribución (Windows .exe)
+
+El agente se distribuye como un **single binary** `bait-print-agent-win-x64.exe` (~80 MB) generado con [Node.js Single Executable Applications (SEA)](https://nodejs.org/api/single-executable-applications.html). No requiere Node instalado en la PC del cliente.
+
+### 1. Descargar
+
+Cada release en GitHub publica el .exe firmado por SHA256. Andá a:
+
+[https://github.com/Carlangas1313/bait-print-agent/releases/latest](https://github.com/Carlangas1313/bait-print-agent/releases/latest)
+
+Descargá `bait-print-agent-win-x64.exe` y, si querés validar la integridad, también `bait-print-agent-win-x64.exe.sha256`:
+
+```powershell
+certutil -hashfile bait-print-agent-win-x64.exe SHA256
+# Comparar con el contenido del .sha256
+```
+
+### 2. Ejecutar
+
+Como todavía **no firmamos el .exe** (eso queda para Sprint 3c con un cert EV), Windows SmartScreen va a quejarse la primera vez:
+
+- **Doble click:** vas a ver "Windows protegió tu PC" → click en **"Más información"** → **"Ejecutar de todos modos"**.
+- **Alternativa (recomendada):** click derecho → **Propiedades** → marcar **"Desbloquear"** → Aceptar.
+
+Después, desde una terminal en la carpeta donde lo guardaste:
+
+```powershell
+.\bait-print-agent-win-x64.exe --version
+# 0.1.0
+```
+
+### 3. Configurar (primer uso)
+
+```powershell
+.\bait-print-agent-win-x64.exe setup --code XXXX-XXXX
+```
+
+El `--code` lo entrega bait-pos web (Dashboard → Configuración → Impresoras → "Vincular nueva PC"). El RPC `claim_pairing_code` devuelve credenciales y las guarda en `%USERPROFILE%\.bait-print-agent\config.json`.
+
+Después podés correr el agente sin argumentos:
+
+```powershell
+.\bait-print-agent-win-x64.exe
+```
+
+Más detalles en la sección [Setup](#setup) de arriba.
+
+### 4. Instalar como servicio Windows
+
+Por ahora (Sprint 3a) la instalación es manual. Dos opciones:
+
+**Opción A: `sc.exe` (servicio nativo de Windows)**
+
+```powershell
+# Como Administrador (servicios requieren elevation):
+sc.exe create bAItPrintAgent binPath= "C:\bait-print-agent\bait-print-agent-win-x64.exe" start= auto DisplayName= "bAIt Print Agent"
+sc.exe description bAItPrintAgent "Agente local de impresion de bait-pos"
+sc.exe start bAItPrintAgent
+```
+
+Para desinstalar:
+
+```powershell
+sc.exe stop bAItPrintAgent
+sc.exe delete bAItPrintAgent
+```
+
+**Opción B: Programador de tareas (más simple si no necesitás autostart en boot)**
+
+1. Abrí "Programador de tareas" (taskschd.msc).
+2. Crear tarea → Disparador: "Al iniciar sesión".
+3. Acción: iniciar programa → ruta al .exe.
+4. Configuración → marca "Ejecutar tarea lo antes posible si se omite el inicio programado".
+
+> **TODO Sprint 3c:** comando `bait-print-agent install-service` que automatiza todo esto (probablemente con [NSSM](https://nssm.cc/) bundleado o `sc.exe` directo). Por ahora son 5 líneas a mano.
+
+### 5. Build local del .exe (sólo para desarrolladores)
+
+```powershell
+npm install
+npm run package:win
+# Output: dist/bait-print-agent-win-x64.exe
+```
+
+Sólo funciona en Windows (Node SEA inyecta el blob en un `node.exe`, no se puede cross-compilar). Para builds reproducibles, el flujo oficial es CI via GitHub Actions con un tag `v*.*.*`.
+
+---
+
 ## Roadmap
 
-**Sprint 3 (próximo):**
+**Sprint 3a (en curso):**
+- ✅ Empaquetar como `.exe` single-file con Node SEA.
+- ✅ Auto-publish a GitHub Releases via GitHub Actions.
+- ✅ CLI `bait-print-agent setup --code XXXX-XXXX` para pairing.
+
+**Sprint 3b (próximo):**
 - Driver ESC/POS real con `node-thermal-printer`.
-- Empaquetar como `.exe` con `pkg`.
-- Servicio Windows con `node-windows`.
-- CLI `bait-print-agent setup --token X` que reemplaza el INSERT manual.
 - JWT scoped en lugar de service role key → safe para distribuir a clientes.
+
+**Sprint 3c (después):**
+- Firma del .exe con certificado EV → desaparece el warning de SmartScreen.
+- `bait-print-agent install-service` para auto-instalación como servicio Windows.
+- Auto-update via GitHub Releases checks.
 
 **Sprint 4:**
 - Integración SimpleAPI/OpenFactura para emisión DTE (boleta SII real).
