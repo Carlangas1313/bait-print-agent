@@ -50,6 +50,19 @@ export interface AgentStatus {
   last_job_at: string | null;
   jobs_pending_count: number;
   jobs_waiting_printer_count: number;
+  /**
+   * Cantidad de jobs impresos exitosamente en el dia operativo del local
+   * (05:00 hasta 04:59 del dia siguiente). `null` si la query del server
+   * fallo — la UI lo pinta como "—" en lugar de "0".
+   */
+  printed_today_count: number | null;
+  /**
+   * Cantidad de jobs en status='failed' que se crearon en el dia operativo.
+   * `null` si la query del server fallo.
+   */
+  failed_today_count: number | null;
+  /** ISO timestamp del inicio del dia operativo actual (05:00 local). */
+  business_day_start: string;
 }
 
 /**

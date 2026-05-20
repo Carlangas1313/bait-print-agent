@@ -73,9 +73,12 @@ export function statusToAgentState(api: ApiAgentStatus): AgentState {
     supabase_connected: supabaseOk,
     realtime_connected: realtimeOk,
     last_heartbeat_at: api.last_heartbeat_at ?? new Date(0).toISOString(),
-    printed_today: undefined,
+    // null del server = query fallo, UI pinta "—". 0 del server = no hubo
+    // jobs hoy, UI pinta "0". `?? undefined` convierte null en undefined
+    // para que el `?? "—"` del MetricCard reaccione correcto.
+    printed_today: api.printed_today_count ?? undefined,
     pending_jobs: api.jobs_pending_count + api.jobs_waiting_printer_count,
-    failed_today: undefined,
+    failed_today: api.failed_today_count ?? undefined,
     uptime_seconds: undefined,
   };
 }

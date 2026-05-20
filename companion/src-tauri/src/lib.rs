@@ -288,13 +288,28 @@ pub fn run() {
                     handle_menu_event(app, event.id.as_ref());
                 })
                 .on_tray_icon_event(move |tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        toggle_window(tray.app_handle());
+                    // Toggle window en click izquierdo (release/Up) y tambien
+                    // en double-click. Algunas configs de Windows + Tauri 2
+                    // entregan los eventos en orden raro (Down sin Up, o solo
+                    // DoubleClick), asi que cubrimos ambos para que el icono
+                    // siempre responda.
+                    match event {
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } => {
+                            log::info!("[tray] click izquierdo (Up) → toggle window");
+                            toggle_window(tray.app_handle());
+                        }
+                        TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        } => {
+                            log::info!("[tray] double-click izquierdo → show window");
+                            show_window(tray.app_handle());
+                        }
+                        _ => {}
                     }
                 })
                 .build(app)?;
@@ -308,10 +323,15 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             // En vez de cerrar la app cuando el user clickea la X, ocultamos
-            // la window (el companion vive en el tray).
+            // la window (el companion vive en el tray). Logueamos cada vez
+            // que dispara para poder confirmar en el log que el handler corrio
+            // (si el log NO aparece y la window se cerro, el bug es de Tauri).
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
-                    let _ = window.hide();
+                    log::info!("[window] CloseRequested en 'main' → hide() + prevent_close()");
+                    if let Err(e) = window.hide() {
+                        log::error!("[window] hide() fallo: {e}");
+                    }
                     api.prevent_close();
                 }
             }

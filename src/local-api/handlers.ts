@@ -85,6 +85,29 @@ export type HandlerResult = {
  * consultamos contra Supabase porque son volatiles y queremos un numero
  * fresco; el resto sale del runtime state.
  */
+/**
+ * Calcula el inicio del "dia operativo" del restaurant en formato ISO.
+ *
+ * Convencion del proyecto (ver memoria global): el dia operativo va desde
+ * 05:00 hasta 04:59 del dia siguiente. Esto cubre los locales que cierran
+ * tarde — un ticket a las 02:00 todavia cuenta como del dia anterior.
+ *
+ * Usamos local time del proceso (que corre en la PC del restaurant, asi que
+ * la TZ del SO == TZ del local). new Date() con getHours() resuelve en
+ * local time automaticamente.
+ */
+function businessDayStartISO(): string {
+  const now = new Date();
+  const start = new Date(now);
+  start.setHours(5, 0, 0, 0);
+  // Si todavia no llegamos a las 05:00 de HOY, el dia operativo empezo
+  // ayer a las 05:00.
+  if (now.getHours() < 5) {
+    start.setTime(start.getTime() - 24 * 60 * 60 * 1000);
+  }
+  return start.toISOString();
+}
+
 export async function handleStatus(ctx: LocalApiContext): Promise<HandlerResult> {
   const { supabase, config, state, logger } = ctx;
 
@@ -93,6 +116,13 @@ export async function handleStatus(ctx: LocalApiContext): Promise<HandlerResult>
   // mostrar la pantalla aunque Supabase este off.
   let jobsPending = 0;
   let jobsWaitingPrinter = 0;
+  // Counters del dia operativo (05:00 -> 04:59 siguiente).
+  // Devolvemos null si la query falla — asi el companion sabe que es "no
+  // disponible" y muestra "—" en lugar de 0 erroneo.
+  let printedToday: number | null = null;
+  let failedToday: number | null = null;
+  const businessStart = businessDayStartISO();
+
   try {
     const pendingRes = await supabase
       .from('print_jobs')
@@ -127,6 +157,41 @@ export async function handleStatus(ctx: LocalApiContext): Promise<HandlerResult>
     } else {
       jobsWaitingPrinter = waitingRes.count ?? 0;
     }
+
+    // Impresos en el dia operativo (printed_at >= 05:00 today).
+    const printedRes = await supabase
+      .from('print_jobs')
+      .select('id', { count: 'exact', head: true })
+      .eq('location_id', config.location_id)
+      .eq('status', 'printed')
+      .gte('printed_at', businessStart);
+
+    if (printedRes.error) {
+      logger.debug(
+        { err: printedRes.error.message },
+        'Count de printed_today fallo'
+      );
+    } else {
+      printedToday = printedRes.count ?? 0;
+    }
+
+    // Fallidos en el dia operativo (created_at >= 05:00 + status='failed').
+    // Usamos created_at como proxy porque no hay `failed_at` en el schema.
+    const failedRes = await supabase
+      .from('print_jobs')
+      .select('id', { count: 'exact', head: true })
+      .eq('location_id', config.location_id)
+      .eq('status', 'failed')
+      .gte('created_at', businessStart);
+
+    if (failedRes.error) {
+      logger.debug(
+        { err: failedRes.error.message },
+        'Count de failed_today fallo'
+      );
+    } else {
+      failedToday = failedRes.count ?? 0;
+    }
   } catch (err) {
     logger.warn(
       { err: err instanceof Error ? err.message : String(err) },
@@ -150,7 +215,12 @@ export async function handleStatus(ctx: LocalApiContext): Promise<HandlerResult>
       last_heartbeat_at: state.last_heartbeat_at,
       last_job_at: state.last_job_at,
       jobs_pending_count: jobsPending,
-      jobs_waiting_printer_count: jobsWaitingPrinter
+      jobs_waiting_printer_count: jobsWaitingPrinter,
+      // Counters del dia operativo (05:00 a 04:59). null si la query fallo.
+      // Frontend: si es null pinta "—", si es 0 pinta "0".
+      printed_today_count: printedToday,
+      failed_today_count: failedToday,
+      business_day_start: businessStart
     }
   };
 }

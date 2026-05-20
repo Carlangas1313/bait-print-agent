@@ -70,6 +70,14 @@ SetupLogging=yes
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 
+[Tasks]
+; Tarea opcional en el wizard: crear acceso directo en el escritorio del user.
+; Default unchecked porque la mayoria de los cajeros prefiere usar el tray icon
+; (que ya aparece autoarrancado por HKCU\Run) y no llenar el escritorio.
+; Si el user lo tilda, se crea el .lnk en {autodesktop} apuntando al companion.
+Name: "desktopicon"; Description: "Crear acceso directo en el Escritorio"; \
+  GroupDescription: "Accesos directos adicionales:"; Flags: unchecked
+
 [Files]
 ; Fuente: el .exe single-file generado por scripts/package-win.js (Node SEA).
 ; Destino: renombrado a bait-print-agent.exe (sin sufijo -win-x64) porque
@@ -100,6 +108,12 @@ Name: "{group}\{#AppName} (modo virtual)"; Filename: "{app}\{#AppExeName}"; Para
 Name: "{group}\Reconfigurar codigo"; Filename: "{app}\{#AppExeName}"; Parameters: "setup"; Comment: "Pega un nuevo codigo de pairing"
 Name: "{group}\Estado del servicio"; Filename: "{app}\{#AppExeName}"; Parameters: "service-status"; Comment: "Muestra si el servicio esta corriendo"
 Name: "{group}\Desinstalar {#AppName}"; Filename: "{uninstallexe}"
+
+; Atajo opcional en el escritorio. Solo se crea si el user tildo el checkbox
+; "Crear acceso directo en el Escritorio" en la pagina de Tasks del wizard.
+Name: "{autodesktop}\bAIt Print Companion"; Filename: "{app}\{#CompanionExeName}"; \
+  Comment: "Abre el dashboard del agente en el tray"; \
+  Tasks: desktopicon
 
 [Registry]
 ; Autostart del companion al login del user actual. HKCU (no HKLM) porque el
@@ -319,6 +333,51 @@ begin
   // o tabs extras. La validacion en NextButtonClick los descarta y verifica
   // que queden exactamente 8 caracteres validos.
   PairingPage.Edits[0].MaxLength := 20;
+end;
+
+// ===========================================================================
+// CurStepChanged(ssInstall) — anti-zombie pre-install
+// ===========================================================================
+//
+// PROBLEMA QUE RESUELVE (descubierto en cliente real con v0.6.0):
+// Cuando el user actualiza el agente (re-corre el setup sobre una instalacion
+// previa), Inno Setup intenta sobrescribir bait-print-agent.exe pero el
+// servicio Windows lo tiene LOCKEADO. El user ve "File in use, retry?" y
+// peor: si Inno se las arregla para reemplazar, el proceso hijo de NSSM puede
+// quedar HUERFANO (zombie) con el puerto 17891 todavia tomado. Al arrancar
+// el nuevo servicio, NSSM tira crash loop por EADDRINUSE → PAUSED forever.
+//
+// FIX: Antes de copiar archivos, paramos el servicio (sc.exe stop) y
+// taskkilleamos cualquier .exe huerfano del agente o del companion. El
+// sleep da tiempo al SO a liberar handles y puertos TCP.
+//
+// Esto corre SIEMPRE — si es instalacion fresca, sc.exe stop falla (no
+// existe el servicio), taskkill no encuentra procesos, todo no-op. Si es
+// upgrade, hace su trabajo limpio.
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+begin
+  if CurStep = ssInstall then
+  begin
+    // 1. Stop graceful del servicio Windows. sc.exe esta en %SystemRoot%\system32
+    //    de toda PC Win11. Exit code 1060 = "servicio no existe", lo ignoramos.
+    Exec('sc.exe', 'stop bAItPrintAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // 2. Esperar 2s para que NSSM ejecute el shutdown del child + libere
+    //    socket. Sin esto el child puede seguir vivo en TIME_WAIT del TCP.
+    Sleep(2000);
+    // 3. Taskkill defensivo por si NSSM no limpio bien (caso del bug que vimos
+    //    con la v0.6.0: child quedaba huerfano tomando puerto 17891). /T mata
+    //    procesos hijos tambien (webview2 del companion, etc).
+    Exec('cmd.exe', '/C taskkill /F /IM bait-print-companion.exe /T',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec('cmd.exe', '/C taskkill /F /IM bait-print-agent.exe /T',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // 4. Otro segundo para que Windows libere los file handles antes de
+    //    que el motor de Inno empiece a copiar al destino.
+    Sleep(1500);
+  end;
 end;
 
 // ===========================================================================
