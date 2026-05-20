@@ -109,6 +109,88 @@ fn read_local_api_token() -> Result<String, String> {
     Ok(token.to_string())
 }
 
+/// Descarga el setup.exe a `%TEMP%` y lo ejecuta con UAC elevation.
+///
+/// Estrategia: spawneamos un script PowerShell que hace:
+///   1. Invoke-WebRequest del download_url al temp.
+///   2. Start-Process -Verb RunAs del .exe descargado.
+///
+/// `-Verb RunAs` dispara el popup de UAC de Windows en la sesion del
+/// usuario. Si el user aprueba, el setup.exe arranca como admin y el
+/// wizard se ve normal. Si rechaza, el spawn termina con error 1223
+/// (operacion cancelada por el user) y se lo devolvemos al frontend.
+///
+/// IMPORTANTE: este comando NO espera a que el setup termine. Una vez
+/// que el setup arranque, su anti-zombie (Pascal CurStepChanged) va a
+/// hacer taskkill del companion. Asi que el companion va a morir poco
+/// despues que esta llamada retorne. El frontend muestra un toast
+/// "Lanzando instalador..." antes para que el user entienda lo que pasa.
+#[tauri::command]
+async fn install_update(download_url: String) -> Result<String, String> {
+    use std::process::Command;
+
+    if !download_url.starts_with("https://github.com/") {
+        return Err(format!(
+            "URL de descarga rechazada por seguridad (no es github.com): {download_url}"
+        ));
+    }
+
+    // Path del archivo descargado. Nombre fijo para que el script PS no
+    // necesite interpolar variables del Rust side. El instalador anterior
+    // (si existe) se sobrescribe sin problema.
+    let temp_dir = std::env::temp_dir();
+    let installer_path = temp_dir.join("bait-print-agent-setup-update.exe");
+    let installer_path_str = installer_path.to_string_lossy().to_string();
+
+    // Script PowerShell: descarga + lanza con RunAs. `$ErrorActionPreference
+    // = 'Stop'` hace que cualquier fallo (red caida, 404, etc.) tire excepcion
+    // y deje stderr legible.
+    let ps_script = format!(
+        "$ErrorActionPreference='Stop'; \
+         $ProgressPreference='SilentlyContinue'; \
+         Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing; \
+         Start-Process -Verb RunAs -FilePath '{}'",
+        download_url, installer_path_str, installer_path_str
+    );
+
+    log::info!("[updater] Descargando + lanzando instalador desde {download_url}");
+
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &ps_script,
+        ])
+        .output()
+        .map_err(|e| format!("No pude lanzar PowerShell: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        log::error!("[updater] PowerShell exit {:?}: {}", output.status.code(), stderr);
+
+        // Exit code 1223 (0x4C7) = ERROR_CANCELLED = el user clickeo "No"
+        // en el popup de UAC. Le damos un mensaje user-friendly.
+        if stderr.contains("1223") || stdout.contains("1223") {
+            return Err("Cancelaste el popup de Windows. Volve a clickear si querias actualizar.".to_string());
+        }
+        return Err(format!(
+            "Fallo al descargar o lanzar el instalador: {}",
+            if stderr.trim().is_empty() { &stdout } else { &stderr }
+                .trim()
+                .chars()
+                .take(300)
+                .collect::<String>()
+        ));
+    }
+
+    log::info!("[updater] Instalador lanzado OK desde {installer_path_str}");
+    Ok(installer_path_str)
+}
+
 // ---------- Window helpers ----------
 
 /// Reposiciona la ventana cerca del tray (bottom-right del monitor con
@@ -239,7 +321,8 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             read_local_api_token,
-            open_logs_folder
+            open_logs_folder,
+            install_update
         ])
         .setup(|app| {
             let handle = app.handle().clone();

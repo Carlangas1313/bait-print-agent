@@ -121,6 +121,7 @@ function App() {
               <ActionsTab
                 printers={printers}
                 isDisconnected={isDisconnected}
+                agentVersion={agentState?.agent_version}
                 onQueueRefreshed={() => {
                   void statusQuery.refresh();
                   void jobsQuery.refresh();

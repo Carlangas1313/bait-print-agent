@@ -1,14 +1,17 @@
 import { LifeBuoy } from "lucide-react";
 import { motion } from "framer-motion";
+import { COMPANION_VERSION } from "@/lib/updater";
 
 interface AppFooterProps {
   agentVersion?: string;
+  /** Override solo para tests/stories. En produccion siempre se usa la
+   *  version del package.json del companion via COMPANION_VERSION. */
   companionVersion?: string;
 }
 
 export function AppFooter({
   agentVersion,
-  companionVersion = "0.1.0",
+  companionVersion = COMPANION_VERSION,
 }: AppFooterProps) {
   return (
     <motion.footer
