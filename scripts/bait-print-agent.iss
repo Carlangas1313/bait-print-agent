@@ -215,9 +215,15 @@ begin
   // -------------------------------------------------------------------------
   // Chequeo de config previa. Si NO existe config.json en el home del user,
   // saltamos la pagina de "Saltar configuracion" mas abajo y forzamos pairing.
+  //
+  // Usamos GetEnv en lugar de ExpandConstant('{userprofile}') porque
+  // {userprofile} NO es una constante de Inno Setup (solo {userdocs},
+  // {userappdata}, etc lo son). GetEnv lee USERPROFILE del env del proceso
+  // del instalador, que siempre apunta al home del user humano que esta
+  // corriendo el .exe del instalador.
   // -------------------------------------------------------------------------
   ExistingConfigFound := FileExists(
-    ExpandConstant('{userprofile}\.bait-print-agent\config.json'));
+    GetEnv('USERPROFILE') + '\.bait-print-agent\config.json');
 
   // -------------------------------------------------------------------------
   // Pagina 1 (condicional): "Saltar configuracion" — checkbox para reinstalaciones.
@@ -389,8 +395,11 @@ end;
 function GetUserConfigPath: String;
 begin
   // src/persistent-config.ts usa os.homedir() + '/.bait-print-agent/config.json'.
-  // {userprofile} de Inno equivale a %USERPROFILE% = os.homedir() en Windows.
-  Result := ExpandConstant('{userprofile}\.bait-print-agent\config.json');
+  // GetEnv('USERPROFILE') equivale a %USERPROFILE% = os.homedir() en Windows.
+  // (No usamos ExpandConstant('{userprofile}') porque {userprofile} no es
+  // una constante valida de Inno Setup — los constantes documentados son
+  // {userdocs}, {userappdata}, etc.)
+  Result := GetEnv('USERPROFILE') + '\.bait-print-agent\config.json';
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -414,7 +423,7 @@ begin
       begin
         DeleteFile(ConfigPath);
         // Intentamos borrar tambien la carpeta padre si quedo vacia.
-        RemoveDir(ExpandConstant('{userprofile}\.bait-print-agent'));
+        RemoveDir(GetEnv('USERPROFILE') + '\.bait-print-agent');
       end;
     end;
   end;
