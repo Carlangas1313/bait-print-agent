@@ -317,6 +317,31 @@ function serviceExists(nssm: string, serviceName: string): boolean {
 }
 
 /**
+ * Detecta si el servicio existente fue creado con NSSM (el path apunta a
+ * `nssm.exe`) o con `sc.exe create` directo (el path apunta al .exe del
+ * agente). Esto sirve para decidir si en un upgrade hay que hacer cleanup
+ * total (caso sc.exe leftover) o solo reconfigurar (caso NSSM normal).
+ *
+ * Usa `sc.exe qc` que devuelve la query config del servicio incluyendo
+ * `BINARY_PATH_NAME`. Si esa linea contiene "nssm.exe" (case-insensitive),
+ * el servicio es NSSM-managed. Cualquier otro path = sc.exe-only.
+ *
+ * Si no podemos consultar (servicio inexistente, permisos), devolvemos
+ * `false` y el caller cae al path de cleanup conservador.
+ */
+function isNssmManagedService(serviceName: string): boolean {
+  try {
+    const out = execFileSync('sc.exe', ['qc', serviceName], {
+      encoding: 'utf8',
+      stdio: 'pipe'
+    });
+    return /nssm\.exe/i.test(out);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Instala el agente como servicio Windows en auto-start usando NSSM. Pasos:
  *
  *  1. Valida Windows + admin.
@@ -339,37 +364,61 @@ export async function installService(opts: InstallServiceOptions): Promise<void>
   logger.info({ nssm, exePath, serviceName, serviceDisplay }, 'Instalando servicio Windows con NSSM');
 
   // ------------------------------------------------------------------
-  // 1. Cleanup de instalacion previa rota (bug del Sprint 3c).
+  // 1. Decidir el path: instalacion fresca vs upgrade.
   //
-  // Si el sub-agente previo creo el servicio con `sc.exe create` directo,
-  // NSSM no lo reconoce y al hacer `nssm install` tira "service already
-  // exists". Limpiamos con sc.exe primero para que el reinstall sea idempotente.
+  // PROBLEMA QUE RESUELVE (bug v0.6.x reportado por Carlos):
+  // El approach viejo era "cleanupBrokenScService + serviceExists check +
+  // nssm install nuevo". El delete con sc.exe deja al servicio en estado
+  // "pending delete" en el SCM hasta que el ultimo handle se cierra
+  // (services.msc abierto, Task Manager, etc). Si serviceExists() corre
+  // antes de que el SCM lo libere, ve el servicio todavia ahi y
+  // process.exit(1) → instalacion fallida en upgrade.
+  //
+  // SOLUCION: detectar si el servicio que existe ES NSSM-managed. Si si,
+  // hacer UPGRADE in-place: stop + update Application path + set configs +
+  // start. Sin delete ni race conditions. Si NO es NSSM-managed (sc.exe
+  // leftover del Sprint 3c), hacer cleanup completo + install fresco.
+  //
+  // En instalacion fresca (servicio no existe), el path es directo:
+  // install + configure + start.
   // ------------------------------------------------------------------
-  cleanupBrokenScService(serviceName, logger);
+  const isUpgrade = serviceExists(nssm, serviceName);
+  const isLegacyService = isUpgrade && !isNssmManagedService(serviceName);
 
-  // ------------------------------------------------------------------
-  // 2. Doble-check: ¿quedo limpio?
-  //
-  // Si despues del cleanup el servicio sigue existiendo, algo raro paso —
-  // mejor pedir uninstall manual.
-  // ------------------------------------------------------------------
-  if (serviceExists(nssm, serviceName)) {
-    logger.warn(
-      `El servicio "${serviceName}" ya existe segun NSSM. Desinstalalo primero con:\n   bait-print-agent uninstall-service --name ${serviceName}`
-    );
-    process.exit(1);
+  if (isUpgrade && !isLegacyService) {
+    // Upgrade limpio: el servicio existe y es NSSM-managed (caso normal).
+    // Lo stoppeamos (idempotent), actualizamos Application path por si el
+    // .exe cambio de ubicacion, y dejamos que los `nssm set` de abajo
+    // reconfiguren el resto. NO borramos para evitar el race "pending delete".
+    logger.info('Servicio NSSM ya existe — modo upgrade in-place');
+    runNssm(nssm, ['stop', serviceName], logger, { ignoreErrors: true });
+    // Dar al SCM tiempo de cerrar handles del child antes de update.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+    runNssm(nssm, ['set', serviceName, 'Application', exePath], logger);
+    logger.info(`  ✓ Application path actualizado: ${exePath}`);
+  } else if (isLegacyService) {
+    // Legacy: el servicio existe pero fue creado con sc.exe directo
+    // (Sprint 3c bug). Limpieza total y reinstalacion fresca.
+    logger.warn('Servicio legacy detectado (sc.exe-managed) — cleanup + reinstall');
+    cleanupBrokenScService(serviceName, logger);
+    // Esperar a que el SCM realmente libere antes de instalar nuevo.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+    if (serviceExists(nssm, serviceName)) {
+      logger.error(
+        `El servicio legacy "${serviceName}" sigue existiendo despues del cleanup. ` +
+          `Cerra services.msc si lo tenes abierto y reintenta, o desinstala manualmente con:\n` +
+          `   bait-print-agent uninstall-service --name ${serviceName}`
+      );
+      process.exit(1);
+    }
+    runNssm(nssm, ['install', serviceName, exePath], logger);
+    logger.info(`  ✓ NSSM instalo el servicio (post-cleanup legacy)`);
+  } else {
+    // Instalacion fresca: el servicio no existe.
+    logger.info('Servicio no existe — instalacion fresca');
+    runNssm(nssm, ['install', serviceName, exePath], logger);
+    logger.info(`  ✓ NSSM instalo el servicio (path: ${nssm})`);
   }
-
-  // ------------------------------------------------------------------
-  // 3. Install: crear el servicio apuntando al .exe del agente.
-  //
-  // nssm install <name> <programPath> [args...]
-  //
-  // No le pasamos args: el agente arranca sin argumentos en modo persistente
-  // (lee el config de ~/.bait-print-agent/config.json).
-  // ------------------------------------------------------------------
-  runNssm(nssm, ['install', serviceName, exePath], logger);
-  logger.info(`  ✓ NSSM instalo el servicio (path: ${nssm})`);
 
   // ------------------------------------------------------------------
   // 4. Display name + descripcion (cosmetico pero util en services.msc).

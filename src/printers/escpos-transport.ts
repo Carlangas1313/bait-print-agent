@@ -1,0 +1,241 @@
+/**
+ * Transport unificado para mandar ESC/POS a una impresora termica.
+ *
+ * Por que un helper aparte:
+ * -------------------------
+ * Hay 2+ callsites que necesitan mandar ESC/POS a una impresora real:
+ *  - `renderJobToPrinter` (flow productivo de comandas)
+ *  - `renderTestPage` (boton "Imprimir test" del companion)
+ *  - Futuros renderers (notificaciones, anulaciones masivas, etc.)
+ *
+ * Sin este helper, cada renderer reimplementa la logica de "elegir el
+ * transport segun connection_type", lo cual:
+ *  - Duplica codigo (DRY violation).
+ *  - Hace que un bug del transport (ej. el caso Rongta donde el backend
+ *    `printer:` falla en SEA) tenga que arreglarse en N lugares.
+ *  - Bloquea agregar transports nuevos (BLE directo, queue de impresion
+ *    Linux/macOS) sin tocar todos los renderers.
+ *
+ * Diseño:
+ * -------
+ * El renderer arma el contenido (lineas + bold + beep + cut) DENTRO de un
+ * callback que recibe el `ThermalPrinter` ya instanciado. El helper decide:
+ *
+ *  - USB        → buffer-only ThermalPrinter, `getBuffer()` + spooler RAW
+ *                 Win32 (sendRawToWindowsPrinter). Esto bypassea cualquier
+ *                 driver propietario (Rongta "80Normal", DOT4 de HP, etc.)
+ *                 que no traduzca ESC/POS al GDI esperado por el spooler.
+ *
+ *  - NETWORK    → ThermalPrinter con interface `tcp://ip:9100`. Abre socket,
+ *                 isPrinterConnected verifica, execute envia y cierra. La
+ *                 termica con Ethernet recibe ESC/POS raw via puerto 9100.
+ *
+ *  - BLUETOOTH  → ThermalPrinter con interface `\\.\COMn`. Escribe al device
+ *                 file del COM virtual; el stack BT de Windows entrega al
+ *                 modulo SPP de la impresora.
+ *
+ * Cualquier otro `connection_type` tira error claro pidiendo configurar
+ * la printer correctamente.
+ */
+
+import {
+  printer as ThermalPrinter,
+  types as PrinterTypes,
+  CharacterSet
+} from 'node-thermal-printer';
+import type { Logger } from '../logger.js';
+import type { PrinterRow } from './registry.js';
+import { sendRawToWindowsPrinter } from './win-raw-print.js';
+
+/**
+ * Ancho del papel en chars. Misma constante que console.ts/format.ts.
+ * Hoy fijo en 32 (58mm). Cuando sumemos 80mm, leer del `printer_type` o
+ * agregar columna `width` a la tabla `printers`.
+ */
+const PRINTER_WIDTH = 32;
+
+/**
+ * Timeout para socket TCP (network) o file (bluetooth) en ms. Misma logica
+ * que el renderer viejo. Para USB no aplica — el spooler de Windows tiene
+ * su propio timeout interno mas razonable.
+ */
+const CONNECT_TIMEOUT_MS = 5_000;
+
+/**
+ * Callback que el renderer usa para poblar el ThermalPrinter con el
+ * contenido del ticket (lineas, bold, beep, cut). El helper ya hizo
+ * `tp.clear()` antes de llamarte, asi que arrancas con buffer limpio.
+ *
+ * Tipamos el `tp` como `unknown` y casteamos al consumer para no propagar
+ * los typings de node-thermal-printer fuera de transport.ts. En la practica
+ * el caller hace `tp as ThermalPrinter` y usa la API completa.
+ */
+export type PopulatePrinter = (tp: InstanceType<typeof ThermalPrinter>) => void;
+
+/**
+ * Manda un ticket ESC/POS a la impresora segun su `connection_type`.
+ *
+ * El renderer (caller) NO necesita saber si la impresora es USB queue,
+ * TCP raw 9100 o COM virtual — solo arma el contenido en el callback.
+ *
+ * Lanza si falla en cualquier paso (connect, send, write). El caller decide
+ * el retry path (productivo: el claimAndRun de realtime.ts; test: el handler
+ * de /v1/printers/:id/test).
+ */
+export async function sendEscPos(
+  printer: PrinterRow,
+  populate: PopulatePrinter,
+  logger: Logger
+): Promise<void> {
+  switch (printer.connection_type) {
+    case 'usb':
+      await sendUsbViaSpooler(printer, populate, logger);
+      return;
+
+    case 'network':
+      await sendViaThermalPrinter(printer, populate, logger);
+      return;
+
+    case 'bluetooth':
+      await sendViaThermalPrinter(printer, populate, logger);
+      return;
+
+    default:
+      throw new Error(
+        `connection_type no soportado: "${printer.connection_type}" en printer "${printer.name}". ` +
+          `Valores validos: usb | network | bluetooth.`
+      );
+  }
+}
+
+/**
+ * Path USB: arma el buffer ESC/POS sin abrir conexion al device, despues
+ * lo manda via spooler Win32 (RAW datatype). Funciona para CUALQUIER queue
+ * registrada en Windows independiente del driver del fabricante.
+ *
+ * Usamos un interface dummy (`\\.\__bait_buffer_only__`) que ThermalPrinter
+ * NO abre hasta que llamamos `execute()` o `isPrinterConnected()`. Como
+ * solo usamos `getBuffer()`, nunca se intenta abrir el handle. Workaround
+ * para que la API de node-thermal-printer nos sirva como builder de buffer.
+ */
+async function sendUsbViaSpooler(
+  printer: PrinterRow,
+  populate: PopulatePrinter,
+  logger: Logger
+): Promise<void> {
+  const tp = new ThermalPrinter({
+    type: PrinterTypes.EPSON,
+    interface: '\\\\.\\__bait_buffer_only__',
+    characterSet: CharacterSet.PC858_EURO,
+    width: PRINTER_WIDTH,
+    removeSpecialCharacters: false
+  });
+  tp.clear();
+  populate(tp);
+  const buffer = tp.getBuffer();
+  await sendRawToWindowsPrinter(printer.name, buffer, logger);
+  logger.debug(
+    { printer: printer.name, bytes: buffer.length },
+    'sendEscPos USB via spooler RAW completado'
+  );
+}
+
+/**
+ * Path network/bluetooth: usa ThermalPrinter con un interface URI real.
+ * node-thermal-printer abre el socket/file, escribe el buffer y cierra.
+ *
+ * Verifica conectividad antes para fallar rapido si el device no responde
+ * (asi el retry-scheduler del realtime puede aplicar backoff sin esperar
+ * el timeout de write).
+ */
+async function sendViaThermalPrinter(
+  printer: PrinterRow,
+  populate: PopulatePrinter,
+  logger: Logger
+): Promise<void> {
+  const interfaceUri = buildInterfaceUri(printer);
+
+  const tp = new ThermalPrinter({
+    type: PrinterTypes.EPSON,
+    interface: interfaceUri,
+    characterSet: CharacterSet.PC858_EURO,
+    width: PRINTER_WIDTH,
+    removeSpecialCharacters: false,
+    options: { timeout: CONNECT_TIMEOUT_MS }
+  });
+
+  let connected = false;
+  try {
+    connected = await tp.isPrinterConnected();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Printer "${printer.name}" no responde (${printer.connection_type}://${printer.target}): ${msg}`
+    );
+  }
+  if (!connected) {
+    throw new Error(
+      `Printer "${printer.name}" no responde (${printer.connection_type}://${printer.target})`
+    );
+  }
+
+  tp.clear();
+  populate(tp);
+
+  try {
+    await tp.execute();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Fallo execute() en printer "${printer.name}": ${msg}`
+    );
+  }
+
+  logger.debug(
+    {
+      printer: printer.name,
+      connection_type: printer.connection_type,
+      target: printer.target
+    },
+    'sendEscPos via ThermalPrinter (network/bluetooth) completado'
+  );
+}
+
+/**
+ * Construye el `interface` URI que node-thermal-printer espera para network
+ * y bluetooth. Igual que el viejo `buildInterfaceUri` de usb.ts pero solo
+ * cubre los casos no-USB (USB ahora va por el spooler).
+ *
+ * Para BLUETOOTH:
+ *   target = "COM7"          → "\\\\.\\COM7"
+ *   target = "\\\\.\\COM7"   → "\\\\.\\COM7" (idempotente)
+ *
+ * Para NETWORK:
+ *   target = "192.168.1.50:9100" → "tcp://192.168.1.50:9100"
+ *   target = "192.168.1.50"      → "tcp://192.168.1.50:9100" (default port)
+ */
+function buildInterfaceUri(printer: PrinterRow): string {
+  const target = (printer.target ?? '').trim();
+  if (target.length === 0) {
+    throw new Error(
+      `Printer "${printer.name}" no tiene target configurado. Configurala en bait-app.cl -> Configuracion -> Impresoras.`
+    );
+  }
+
+  switch (printer.connection_type) {
+    case 'network': {
+      const hasPort = /:\d+$/.test(target);
+      return hasPort ? `tcp://${target}` : `tcp://${target}:9100`;
+    }
+    case 'bluetooth': {
+      if (target.startsWith('\\\\')) return target;
+      return `\\\\.\\${target}`;
+    }
+    default:
+      // No deberia llegar aca — sendEscPos route USB al spooler, no a este
+      // helper. Defensive throw.
+      throw new Error(
+        `buildInterfaceUri llamado con connection_type "${printer.connection_type}" — solo network/bluetooth aca.`
+      );
+  }
+}

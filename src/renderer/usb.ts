@@ -1,46 +1,21 @@
 /**
- * Renderer ESC/POS real: manda los jobs a impresoras termicas fisicas
- * via USB (cola Windows compartida), LAN (TCP raw 9100) o Bluetooth
- * (COM port virtual de Windows).
+ * Renderers ESC/POS: arman el contenido de tickets (jobs productivos +
+ * pagina de prueba del companion) y delegan el envio al helper unificado
+ * `sendEscPos` de `printers/escpos-transport.ts`.
  *
- * Stack:
- *  - `node-thermal-printer` 4.x para generar el buffer ESC/POS y mandarlo.
- *    Soporta Epson/Star/Tanca/Daruma/Brother. Default EPSON; cubre 90%+
- *    de las termicas del mercado chileno (TM-T20II, T20III, T88V, TSP143).
- *  - Backend `network`: usa el modulo `net` de Node (puro JS, OK en SEA).
- *  - Backend `file`: usa `fs.createWriteStream` (puro JS, OK en SEA).
- *  - Backend `printer:` (cola Windows con driver nativo `printer`): solo
- *    disponible cuando el agente corre desde Node normal (dev). En SEA lo
- *    skipeamos porque el binario nativo `.node` no se empaqueta — ahi el
- *    usuario debe compartir la cola como `\\localhost\<share>` o usar
- *    el path UNC directo en el `target`.
- *
- * Eleccion de `interface` URI:
- *
- *   connection_type | target ejemplo            | URI resultante
- *   ----------------+---------------------------+---------------------------
- *   network         | 192.168.1.50:9100         | tcp://192.168.1.50:9100
- *   network         | 192.168.1.50              | tcp://192.168.1.50:9100
- *   bluetooth       | COM7                      | \\.\COM7
- *   usb             | \\localhost\EPSONTM       | \\localhost\EPSONTM (file)
- *   usb             | \\.\USB001                | \\.\USB001 (file)
- *   usb             | EPSON TM-T20III Receipt   | printer:EPSON TM-T20III Receipt
- *                   |                           |   (requiere modulo `printer`,
- *                   |                           |    fallback a error claro en SEA)
+ * Toda la decision de "elegir transport" (USB spooler RAW Win32 vs TCP raw
+ * 9100 vs COM virtual) vive en el helper. Aca solo importa el CONTENIDO
+ * del ticket — esto evita duplicacion y deja que sumar un renderer nuevo
+ * (notificaciones de cierre, ticket de propinas, etc) sea trivial.
  */
 
-import {
-  printer as ThermalPrinter,
-  types as PrinterTypes,
-  CharacterSet
-} from 'node-thermal-printer';
 import type { Logger } from '../logger.js';
 import type { PrintJobRow } from '../types.js';
 import { formatJob } from './console.js';
 import type { PrinterRow } from '../printers/registry.js';
 import type { DiscoveredPrinter } from '../printers/discover.js';
 import { AGENT_VERSION } from '../constants.js';
-import { sendRawToWindowsPrinter } from '../printers/win-raw-print.js';
+import { sendEscPos } from '../printers/escpos-transport.js';
 
 /**
  * Ancho del papel en chars. Misma constante que console.ts/format.ts.
@@ -68,96 +43,22 @@ function isBoldLine(rawLine: string): boolean {
 }
 
 /**
- * Construye el `interface` URI que `node-thermal-printer` espera segun
- * el connection_type y el target. Lanza error claro si los datos no
- * cuadran (target vacio, IP malformada, etc.) para que el job falle rapido
- * y vaya al retry path en vez de quedar colgado en el socket.
- *
- * Reglas:
- *   - network: target puede venir como "IP" o "IP:puerto". Si no trae
- *     puerto, asumimos 9100 (raw print, estandar industrial).
- *   - bluetooth: target es el COM port (ej. "COM7" o "\\.\COM7"). Si el
- *     usuario solo puso "COM7", le agregamos el prefijo "\\.\".
- *   - usb: tres casos posibles segun el formato de target:
- *       a) Empieza con "\\" (UNC) o "\\." (device path) -> file backend.
- *       b) Cualquier otro string -> "printer:<nombre>" (requiere driver
- *          nativo `printer`, solo OK en dev/Node, no en SEA).
- */
-function buildInterfaceUri(printer: PrinterRow): string {
-  const target = (printer.target ?? '').trim();
-  if (target.length === 0) {
-    throw new Error(
-      `Printer "${printer.name}" no tiene target configurado. Configurala en bait-app.cl -> Configuracion -> Impresoras.`
-    );
-  }
-
-  switch (printer.connection_type) {
-    case 'network': {
-      // "192.168.1.50:9100" o "192.168.1.50"
-      const hasPort = /:\d+$/.test(target);
-      return hasPort ? `tcp://${target}` : `tcp://${target}:9100`;
-    }
-
-    case 'bluetooth': {
-      // Bluetooth en Windows se expone como COM virtual cuando esta pareada.
-      // Aceptamos "COM7" o "\\.\COM7" indistintamente.
-      if (target.startsWith('\\\\')) return target;
-      return `\\\\.\\${target}`;
-    }
-
-    case 'usb': {
-      // Caso a: ya es un path file (UNC compartida o device path crudo).
-      if (target.startsWith('\\\\')) return target;
-      // Caso b: nombre de cola Windows -> printer: con driver nativo.
-      // En SEA el driver no se puede cargar; el error se va a tirar al
-      // ejecutar isPrinterConnected. Documentado en el README.
-      return `printer:${target}`;
-    }
-
-    default: {
-      // Cualquier otro connection_type que el filtro de registry.ts dejo
-      // pasar por error. Defensive: tiramos para no mandar basura al socket.
-      throw new Error(
-        `connection_type no soportado: "${printer.connection_type}" en printer "${printer.name}"`
-      );
-    }
-  }
-}
-
-/**
- * Carga el driver nativo `printer` de manera opcional. Solo necesario
- * cuando el target es `printer:<nombre>` (cola Windows con driver nativo).
- *
- * En SEA el modulo nativo `.node` no se empaqueta y require() tira; en
- * ese caso retornamos null y el caller decide si tirar o sugerir un
- * fallback (compartir la cola como UNC).
- */
-function loadOptionalPrinterDriver(): unknown | null {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const mod = require('printer');
-    return mod;
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Imprime un job en una impresora fisica via ESC/POS.
  *
- * Flujo:
- *   1. Construir interface URI segun connection_type/target.
- *   2. Instanciar ThermalPrinter con codepage chileno (PC858 cubre tildes,
- *      ñ y €).
- *   3. Si interface es `printer:`, cargar driver nativo opcional. Si no
- *      esta disponible, tirar error claro.
- *   4. isPrinterConnected() — si la printer no responde, error con contexto.
- *   5. Generar el bloque ASCII via formatJob() (compartido con console/virtual).
- *   6. Iterar lineas y agregar bold cuando matchee keyword (MESA, TOTAL, ...).
- *   7. Beep + cut + execute. Repetir `copies` veces.
+ * Flujo (refactor v0.6.7):
+ *  1. formatJob() genera el bloque ASCII del ticket (mismo contenido que
+ *     consola/virtual).
+ *  2. Por cada copy (default 1), llamamos a sendEscPos del helper unificado.
+ *     El callback popula el ThermalPrinter con las lineas + bold + beep + cut.
+ *     El helper elige el transport:
+ *       - USB → Win32 spooler RAW (bypass driver del fabricante)
+ *       - network → tcp://target:9100
+ *       - bluetooth → \\.\COMn
  *
- * No captura excepciones internas: deja que se propaguen al claimAndRun
- * del realtime.ts, que las maneja con retry + backoff.
+ * El renderer NO sabe qué transport se usa — solo arma contenido.
+ *
+ * No captura excepciones del transport: deja que se propaguen al
+ * claimAndRun del realtime.ts, que las maneja con retry + backoff.
  */
 export async function renderJobToPrinter(
   job: PrintJobRow,
@@ -175,96 +76,30 @@ export async function renderJobToPrinter(
     `Renderizando job ${job.id} en impresora "${printer.name}" (${printer.connection_type})`
   );
 
-  const interfaceUri = buildInterfaceUri(printer);
-
-  // node-thermal-printer requiere el driver explicito para el backend
-  // `printer:`. Para network/file el campo `driver` se ignora.
-  const driver =
-    interfaceUri.startsWith('printer:')
-      ? (loadOptionalPrinterDriver() as object | null)
-      : undefined;
-
-  if (interfaceUri.startsWith('printer:') && !driver) {
-    throw new Error(
-      `No se pudo cargar el driver nativo 'printer' para imprimir en cola Windows "${printer.target}". ` +
-        `Opciones:\n` +
-        `  1) Compartir la cola en Windows y configurar el target como \\\\localhost\\<nombre_share>\n` +
-        `  2) Usar conexion LAN (puerto raw 9100) en vez de USB\n` +
-        `  3) (Avanzado) Instalar el modulo 'printer' manualmente; no funciona en el .exe empaquetado.`
-    );
-  }
-
-  const tp = new ThermalPrinter({
-    type: PrinterTypes.EPSON, // Epson-compat cubre 90%+ del mercado CL.
-    interface: interfaceUri,
-    characterSet: CharacterSet.PC858_EURO, // Tildes + ñ + € en chileno.
-    width: PRINTER_WIDTH,
-    removeSpecialCharacters: false,
-    options: { timeout: 5000 },
-    // Cast a `any` porque el typing oficial pide `Object` pero acepta undefined
-    // tambien para los backends que no lo usan (network/file).
-    ...(driver ? { driver: driver as object } : {})
-  });
-
-  // Verificar conexion antes de armar el buffer. Para LAN abre socket
-  // a host:port y cierra. Para file/printer chequea existencia/disponibilidad.
-  let connected = false;
-  try {
-    connected = await tp.isPrinterConnected();
-  } catch (err) {
-    // El backend `printer:` tira false en vez de retornar false. Lo
-    // tratamos como no-conectada con detalle del error.
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(
-      `Printer "${printer.name}" no responde (${printer.connection_type}://${printer.target}): ${msg}`
-    );
-  }
-  if (!connected) {
-    throw new Error(
-      `Printer "${printer.name}" no responde (${printer.connection_type}://${printer.target})`
-    );
-  }
-
-  // Construir el bloque ASCII reutilizando el formatter compartido.
-  // No re-implementamos layouts aca: console/virtual/usb deben mostrar
-  // el mismo ticket.
   const content = formatJob(job, logger);
   const lines = content.split('\n');
-
   const copies = Math.max(1, printer.copies ?? 1);
 
   for (let copy = 1; copy <= copies; copy++) {
-    tp.clear();
-
-    for (const rawLine of lines) {
-      // Lineas vacias = newLine() simple, sin pasar por println() que mete
-      // un \n extra en algunos firmwares medio rotos.
-      if (rawLine.length === 0) {
-        tp.newLine();
-        continue;
-      }
-
-      const bold = isBoldLine(rawLine);
-      if (bold) tp.bold(true);
-      tp.println(rawLine);
-      if (bold) tp.bold(false);
-    }
-
-    if (printer.beep) {
-      // 1 beep corto. Algunas Epson aceptan 2 args (numero, longitud),
-      // otras solo el primero. Pasamos los defaults.
-      tp.beep();
-    }
-    if (printer.cut_paper) {
-      tp.cut();
-    }
-
     try {
-      await tp.execute();
+      await sendEscPos(printer, (tp) => {
+        for (const rawLine of lines) {
+          if (rawLine.length === 0) {
+            tp.newLine();
+            continue;
+          }
+          const bold = isBoldLine(rawLine);
+          if (bold) tp.bold(true);
+          tp.println(rawLine);
+          if (bold) tp.bold(false);
+        }
+        if (printer.beep) tp.beep();
+        if (printer.cut_paper) tp.cut();
+      }, logger);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(
-        `Fallo execute() en printer "${printer.name}" (copia ${copy}/${copies}): ${msg}`
+        `Fallo print de job ${job.id} en "${printer.name}" (copia ${copy}/${copies}): ${msg}`
       );
     }
   }
@@ -283,56 +118,38 @@ export async function renderJobToPrinter(
 
 /**
  * Construye una `PrinterRow` sintetica a partir de una impresora descubierta
- * del OS. Sirve para imprimir un test page directo (sin pasar por la cola
- * print_jobs) eligiendo cualquier impresora del dropdown del companion, sin
- * que tenga que estar configurada todavia en bait-app.cl.
+ * del OS. Usada por `renderTestPage` para llamar a `sendEscPos` con el
+ * mismo contrato que usa el flow productivo, sin necesidad de que la
+ * impresora este configurada en bait-app.cl.
  *
- * Reglas de mapeo:
- *  - usb         → target = "\\.\<PortName>" (device path crudo, evita el
- *                  modulo `printer` que no funciona en SEA).
- *  - network     → target = "<device_id>" (ya viene como "ip:puerto").
- *  - bluetooth   → target = "\\.\<device_id>" (COM port virtual).
- *  - unknown     → tiramos error claro (no podemos imprimir si no sabemos
- *                  por que puerto sale).
+ * Reglas:
+ *  - kind 'usb' o 'unknown'  → connection_type='usb' en la PrinterRow.
+ *    El helper sendEscPos enruta esto al spooler RAW Win32 usando el
+ *    `name` como queue name, asi que funciona para cualquier driver
+ *    (Rongta, Epson, etc) sin tocar `target`.
+ *  - kind 'network'          → connection_type='network', target='ip:puerto'.
+ *  - kind 'bluetooth'        → connection_type='bluetooth', target=COMn.
  *
- * Para el test page no necesitamos copies/beep/cut_paper de la config — usamos
- * defaults (1 copia, beep off, cut on).
+ * Para el test page no necesitamos copies/beep — defaults (1 copia, sin beep,
+ * con cut).
  */
 function discoveredToSyntheticPrinter(
   discovered: DiscoveredPrinter
 ): PrinterRow {
-  let target: string;
-  switch (discovered.kind) {
-    case 'usb':
-      // PortName tipico: "USB001". El prefijo \\.\ lo convierte en device
-      // path que el backend `file` de node-thermal-printer abre como stream.
-      target = discovered.device_id.startsWith('\\\\')
-        ? discovered.device_id
-        : `\\\\.\\${discovered.device_id}`;
-      break;
-    case 'network':
-      // Ya viene como "ip:puerto" desde discover.ts.
-      target = discovered.device_id;
-      break;
-    case 'bluetooth':
-      // COM virtual en Windows: "COM7" → "\\.\COM7".
-      target = discovered.device_id.startsWith('\\\\')
-        ? discovered.device_id
-        : `\\\\.\\${discovered.device_id}`;
-      break;
-    default:
-      throw new Error(
-        `No puedo imprimir test page en una impresora de tipo "${discovered.kind}". ` +
-          `Configurala manualmente en bait-app.cl -> Settings -> Impresoras.`
-      );
-  }
+  // Determinar connection_type para el helper. 'unknown' lo mapeamos a 'usb'
+  // porque el spooler de Windows maneja cualquier queue registrada sin
+  // importar el port name — es nuestro fallback universal en Windows.
+  const connectionType: PrinterRow['connection_type'] =
+    discovered.kind === 'unknown' ? 'usb' : discovered.kind;
 
   return {
     id: `test-${discovered.device_id}`,
     name: discovered.name,
     printer_type: 'thermal_test',
-    connection_type: discovered.kind,
-    target,
+    connection_type: connectionType,
+    // Para USB el helper ignora target (usa name como queue). Para network
+    // y bluetooth el target ES requerido y viene del device_id del OS.
+    target: discovered.device_id,
     print_area_id: null,
     is_primary: false,
     copies: 1,
@@ -402,21 +219,13 @@ function centerLine(text: string, width: number): string {
  * Imprime un test page en la impresora indicada. Usado por el endpoint
  * `POST /v1/printers/:id/test` del companion.
  *
- * Diseño: NO pasa por la cola print_jobs. El handler recibe el id del OS
- * (USB001 / ip:puerto / COM7), construye una `PrinterRow` sintetica con esa
- * conexion y delega al mismo path de node-thermal-printer que usa la
- * impresion productiva. Asi el test:
- *   - No requiere que la impresora este configurada en bait-app.cl.
- *   - Verifica la conectividad real al mismo socket / device que usaria
- *     un job productivo.
- *   - No genera ruido en la tabla print_jobs (no aparece como "Test" en
- *     el historial del dashboard).
+ * Diseño: NO pasa por la cola print_jobs. El handler arma una `PrinterRow`
+ * sintetica desde el DiscoveredPrinter (USB/network/bluetooth/unknown) y
+ * delega TODO el transport al mismo `sendEscPos` que usa el flow productivo.
  *
- * Errores:
- *   - Si la printer no responde → throw "Printer no responde...".
- *   - Si el backend `printer:` (queue Windows con driver) se intenta usar
- *     en SEA → throw con sugerencia de UNC share.
- *   - Si kind === 'unknown' → throw con sugerencia de configuracion manual.
+ * Asi tenemos un solo path para "elegir transport segun kind" — si en el
+ * futuro agregamos por ejemplo BLE-LE directo, una sola modificacion en
+ * el helper hace que test + jobs productivos lo usen.
  */
 export async function renderTestPage(
   discovered: DiscoveredPrinter,
@@ -433,120 +242,35 @@ export async function renderTestPage(
     `Imprimiendo test page en "${discovered.name}" (${discovered.kind})`
   );
 
-  // Estrategia segun el kind del discovery:
-  //
-  //  - USB / unknown: usamos el spooler RAW de Windows via WritePrinter
-  //    (Win32 API). Es la unica forma confiable de imprimir ESC/POS en
-  //    impresoras USB modernas que se exponen como queues con drivers
-  //    propietarios (Rongta, ESDPRT, DOT4, etc). No usamos buildInterfaceUri
-  //    aca porque no necesitamos un interface URI — el spooler routea solo.
-  //
-  //  - NETWORK: TCP raw 9100 sigue siendo el path correcto. node-thermal-printer
-  //    abre un socket y manda ESC/POS sin pasar por el OS.
-  //
-  //  - BLUETOOTH: COM virtual en Windows. Usamos node-thermal-printer en
-  //    modo file (\\.\COMn).
-  //
-  // Generamos el buffer ESC/POS UNA sola vez con node-thermal-printer y
-  // despues lo mandamos por el transport correcto. Para USB usamos
-  // sendRawToWindowsPrinter (spooler); para network/bluetooth seguimos
-  // usando tp.execute() que abre el socket.
-
-  if (discovered.kind === 'usb' || discovered.kind === 'unknown') {
-    // Generar el buffer ESC/POS con un "interface dummy" que node-thermal-printer
-    // acepta para construir el comando sin abrir conexion. El truco: usamos
-    // un path file inexistente; nunca llamamos a execute() asi que no se
-    // abre el handle. Solo nos interesa el buffer.
-    const tp = new ThermalPrinter({
-      type: PrinterTypes.EPSON,
-      interface: '\\\\.\\__bait_buffer_only__',
-      characterSet: CharacterSet.PC858_EURO,
-      width: PRINTER_WIDTH,
-      removeSpecialCharacters: false
-    });
-
-    tp.clear();
-    const lines = buildTestPageLines(discovered, agentName, locationName);
-    for (const raw of lines) {
-      if (raw.length === 0) {
-        tp.newLine();
-        continue;
-      }
-      const bold = isBoldLine(raw);
-      if (bold) tp.bold(true);
-      tp.println(raw);
-      if (bold) tp.bold(false);
-    }
-    tp.cut();
-
-    const buffer = tp.getBuffer();
-    await sendRawToWindowsPrinter(discovered.name, buffer, logger);
-    logger.info(
-      { printerName: discovered.name, bytes: buffer.length },
-      `Test page impreso via spooler RAW en "${discovered.name}"`
-    );
-    return;
-  }
-
-  // network / bluetooth: mismo path que el productivo via socket / COM.
   const printer = discoveredToSyntheticPrinter(discovered);
-  const interfaceUri = buildInterfaceUri(printer);
-
-  const tp = new ThermalPrinter({
-    type: PrinterTypes.EPSON,
-    interface: interfaceUri,
-    characterSet: CharacterSet.PC858_EURO,
-    width: PRINTER_WIDTH,
-    removeSpecialCharacters: false,
-    options: { timeout: 5000 }
-  });
-
-  let connected = false;
-  try {
-    connected = await tp.isPrinterConnected();
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(
-      `Printer "${printer.name}" no responde (${printer.connection_type}://${printer.target}): ${msg}`
-    );
-  }
-  if (!connected) {
-    throw new Error(
-      `Printer "${printer.name}" no responde (${printer.connection_type}://${printer.target})`
-    );
-  }
-
-  tp.clear();
   const lines = buildTestPageLines(discovered, agentName, locationName);
-  for (const raw of lines) {
-    if (raw.length === 0) {
-      tp.newLine();
-      continue;
-    }
-    const bold = isBoldLine(raw);
-    if (bold) tp.bold(true);
-    tp.println(raw);
-    if (bold) tp.bold(false);
-  }
-  if (printer.cut_paper) {
-    tp.cut();
-  }
 
   try {
-    await tp.execute();
+    await sendEscPos(printer, (tp) => {
+      for (const raw of lines) {
+        if (raw.length === 0) {
+          tp.newLine();
+          continue;
+        }
+        const bold = isBoldLine(raw);
+        if (bold) tp.bold(true);
+        tp.println(raw);
+        if (bold) tp.bold(false);
+      }
+      tp.cut();
+    }, logger);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(
-      `Fallo execute() en test page de "${printer.name}": ${msg}`
+      `Fallo test page en "${discovered.name}" (${discovered.kind}): ${msg}`
     );
   }
 
   logger.info(
     {
-      printerName: printer.name,
-      connectionType: printer.connection_type,
-      target: printer.target
+      printerName: discovered.name,
+      kind: discovered.kind
     },
-    `Test page impreso en "${printer.name}"`
+    `Test page impreso en "${discovered.name}"`
   );
 }
