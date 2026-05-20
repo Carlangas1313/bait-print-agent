@@ -4,8 +4,9 @@ import { Command } from 'commander';
 import { loadConfig, type AgentConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { createAuthenticatedSupabase } from './supabase.js';
-import { startRealtimeListener } from './realtime.js';
+import { startRealtimeListener, backfillPendingJobs } from './realtime.js';
 import { startHeartbeat } from './heartbeat.js';
+import { startRetryScheduler } from './retry-scheduler.js';
 import { getVirtualOutDir } from './renderer/virtual.js';
 import { dispatchJob } from './renderer/dispatcher.js';
 import {
@@ -20,6 +21,7 @@ import {
 } from './constants.js';
 import {
   deletePersistentConfig,
+  ensureLocalApiToken,
   getConfigPath,
   readPersistentConfig
 } from './persistent-config.js';
@@ -33,6 +35,8 @@ import {
   startPeriodicUpdateCheck
 } from './update-checker.js';
 import { autoUpdate } from './auto-update.js';
+import { startLocalApi } from './local-api/server.js';
+import type { AgentRuntimeState } from './local-api/handlers.js';
 
 /**
  * Repo de GitHub donde publicamos los .exe. Hardcodeado porque el
@@ -535,14 +539,65 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
   }
 
   // ------------------------------------------------------------------
+  // Runtime state: snapshot vivo que el local API expone via /v1/status.
+  // Lo definimos aca para que los observers (heartbeat, realtime, job
+  // handler) lo muten en sus respectivos eventos. El struct vive en este
+  // scope para que su lifetime sea el del agente.
+  // ------------------------------------------------------------------
+  const runtimeState: AgentRuntimeState = {
+    last_heartbeat_at: null,
+    last_job_at: null,
+    realtime_status: 'PENDING',
+    supabase_connected: true, // ya pasamos por createAuthenticatedSupabase OK
+    discovered_printers: [],
+    // refreshQueue se rellena despues de armar el jobHandler (necesita la
+    // closure correcta sobre printersCache + modo efectivo).
+    refreshQueue: async () => ({ processed: 0 })
+  };
+
+  // ------------------------------------------------------------------
   // Job handler unificado: el dispatcher decide segun el modo efectivo.
   // Captura `printersCache` por referencia para que el refresh interval
   // se vea reflejado al instante.
+  //
+  // Lo envolvemos para actualizar `runtimeState.last_job_at` cada vez que
+  // procesamos un job (sin importar el outcome). Asi el companion puede
+  // mostrar "Ultimo job: hace 12s" en su panel.
   // ------------------------------------------------------------------
-  const jobHandler = (job: Parameters<typeof dispatchJob>[0]) =>
-    dispatchJob(job, effectiveMode, printersCache, logger);
+  const jobHandler = async (job: Parameters<typeof dispatchJob>[0]) => {
+    const result = await dispatchJob(job, effectiveMode, printersCache, logger);
+    runtimeState.last_job_at = new Date().toISOString();
+    return result;
+  };
 
-  const heartbeatId = startHeartbeat(supabase, config, logger);
+  // Ahora si: rellenamos refreshQueue con la closure correcta. Hacemos
+  // mutation sobre el objeto para no romper la referencia que el local API
+  // ya capturo.
+  runtimeState.refreshQueue = () =>
+    backfillPendingJobs(supabase, config, logger, jobHandler);
+
+  const heartbeatId = startHeartbeat(supabase, config, logger, {
+    onSuccess: ({ at }) => {
+      runtimeState.last_heartbeat_at = at;
+      runtimeState.supabase_connected = true;
+    },
+    onFailure: () => {
+      // Si el heartbeat falla, no podemos asumir que Supabase este OK.
+      // El flag se vuelve a poner true al primer heartbeat exitoso.
+      runtimeState.supabase_connected = false;
+    },
+    onDiscovery: (printers) => {
+      runtimeState.discovered_printers = printers;
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Retry scheduler: cada 15s reanima los waiting_printer cuyo
+  // next_retry_at ya paso, y aplica el hard cap de 24h a los muy viejos.
+  // Funciona en cualquier modo (console/virtual/usb), pero solo tiene
+  // efecto practico cuando hay jobs encolados que fallaron alguna vez.
+  // ------------------------------------------------------------------
+  const retrySchedulerId = startRetryScheduler(supabase, config, logger);
 
   // ------------------------------------------------------------------
   // Update checker: polling cada UPDATE_CHECK_INTERVAL_MINUTES (default 60)
@@ -569,12 +624,46 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
     supabase,
     config,
     logger,
-    jobHandler
+    jobHandler,
+    (status) => {
+      // Cada cambio de estado del canal Realtime se refleja en /v1/status.
+      // Los valores comunes son 'SUBSCRIBED', 'CHANNEL_ERROR', 'TIMED_OUT',
+      // 'CLOSED'. El companion los mapea a iconos verde/rojo/amarillo.
+      runtimeState.realtime_status = status;
+    }
   );
 
   // ------------------------------------------------------------------
+  // Local API HTTP (127.0.0.1:17891): expone /v1/status, /v1/jobs/recent,
+  // y endpoints de control al tray companion. Token compartido vive en el
+  // mismo config.json que las credenciales del agente (NSSM pinnea
+  // USERPROFILE asi ambos procesos comparten el home).
+  //
+  // Si el archivo no tenia token todavia (config legacy), ensureLocalApiToken
+  // lo genera y persiste antes de arrancar el server. En modo env-legacy
+  // (sin persistent config) devuelve null y NO arrancamos el server — el
+  // companion no tiene sentido ahi porque no hay archivo desde donde leer
+  // el token.
+  // ------------------------------------------------------------------
+  const localApiToken = ensureLocalApiToken();
+  let localApiServer: ReturnType<typeof startLocalApi> | null = null;
+  if (localApiToken) {
+    localApiServer = startLocalApi({
+      supabase,
+      config,
+      logger,
+      state: runtimeState,
+      token: localApiToken
+    });
+  } else {
+    logger.warn(
+      'Sin config persistente: no se arranca el local API. El tray companion no podra conectarse.'
+    );
+  }
+
+  // ------------------------------------------------------------------
   // Cleanup ordenado: paramos heartbeat, update checker, refresh de printers,
-  // cerramos canal, salimos.
+  // cerramos canal, cerramos el local API, salimos.
   // ------------------------------------------------------------------
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -582,12 +671,27 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, 'Shutting down gracefully');
     clearInterval(heartbeatId);
+    clearInterval(retrySchedulerId);
     if (updateCheckerId) clearInterval(updateCheckerId);
     if (printersRefreshId) clearInterval(printersRefreshId);
     try {
       await supabase.removeChannel(channel);
     } catch (err) {
       logger.warn({ err }, 'Error cerrando canal Realtime (ignorado)');
+    }
+    // Cerrar el local API server. close() espera a que las conexiones
+    // activas terminen; el companion es local, esto es ~instantaneo.
+    if (localApiServer) {
+      try {
+        await new Promise<void>((resolve) => {
+          localApiServer!.close(() => resolve());
+          // Safety net: si por alguna razon el close se queda colgado, no
+          // bloqueamos el shutdown del agente.
+          setTimeout(() => resolve(), 2_000).unref();
+        });
+      } catch (err) {
+        logger.warn({ err }, 'Error cerrando local API server (ignorado)');
+      }
     }
     process.exit(0);
   };

@@ -18,7 +18,19 @@ export type JobStatus =
   | 'printing'
   | 'printed'
   | 'failed'
-  | 'cancelled';
+  | 'cancelled'
+  // waiting_printer: el job entro en backoff exponencial porque tuvo un
+  // error transient (impresora offline, timeout). next_retry_at apunta a
+  // cuando el retry-scheduler debe resetearlo a 'pending'. Si la impresora
+  // vuelve antes (auto-recovery via heartbeat), tambien se resetea a pending.
+  | 'waiting_printer';
+
+/**
+ * Categoria del ultimo error de un job:
+ *  - transient: vale la pena reintentar (impresora offline, red, timeout, sin papel).
+ *  - permanent: no reintentar (payload invalido, print_area inexistente, RLS).
+ */
+export type ErrorKind = 'transient' | 'permanent';
 
 export type PrintJobRow = {
   id: string;
@@ -32,6 +44,11 @@ export type PrintJobRow = {
   status: JobStatus;
   attempts: number;
   last_error: string | null;
+  // Hora futura en la que el job vuelve a 'pending'. Solo seteado mientras
+  // el job esta en status='waiting_printer'.
+  next_retry_at: string | null;
+  // Clasificacion del ultimo error. NULL si el job nunca fallo o esta sano.
+  error_kind: ErrorKind | null;
   printed_at: string | null;
   created_at: string;
   updated_at: string;

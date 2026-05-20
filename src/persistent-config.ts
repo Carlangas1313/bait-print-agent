@@ -10,6 +10,7 @@
  * solo por los perms del filesystem.
  */
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -25,7 +26,22 @@ const PersistentConfigSchema = z.object({
   supabase_url: z.string().url(),
   supabase_anon_key: z.string().min(20),
   pairing_completed_at: z.string().datetime(),
-  agent_version: z.string().min(1)
+  agent_version: z.string().min(1),
+  /**
+   * Token compartido para que el "tray companion" (app que vive en la sesion
+   * del usuario, separada del servicio Windows) se autentique contra la API
+   * local HTTP del agente. Se genera la primera vez que el agente carga la
+   * config: si no existe, lo creamos con crypto.randomBytes(32) en base64 y
+   * lo persistimos antes de arrancar el server local.
+   *
+   * Vive en este archivo a proposito: el companion lee el mismo config.json
+   * (gracias al USERPROFILE pinneado por NSSM, ambos procesos comparten el
+   * home), asi no hay que mantener dos archivos sincronizados.
+   *
+   * Opcional para no romper configs viejas — el bloque de `ensureLocalApiToken`
+   * arregla al vuelo cualquier config legacy.
+   */
+  local_api_token: z.string().min(20).optional()
 });
 
 export type PersistentConfig = z.infer<typeof PersistentConfigSchema>;
@@ -125,4 +141,47 @@ export function deletePersistentConfig(): void {
   if (fs.existsSync(configPath)) {
     fs.unlinkSync(configPath);
   }
+}
+
+/**
+ * Garantiza que el `local_api_token` exista en el config persistente.
+ *
+ * Si la config no trae token (porque viene de una version vieja donde el
+ * campo no existia, o porque alguien lo borro a mano), generamos uno con
+ * `crypto.randomBytes(32).toString('base64')` y lo escribimos al archivo
+ * antes de devolver el valor.
+ *
+ * Es idempotente: si ya hay un token valido lo retorna tal cual, sin
+ * reescribir nada.
+ *
+ * Devuelve el token vigente (ya sea el preexistente o el recien creado).
+ * Si el agente esta corriendo en modo env-legacy (sin config persistente),
+ * devuelve null — el caller decide si arranca un server local con token
+ * efimero o si skip totalmente.
+ *
+ * Diseño:
+ *  - Lo invocamos al arrancar el agente (justo antes de levantar el server
+ *    local) asi siempre hay token cuando el companion intenta hablar.
+ *  - El token es 32 bytes random base64 -> ~44 chars. Suficiente entropy
+ *    para que un atacante local que no tenga read en %USERPROFILE% no lo
+ *    adivine en tiempo razonable.
+ */
+export function ensureLocalApiToken(): string | null {
+  const existing = readPersistentConfig();
+  if (!existing) {
+    // Modo env-legacy: no hay archivo donde persistir el token. Devolvemos
+    // null y el caller decide si arranca el server local o no. En produccion
+    // (clientes finales) esto no deberia pasar porque el flow es siempre
+    // `setup --code XXXX-XXXX` antes de correr.
+    return null;
+  }
+
+  if (existing.local_api_token && existing.local_api_token.length >= 20) {
+    return existing.local_api_token;
+  }
+
+  const token = crypto.randomBytes(32).toString('base64');
+  const updated: PersistentConfig = { ...existing, local_api_token: token };
+  writePersistentConfig(updated);
+  return token;
 }
