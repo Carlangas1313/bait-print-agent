@@ -227,6 +227,25 @@ async function handleRequest(
     return;
   }
 
+  // CORS preflight: el companion corre en un webview Tauri (origin
+  // http://tauri.localhost en Win11), asi que cualquier request con header
+  // custom (Authorization) gatilla un OPTIONS preflight antes. Hay que
+  // responderlo ANTES de la auth (el preflight NO incluye el Authorization
+  // header — por eso fallaba antes y la UI mostraba "Desconectado").
+  //
+  // Nuestra defensa real es bind a 127.0.0.1 + Bearer token; el origin del
+  // browser no es relevante para la seguridad de este endpoint, asi que
+  // devolvemos Allow-Origin: * y Allow-Headers con Authorization.
+  if (method === 'OPTIONS') {
+    res.statusCode = 204;
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    res.end();
+    return;
+  }
+
   // Auth: header Authorization: Bearer <token>
   const auth = req.headers['authorization'];
   if (!auth || typeof auth !== 'string') {
@@ -428,10 +447,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
-  // Buena medida defensiva: el companion nunca corre cross-origin (es una
-  // app desktop) pero por si alguien intenta probar desde un browser local
-  // bloqueamos CORS.
-  res.setHeader('Access-Control-Allow-Origin', 'null');
+  // CORS: el companion corre en webview Tauri (origin http://tauri.localhost
+  // en Win11) y es siempre cross-origin a este server local. Sin estos
+  // headers el browser bloquea las responses aunque el HTTP succeed.
+  // La defensa real es el bind a 127.0.0.1 + Bearer token (ver comment del
+  // OPTIONS preflight handler arriba).
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
   res.end(payload);
 }
 
