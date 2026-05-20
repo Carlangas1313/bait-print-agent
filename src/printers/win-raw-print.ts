@@ -112,21 +112,22 @@ export async function sendRawToWindowsPrinter(
     // si lo decodificamos del lado PS).
     const nameB64 = Buffer.from(printerName, 'utf8').toString('base64');
 
-    // Script PowerShell. Definimos los P/Invoke signatures con Add-Type y
-    // los llamamos en secuencia clasica:
-    //   OpenPrinter -> StartDocPrinter (datatype=RAW) -> StartPagePrinter
-    //   -> WritePrinter -> EndPagePrinter -> EndDocPrinter -> ClosePrinter
+    // Escape de apostrofes en tmpPath para que el single-quoted string de PS
+    // no se rompa si el path tiene uno (raro pero posible). En PS, el escape
+    // de "'" dentro de '...' es "''" (dos apostrofes).
+    const tmpPathEsc = tmpPath.replace(/'/g, "''");
+
+    // Script PowerShell. Inyectamos printerNameB64 y tmpPath como literales
+    // single-quoted (PS no expande variables ni codigo dentro de single-quoted).
+    // Esto evita el problema con `-Command <script> -- arg1 arg2` donde PS
+    // interpreta `--` como operador unario y rompe el parse.
     //
-    // En cualquier fallo tiramos con $LASTERROR para que el caller vea exit
-    // code != 0 y el mensaje en stderr.
-    //
-    // Ojo: el here-string usa @' '@ (single-quoted) asi PS NO expande $vars
-    // internas. Los unicos placeholders que sustituimos son los args via
-    // -ArgumentList y los $args[0]/$args[1] adentro.
+    // nameB64 es seguro inyectar como literal: charset base64 = [A-Za-z0-9+/=],
+    // sin apostrofes ni caracteres especiales.
     const script = `
 $ErrorActionPreference = 'Stop'
-$printerNameB64 = $args[0]
-$tmpPath = $args[1]
+$printerNameB64 = '${nameB64}'
+$tmpPath = '${tmpPathEsc}'
 
 $printerName = [System.Text.Encoding]::UTF8.GetString(
   [System.Convert]::FromBase64String($printerNameB64)
@@ -212,15 +213,17 @@ try {
 Write-Output "OK"
 `;
 
+    // Encodeamos el script entero en base64 UTF-16LE (formato que PS espera
+    // para -EncodedCommand). Esto evita TODOS los problemas de escaping en
+    // la CLI: comillas, saltos de linea, dollar signs, todo se preserva
+    // byte-perfect. Recomendado por Microsoft para scripts complejos.
+    const encodedScript = Buffer.from(script, 'utf16le').toString('base64');
+
     const psArgs = [
       '-NoProfile',
       '-NonInteractive',
       '-ExecutionPolicy', 'Bypass',
-      '-Command', script,
-      // Los `-Command` args adicionales caen en $args[] dentro del script.
-      '--',
-      nameB64,
-      tmpPath
+      '-EncodedCommand', encodedScript
     ];
 
     const { stdout, stderr } = await execFileAsync('powershell.exe', psArgs, {
