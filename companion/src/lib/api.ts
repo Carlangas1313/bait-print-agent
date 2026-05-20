@@ -321,18 +321,29 @@ export async function refreshQueue(): Promise<{ processed: number }> {
   return { processed: body.processed ?? 0 };
 }
 
+export interface TestPrintResult {
+  ok: true;
+  printer_name: string;
+  connection_type: string;
+  device_id: string;
+}
+
 /**
- * Stub: el server actualmente devuelve 501. Llamamos para que el
- * companion vea el mismo error siempre y mostremos un toast informativo.
- * Cuando el endpoint quede implementado, esto va a dejar de tirar
- * NotImplementedError naturalmente y va a empezar a funcionar.
+ * Manda una pagina de prueba a la impresora identificada por su `device_id`
+ * del OS (eg "USB001", "192.168.1.50:9100", "COM7"). El server llama directo
+ * al renderer ESC/POS — no pasa por la cola print_jobs, no aparece en el
+ * historial, no requiere configuracion previa de la printer en bait-app.cl.
+ *
+ * Errores:
+ *  - 404 → printer no aparece en el discovery actual (refresh + reintentar).
+ *  - 502 → el render fallo (printer offline, sin papel, etc). `detail` con
+ *          mensaje user-friendly desde el agente.
+ *  - Otros HTTP errors → ver `callApi`.
  */
-export async function testPrint(printerId: string): Promise<never> {
-  await callApi<unknown>(
+export async function testPrint(printerId: string): Promise<TestPrintResult> {
+  const body = await callApi<TestPrintResult>(
     `/v1/printers/${encodeURIComponent(printerId)}/test`,
     { method: "POST", body: {} }
   );
-  // El callApi tira NotImplementedError en 501 antes de llegar aca,
-  // pero por seguridad si algun dia cambia, dejamos esta linea.
-  throw new NotImplementedError();
+  return body;
 }

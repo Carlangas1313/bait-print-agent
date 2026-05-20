@@ -1,7 +1,7 @@
 {
   "name": "bait-print-companion",
   "private": true,
-  "version": "0.6.2",
+  "version": "0.6.3",
   "type": "module",
   "description": "Companion app del agente bait-print-agent — tray icon + ventana flotante de control en la sesión del usuario",
   "scripts": {

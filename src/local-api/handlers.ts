@@ -21,6 +21,7 @@ import type { Logger } from '../logger.js';
 import type { PrintJobRow } from '../types.js';
 import type { DiscoveredPrinter } from '../printers/discover.js';
 import { AGENT_VERSION } from '../constants.js';
+import { renderTestPage } from '../renderer/usb.js';
 
 /**
  * Estado mutable que el main loop del agente actualiza y que la API local
@@ -358,41 +359,106 @@ export async function handleJobReprint(
 // ====================================================================
 
 /**
- * STUB — creacion de print_job dummy de tipo "test" apuntado a la
- * impresora indicada.
+ * Imprime una pagina de prueba en la impresora indicada por su `device_id`
+ * del descubrimiento del OS (Get-Printer en Windows). Bypassea la cola
+ * print_jobs entera — el handler llama directo al renderer ESC/POS con un
+ * payload sintetico de test. Asi:
+ *   - No requiere que la impresora este configurada en bait-app.cl.
+ *   - No mete ruido en print_jobs (no aparece en el historial de comandas).
+ *   - Verifica conectividad real al mismo socket / device que usaria un job
+ *     productivo (mismo node-thermal-printer, mismo buildInterfaceUri).
  *
- * Pendiente porque requiere:
- *  1. Agregar el `job_type='test'` al enum en Supabase (migration).
- *  2. Construir un payload minimo con texto tipo "TEST PRINT bait-print-agent v0.5.4".
- *  3. Decidir si el job se inserta con `print_area_id` derivado de la
- *     printer o si se agrega un campo `forced_printer_id` al schema
- *     (mas limpio porque evita conflictos con el matching por area).
- *  4. Hacer un INSERT contra Supabase: el realtime listener del propio
- *     agente lo va a recoger via INSERT event y procesarlo normal.
+ * Errores:
+ *   - 404 si el `printerId` no esta en el ultimo snapshot de discovered_printers
+ *     (el companion deberia ofrecer solo opciones validas en su dropdown).
+ *   - 502 si el render falla (printer offline, sin papel, driver no
+ *     disponible, etc) — el `detail` trae el mensaje del renderer.
  *
- * Por ahora devolvemos 501 + flag para que el companion deshabilite el
- * boton de "Probar impresora" hasta que se complete.
+ * El printerId que recibe es `device_id` del DiscoveredPrinter (USB001,
+ * ip:puerto, COM7). Esta URL-encoded en el path porque puede tener `:` y `\`.
  */
 export async function handlePrinterTest(
   ctx: LocalApiContext
 ): Promise<HandlerResult> {
-  const { params, logger } = ctx;
-  const printerId = params.printerId;
+  const { params, state, config, logger } = ctx;
+  const rawPrinterId = params.printerId;
 
-  logger.info(
-    { printerId },
-    'POST /printers/:id/test recibido pero no implementado (stub)'
+  if (!rawPrinterId) {
+    return {
+      status: 400,
+      body: { ok: false, error: 'missing_printer_id' }
+    };
+  }
+
+  // El path param viene URL-encoded; decodificamos para matchear contra
+  // `device_id` que puede tener `:`, `\\`, etc.
+  let printerId: string;
+  try {
+    printerId = decodeURIComponent(rawPrinterId);
+  } catch {
+    return {
+      status: 400,
+      body: { ok: false, error: 'invalid_printer_id_encoding' }
+    };
+  }
+
+  // Match contra el snapshot del heartbeat. Si la impresora desaparecio
+  // entre el ultimo discovery y el click del user, devolvemos 404 con un
+  // hint para refrescar.
+  const discovered = state.discovered_printers.find(
+    (p) => p.device_id === printerId
   );
 
-  return {
-    status: 501,
-    body: {
-      ok: false,
-      error: 'not_implemented',
-      detail:
-        'El endpoint de test requiere agregar job_type=test al enum de Supabase y un mecanismo de "forced_printer_id" en print_jobs. Ver TODO en src/local-api/handlers.ts.'
-    }
-  };
+  if (!discovered) {
+    logger.info(
+      {
+        printerId,
+        availableIds: state.discovered_printers.map((p) => p.device_id)
+      },
+      'Test print solicitado para una printer no presente en discovery snapshot'
+    );
+    return {
+      status: 404,
+      body: {
+        ok: false,
+        error: 'printer_not_found',
+        detail:
+          'La impresora ya no aparece en el snapshot del agente. Refrescar la lista o verificar que sigue conectada.'
+      }
+    };
+  }
+
+  try {
+    await renderTestPage(
+      discovered,
+      config.agent_name,
+      null, // location_name no esta en config — para v0.6.x lo omitimos
+      logger
+    );
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        printer_name: discovered.name,
+        connection_type: discovered.kind,
+        device_id: discovered.device_id
+      }
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(
+      { printerId, err: msg },
+      'Test print fallo en el renderer'
+    );
+    return {
+      status: 502,
+      body: {
+        ok: false,
+        error: 'render_failed',
+        detail: msg
+      }
+    };
+  }
 }
 
 // ====================================================================

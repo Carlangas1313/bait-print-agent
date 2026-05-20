@@ -17,7 +17,6 @@ import {
   refreshQueue,
   testPrint,
   AgentOfflineError,
-  NotImplementedError,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { PrinterInfo } from "@/lib/mock-data";
@@ -77,31 +76,25 @@ export function ActionsTab({
     }
     setTestRunning(true);
     try {
-      await testPrint(selectedPrinter.id);
-      // No deberiamos llegar aca mientras el endpoint sea stub (501).
-      // Si en el futuro responde 200, mostramos el ok.
+      const result = await testPrint(selectedPrinter.id);
       toast({
         title: "Test enviado",
-        description: `→ ${selectedPrinter.name}`,
+        description: `→ ${result.printer_name} (${result.connection_type})`,
         variant: "success",
       });
     } catch (err) {
-      if (err instanceof NotImplementedError) {
-        toast({
-          title: "Funcionalidad en desarrollo",
-          description:
-            "El endpoint de test de impresión todavía no está disponible.",
-          variant: "warning",
-        });
-      } else if (err instanceof AgentOfflineError) {
+      if (err instanceof AgentOfflineError) {
         toast({
           title: "Servicio no disponible",
           description: "El agente no respondió. Verifica que esté corriendo.",
           variant: "destructive",
         });
       } else {
+        // El renderer del agente puede tirar mensajes como "Printer no
+        // responde", "Sin papel", "No se puede cargar driver", etc. Los
+        // mostramos tal cual — son user-friendly desde el lado del agente.
         toast({
-          title: "Error al imprimir test",
+          title: "No se pudo imprimir el test",
           description:
             err instanceof Error ? err.message : "Error desconocido.",
           variant: "destructive",

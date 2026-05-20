@@ -38,6 +38,8 @@ import type { Logger } from '../logger.js';
 import type { PrintJobRow } from '../types.js';
 import { formatJob } from './console.js';
 import type { PrinterRow } from '../printers/registry.js';
+import type { DiscoveredPrinter } from '../printers/discover.js';
+import { AGENT_VERSION } from '../constants.js';
 
 /**
  * Ancho del papel en chars. Misma constante que console.ts/format.ts.
@@ -275,5 +277,234 @@ export async function renderJobToPrinter(
       copies
     },
     `Job impreso en ${printer.name} (${printer.connection_type}:${printer.target ?? ''})`
+  );
+}
+
+/**
+ * Construye una `PrinterRow` sintetica a partir de una impresora descubierta
+ * del OS. Sirve para imprimir un test page directo (sin pasar por la cola
+ * print_jobs) eligiendo cualquier impresora del dropdown del companion, sin
+ * que tenga que estar configurada todavia en bait-app.cl.
+ *
+ * Reglas de mapeo:
+ *  - usb         → target = "\\.\<PortName>" (device path crudo, evita el
+ *                  modulo `printer` que no funciona en SEA).
+ *  - network     → target = "<device_id>" (ya viene como "ip:puerto").
+ *  - bluetooth   → target = "\\.\<device_id>" (COM port virtual).
+ *  - unknown     → tiramos error claro (no podemos imprimir si no sabemos
+ *                  por que puerto sale).
+ *
+ * Para el test page no necesitamos copies/beep/cut_paper de la config — usamos
+ * defaults (1 copia, beep off, cut on).
+ */
+function discoveredToSyntheticPrinter(
+  discovered: DiscoveredPrinter
+): PrinterRow {
+  let target: string;
+  switch (discovered.kind) {
+    case 'usb':
+      // PortName tipico: "USB001". El prefijo \\.\ lo convierte en device
+      // path que el backend `file` de node-thermal-printer abre como stream.
+      target = discovered.device_id.startsWith('\\\\')
+        ? discovered.device_id
+        : `\\\\.\\${discovered.device_id}`;
+      break;
+    case 'network':
+      // Ya viene como "ip:puerto" desde discover.ts.
+      target = discovered.device_id;
+      break;
+    case 'bluetooth':
+      // COM virtual en Windows: "COM7" → "\\.\COM7".
+      target = discovered.device_id.startsWith('\\\\')
+        ? discovered.device_id
+        : `\\\\.\\${discovered.device_id}`;
+      break;
+    default:
+      throw new Error(
+        `No puedo imprimir test page en una impresora de tipo "${discovered.kind}". ` +
+          `Configurala manualmente en bait-app.cl -> Settings -> Impresoras.`
+      );
+  }
+
+  return {
+    id: `test-${discovered.device_id}`,
+    name: discovered.name,
+    printer_type: 'thermal_test',
+    connection_type: discovered.kind,
+    target,
+    print_area_id: null,
+    is_primary: false,
+    copies: 1,
+    cut_paper: true,
+    beep: false
+  };
+}
+
+/**
+ * Construye las lineas de la pagina de prueba. ASCII fijo, no usa formatJob
+ * porque no queremos depender de un job_type real para el test (sumar 'test'
+ * al schema de la DB seria overkill para esto).
+ */
+function buildTestPageLines(
+  discovered: DiscoveredPrinter,
+  agentName: string,
+  locationName: string | null
+): string[] {
+  const width = PRINTER_WIDTH;
+  const sep = '='.repeat(width);
+  const dash = '-'.repeat(width);
+  const now = new Date();
+  const fecha =
+    `${now.getDate().toString().padStart(2, '0')}/` +
+    `${(now.getMonth() + 1).toString().padStart(2, '0')}/` +
+    `${now.getFullYear()} ` +
+    `${now.getHours().toString().padStart(2, '0')}:` +
+    `${now.getMinutes().toString().padStart(2, '0')}:` +
+    `${now.getSeconds().toString().padStart(2, '0')}`;
+
+  const lines: string[] = [
+    sep,
+    centerLine('bAIt PRINT AGENT', width),
+    centerLine('Test de impresion', width),
+    sep,
+    '',
+    `Fecha:   ${fecha}`,
+    `Agente:  ${agentName}`
+  ];
+  if (locationName) {
+    lines.push(`Local:   ${locationName}`);
+  }
+  lines.push(`Version: ${AGENT_VERSION}`);
+  lines.push('');
+  lines.push(dash);
+  lines.push('Impresora:');
+  lines.push(`  ${discovered.name}`);
+  lines.push(`  Conexion: ${discovered.kind.toUpperCase()}`);
+  lines.push(`  Device:   ${discovered.device_id}`);
+  lines.push(dash);
+  lines.push('');
+  lines.push('Si lees este ticket, la');
+  lines.push('impresora esta funcionando');
+  lines.push('correctamente.');
+  lines.push('');
+  lines.push(sep);
+  return lines;
+}
+
+function centerLine(text: string, width: number): string {
+  if (text.length >= width) return text.substring(0, width);
+  const pad = Math.floor((width - text.length) / 2);
+  return ' '.repeat(pad) + text;
+}
+
+/**
+ * Imprime un test page en la impresora indicada. Usado por el endpoint
+ * `POST /v1/printers/:id/test` del companion.
+ *
+ * Diseño: NO pasa por la cola print_jobs. El handler recibe el id del OS
+ * (USB001 / ip:puerto / COM7), construye una `PrinterRow` sintetica con esa
+ * conexion y delega al mismo path de node-thermal-printer que usa la
+ * impresion productiva. Asi el test:
+ *   - No requiere que la impresora este configurada en bait-app.cl.
+ *   - Verifica la conectividad real al mismo socket / device que usaria
+ *     un job productivo.
+ *   - No genera ruido en la tabla print_jobs (no aparece como "Test" en
+ *     el historial del dashboard).
+ *
+ * Errores:
+ *   - Si la printer no responde → throw "Printer no responde...".
+ *   - Si el backend `printer:` (queue Windows con driver) se intenta usar
+ *     en SEA → throw con sugerencia de UNC share.
+ *   - Si kind === 'unknown' → throw con sugerencia de configuracion manual.
+ */
+export async function renderTestPage(
+  discovered: DiscoveredPrinter,
+  agentName: string,
+  locationName: string | null,
+  logger: Logger
+): Promise<void> {
+  const printer = discoveredToSyntheticPrinter(discovered);
+  const interfaceUri = buildInterfaceUri(printer);
+
+  logger.info(
+    {
+      printerName: printer.name,
+      connectionType: printer.connection_type,
+      interfaceUri
+    },
+    `Imprimiendo test page en "${printer.name}"`
+  );
+
+  // Mismo bloque que renderJobToPrinter — driver nativo opcional para queues
+  // Windows con printer: prefix. En SEA falla con mensaje claro.
+  const driver =
+    interfaceUri.startsWith('printer:')
+      ? (loadOptionalPrinterDriver() as object | null)
+      : undefined;
+
+  if (interfaceUri.startsWith('printer:') && !driver) {
+    throw new Error(
+      `No puedo imprimir en la cola Windows "${printer.target}" desde el agente empaquetado. ` +
+        `Compartila como red local (\\\\localhost\\<nombre>) o usa conexion LAN raw 9100.`
+    );
+  }
+
+  const tp = new ThermalPrinter({
+    type: PrinterTypes.EPSON,
+    interface: interfaceUri,
+    characterSet: CharacterSet.PC858_EURO,
+    width: PRINTER_WIDTH,
+    removeSpecialCharacters: false,
+    options: { timeout: 5000 },
+    ...(driver ? { driver: driver as object } : {})
+  });
+
+  let connected = false;
+  try {
+    connected = await tp.isPrinterConnected();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Printer "${printer.name}" no responde (${printer.connection_type}://${printer.target}): ${msg}`
+    );
+  }
+  if (!connected) {
+    throw new Error(
+      `Printer "${printer.name}" no responde (${printer.connection_type}://${printer.target})`
+    );
+  }
+
+  tp.clear();
+  const lines = buildTestPageLines(discovered, agentName, locationName);
+  for (const raw of lines) {
+    if (raw.length === 0) {
+      tp.newLine();
+      continue;
+    }
+    const bold = isBoldLine(raw);
+    if (bold) tp.bold(true);
+    tp.println(raw);
+    if (bold) tp.bold(false);
+  }
+  if (printer.cut_paper) {
+    tp.cut();
+  }
+
+  try {
+    await tp.execute();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Fallo execute() en test page de "${printer.name}": ${msg}`
+    );
+  }
+
+  logger.info(
+    {
+      printerName: printer.name,
+      connectionType: printer.connection_type,
+      target: printer.target
+    },
+    `Test page impreso en "${printer.name}"`
   );
 }
