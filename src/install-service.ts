@@ -420,6 +420,27 @@ export async function installService(opts: InstallServiceOptions): Promise<void>
   logger.info(`  ✓ Logs en: ${logsDir}`);
 
   // ------------------------------------------------------------------
+  // 6b. USERPROFILE pinneado al home del usuario que instalo.
+  //
+  // NSSM corre el servicio como LocalSystem (cuenta del SO, sin home de
+  // usuario real). En Windows Node lee USERPROFILE para resolver
+  // os.homedir(), asi que sin esto el servicio busca config.json en
+  // C:\Windows\System32\config\systemprofile\.bait-print-agent\ y nunca
+  // lo encuentra (el wizard escribe en el home del user humano).
+  //
+  // Hardcodeamos el USERPROFILE actual al install-time: install-service
+  // siempre corre como el user humano elevado, asi que os.homedir() aca
+  // si devuelve algo como C:\Users\Carlos.
+  // ------------------------------------------------------------------
+  const userHome = os.homedir();
+  runNssm(
+    nssm,
+    ['set', serviceName, 'AppEnvironmentExtra', `USERPROFILE=${userHome}`],
+    logger
+  );
+  logger.info(`  ✓ USERPROFILE del servicio: ${userHome}`);
+
+  // ------------------------------------------------------------------
   // 7. Recovery: que hacer cuando el proceso termina.
   //
   // AppExit Default Restart  -> reintentar siempre que muera (default behaviour).

@@ -1,10 +1,10 @@
 {
   "name": "bait-print-agent",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": true,
   "description": "Agente local que escucha la cola de impresión de bait-pos y manda comandas a impresoras térmicas vía ESC/POS (USB / LAN raw 9100 / Bluetooth COM). Modos: console, virtual, usb.",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "main": "dist/index.js",
   "scripts": {
@@ -14,7 +14,7 @@
     "start": "node dist/index.js",
     "start:console": "node dist/index.js --mode console",
     "typecheck": "tsc --noEmit",
-    "bundle": "esbuild src/index.ts --bundle --platform=node --target=node20 --outfile=dist/bundle.cjs --format=cjs --external:pino-pretty --external:printer --external:electron-printer",
+    "bundle": "esbuild src/index.ts --bundle --platform=node --target=node22 --outfile=dist/bundle.cjs --format=cjs --external:pino-pretty --external:printer --external:electron-printer",
     "package:win": "npm run build && npm run bundle && node scripts/package-win.js",
     "release": "npm run package:win"
   },

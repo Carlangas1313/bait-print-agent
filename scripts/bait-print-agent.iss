@@ -135,6 +135,11 @@ var
   SkipPairingCheck: TInputOptionWizardPage;
   CurrentPairingCode: String;
   SkipPairing: Boolean;
+  // True solo si encontramos config.json en %USERPROFILE%\.bait-print-agent\
+  // al iniciar el wizard. Si no existe, la pagina "Saltar configuracion" se
+  // skipea entera y forzamos pairing — sino el cliente reinstala despues de
+  // desinstalar y queda con servicio en crash loop por config faltante.
+  ExistingConfigFound: Boolean;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -203,19 +208,31 @@ end;
 
 procedure InitializeWizard;
 begin
+  // Default: si la pagina de skip se oculta (porque no hay config previa),
+  // SkipPairing queda False y el wizard fuerza el flujo de pairing.
+  SkipPairing := False;
+
   // -------------------------------------------------------------------------
-  // Pagina 1 (opcional): "Saltar configuracion" — checkbox para reinstalaciones.
-  // Si el user ya tiene config.json valido (porque reinstala el agente sobre
-  // la version vieja), no queremos forzarlo a pegar el codigo de nuevo.
+  // Chequeo de config previa. Si NO existe config.json en el home del user,
+  // saltamos la pagina de "Saltar configuracion" mas abajo y forzamos pairing.
+  // -------------------------------------------------------------------------
+  ExistingConfigFound := FileExists(
+    ExpandConstant('{userprofile}\.bait-print-agent\config.json'));
+
+  // -------------------------------------------------------------------------
+  // Pagina 1 (condicional): "Saltar configuracion" — checkbox para reinstalaciones.
+  // Solo tiene sentido si el user ya tiene config.json. La creamos siempre por
+  // simplicidad (el ID se reusa abajo), pero ShouldSkipPage la oculta cuando
+  // no hay config previa, asi el wizard fuerza al user a pegar el codigo.
   // -------------------------------------------------------------------------
   SkipPairingCheck := CreateInputOptionPage(
     wpSelectDir,
     'Configuracion',
     'Como queres configurar el agente',
-    'Si es la primera vez que instalas el agente en este equipo, dejalo en "Configurar ahora" para pegar el codigo de pairing. Si solo estas actualizando el agente y ya tenes la config guardada, elegi "Saltar".',
+    'Detectamos una configuracion previa en este equipo. Si solo estas actualizando el agente, elegi "Saltar". Si queres re-vincularlo con un codigo nuevo, dejalo en "Configurar ahora".',
     True,   // exclusive (radio buttons)
     False); // not list-style
-  SkipPairingCheck.Add('Configurar ahora (recomendado — primera instalacion)');
+  SkipPairingCheck.Add('Configurar ahora (recomendado — usa un codigo nuevo)');
   SkipPairingCheck.Add('Saltar configuracion (ya tengo el agente configurado)');
   SkipPairingCheck.SelectedValueIndex := 0;
 
@@ -249,6 +266,14 @@ end;
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := False;
+  // Si no hay config previa, ocultamos la pagina de "Saltar configuracion"
+  // entera y mandamos al user directo a la pagina del codigo.
+  if (PageID = SkipPairingCheck.ID) and (not ExistingConfigFound) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  // Si hay config previa y el user eligio "saltar", skipeamos la pagina del codigo.
   if (PageID = PairingPage.ID) and (SkipPairingCheck.SelectedValueIndex = 1) then
     Result := True;
 end;

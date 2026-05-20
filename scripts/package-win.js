@@ -72,10 +72,13 @@ function checkPrereqs() {
   const bundleSize = fs.statSync(BUNDLE).size;
   log(`Bundle OK: ${BUNDLE} (${(bundleSize / 1024).toFixed(1)} KB)`);
 
-  // Verificamos que estamos en Node 20+, sino postject va a tirar mensajes raros.
+  // Verificamos que estamos en Node 22+. Node 22 trae WebSocket nativo, que
+  // necesita el Realtime client de @supabase/supabase-js que el agente usa
+  // en runtime. Con Node 20 el agente arranca pero crashea al primer realtime
+  // subscribe con "Node.js 20 detected without native WebSocket support".
   const nodeMajor = parseInt(process.versions.node.split('.')[0], 10);
-  if (nodeMajor < 20) {
-    fail(`Necesitas Node 20+ para SEA. Tenes ${process.versions.node}`);
+  if (nodeMajor < 22) {
+    fail(`Necesitas Node 22+ para empaquetar (WebSocket nativo). Tenes ${process.versions.node}`);
   }
   log(`Node ${process.versions.node} OK`);
 }
