@@ -40,6 +40,7 @@ import { formatJob } from './console.js';
 import type { PrinterRow } from '../printers/registry.js';
 import type { DiscoveredPrinter } from '../printers/discover.js';
 import { AGENT_VERSION } from '../constants.js';
+import { sendRawToWindowsPrinter } from '../printers/win-raw-print.js';
 
 /**
  * Ancho del papel en chars. Misma constante que console.ts/format.ts.
@@ -423,31 +424,73 @@ export async function renderTestPage(
   locationName: string | null,
   logger: Logger
 ): Promise<void> {
-  const printer = discoveredToSyntheticPrinter(discovered);
-  const interfaceUri = buildInterfaceUri(printer);
-
   logger.info(
     {
-      printerName: printer.name,
-      connectionType: printer.connection_type,
-      interfaceUri
+      printerName: discovered.name,
+      kind: discovered.kind,
+      deviceId: discovered.device_id
     },
-    `Imprimiendo test page en "${printer.name}"`
+    `Imprimiendo test page en "${discovered.name}" (${discovered.kind})`
   );
 
-  // Mismo bloque que renderJobToPrinter — driver nativo opcional para queues
-  // Windows con printer: prefix. En SEA falla con mensaje claro.
-  const driver =
-    interfaceUri.startsWith('printer:')
-      ? (loadOptionalPrinterDriver() as object | null)
-      : undefined;
+  // Estrategia segun el kind del discovery:
+  //
+  //  - USB / unknown: usamos el spooler RAW de Windows via WritePrinter
+  //    (Win32 API). Es la unica forma confiable de imprimir ESC/POS en
+  //    impresoras USB modernas que se exponen como queues con drivers
+  //    propietarios (Rongta, ESDPRT, DOT4, etc). No usamos buildInterfaceUri
+  //    aca porque no necesitamos un interface URI — el spooler routea solo.
+  //
+  //  - NETWORK: TCP raw 9100 sigue siendo el path correcto. node-thermal-printer
+  //    abre un socket y manda ESC/POS sin pasar por el OS.
+  //
+  //  - BLUETOOTH: COM virtual en Windows. Usamos node-thermal-printer en
+  //    modo file (\\.\COMn).
+  //
+  // Generamos el buffer ESC/POS UNA sola vez con node-thermal-printer y
+  // despues lo mandamos por el transport correcto. Para USB usamos
+  // sendRawToWindowsPrinter (spooler); para network/bluetooth seguimos
+  // usando tp.execute() que abre el socket.
 
-  if (interfaceUri.startsWith('printer:') && !driver) {
-    throw new Error(
-      `No puedo imprimir en la cola Windows "${printer.target}" desde el agente empaquetado. ` +
-        `Compartila como red local (\\\\localhost\\<nombre>) o usa conexion LAN raw 9100.`
+  if (discovered.kind === 'usb' || discovered.kind === 'unknown') {
+    // Generar el buffer ESC/POS con un "interface dummy" que node-thermal-printer
+    // acepta para construir el comando sin abrir conexion. El truco: usamos
+    // un path file inexistente; nunca llamamos a execute() asi que no se
+    // abre el handle. Solo nos interesa el buffer.
+    const tp = new ThermalPrinter({
+      type: PrinterTypes.EPSON,
+      interface: '\\\\.\\__bait_buffer_only__',
+      characterSet: CharacterSet.PC858_EURO,
+      width: PRINTER_WIDTH,
+      removeSpecialCharacters: false
+    });
+
+    tp.clear();
+    const lines = buildTestPageLines(discovered, agentName, locationName);
+    for (const raw of lines) {
+      if (raw.length === 0) {
+        tp.newLine();
+        continue;
+      }
+      const bold = isBoldLine(raw);
+      if (bold) tp.bold(true);
+      tp.println(raw);
+      if (bold) tp.bold(false);
+    }
+    tp.cut();
+
+    const buffer = tp.getBuffer();
+    await sendRawToWindowsPrinter(discovered.name, buffer, logger);
+    logger.info(
+      { printerName: discovered.name, bytes: buffer.length },
+      `Test page impreso via spooler RAW en "${discovered.name}"`
     );
+    return;
   }
+
+  // network / bluetooth: mismo path que el productivo via socket / COM.
+  const printer = discoveredToSyntheticPrinter(discovered);
+  const interfaceUri = buildInterfaceUri(printer);
 
   const tp = new ThermalPrinter({
     type: PrinterTypes.EPSON,
@@ -455,8 +498,7 @@ export async function renderTestPage(
     characterSet: CharacterSet.PC858_EURO,
     width: PRINTER_WIDTH,
     removeSpecialCharacters: false,
-    options: { timeout: 5000 },
-    ...(driver ? { driver: driver as object } : {})
+    options: { timeout: 5000 }
   });
 
   let connected = false;

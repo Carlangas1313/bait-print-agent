@@ -60,6 +60,20 @@ const RE_IP =
   /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)(?::\d{1,5})?$/;
 const RE_WSD = /^WSD-/i;
 const RE_COM = /^COM\d+$/i;
+/**
+ * Patrones de PortName "USB-like" comunes en POS printers:
+ *  - RongtaUSB PORT: (Rongta RP58, RP80, RP326, etc)
+ *  - ESDPRT001..ESDPRTnnn (Epson driver propietario)
+ *  - DOT4_001 / DOT4USB (HP impresoras multifuncion en USB)
+ *  - POS-58_USB / POS-80_USB / POSPRINTER (drivers generic chinos)
+ *  - StarUSB001 (Star TSP143, etc)
+ *
+ * El comun denominador: el string contiene "USB" en cualquier lugar. Si
+ * matchea esto y no matcheo IP/WSD/COM antes, asumimos USB y delegamos
+ * al spooler RAW de Windows en renderTestPage / renderJobToPrinter, que
+ * funciona para cualquier queue que Windows tenga registrada.
+ */
+const RE_USB_LIKE = /USB/i;
 
 /**
  * Limite duro para el array de printers. Algun cliente puede tener decenas
@@ -236,6 +250,14 @@ function inferKindAndDeviceId(port: string): {
 
   if (RE_COM.test(port)) {
     return { kind: 'bluetooth', device_id: port };
+  }
+
+  // Fallback "USB-like": cualquier port name que contenga "USB" (Rongta,
+  // ESDPRT, DOT4, POS-58/80, etc). El device_id queda como el port name
+  // crudo — el spooler RAW de Windows va a routear por queue name, no
+  // por device path, asi que esto sirve para diagnostico/UI nomas.
+  if (RE_USB_LIKE.test(port)) {
+    return { kind: 'usb', device_id: port };
   }
 
   return { kind: 'unknown', device_id: port };
