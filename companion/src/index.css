@@ -1,0 +1,178 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   bAIt Print Companion — Design tokens
+   Paleta navy + cyan + cream + orange. Glassmorphism + Inter/Space Grotesk.
+   ============================================================ */
+
+@layer base {
+  :root {
+    /* Base shadcn vars, tuneados sobre navy oscuro */
+    --background: 213 53% 10%; /* ~ #0a1929 */
+    --foreground: 34 38% 95%; /* cream */
+
+    --card: 213 50% 13%;
+    --card-foreground: 34 38% 95%;
+
+    --popover: 213 55% 9%;
+    --popover-foreground: 34 38% 95%;
+
+    --primary: 187 100% 42%; /* cyan #00bcd4 */
+    --primary-foreground: 213 60% 8%;
+
+    --secondary: 213 35% 22%;
+    --secondary-foreground: 34 38% 95%;
+
+    --muted: 213 30% 18%;
+    --muted-foreground: 213 15% 70%;
+
+    --accent: 16 100% 60%; /* orange #ff6b35 */
+    --accent-foreground: 34 38% 96%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 34 38% 95%;
+
+    --border: 213 40% 22%;
+    --input: 213 40% 22%;
+    --ring: 187 100% 42%;
+
+    --radius: 0.875rem;
+  }
+
+  .dark {
+    /* Companion siempre arranca en modo "navy" — pero dejamos los tokens
+       por si en el futuro queremos un dark/light real. */
+    --background: 213 53% 10%;
+    --foreground: 34 38% 95%;
+  }
+}
+
+@layer base {
+  /* Tauri transparent window — el body queda transparente, el chrome lo dibuja
+     el contenedor .glass-shell de App.tsx. */
+  html,
+  body,
+  #root {
+    height: 100%;
+    background: transparent !important;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  body {
+    @apply text-foreground font-sans;
+    font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: theme("fontFamily.display");
+    letter-spacing: -0.01em;
+  }
+
+  /* Selectable: por defecto la app es no seleccionable, pero los inputs y los
+     bloques de "payload" sí — los marcamos con `select-text` puntualmente. */
+  input,
+  textarea,
+  [contenteditable="true"],
+  .select-text,
+  .select-text * {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  /* Drag region custom (Tauri 2 usa data-tauri-drag-region). */
+  [data-tauri-drag-region] {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+}
+
+@layer components {
+  /* ---------- Glass shell — el "chrome" custom de la ventana ---------- */
+  .glass-shell {
+    @apply h-full w-full rounded-[var(--radius)] overflow-hidden
+           border border-white/10 relative;
+    background:
+      linear-gradient(
+        165deg,
+        rgba(15, 35, 60, 0.92) 0%,
+        rgba(8, 22, 42, 0.88) 50%,
+        rgba(5, 16, 32, 0.92) 100%
+      );
+    backdrop-filter: blur(24px) saturate(160%);
+    -webkit-backdrop-filter: blur(24px) saturate(160%);
+    box-shadow:
+      0 24px 48px -12px rgba(0, 0, 0, 0.6),
+      0 0 0 1px rgba(0, 188, 212, 0.08) inset,
+      0 1px 0 0 rgba(255, 255, 255, 0.06) inset;
+  }
+
+  /* Aura cyan sutil en el borde superior — la "luz" del agente */
+  .glass-shell::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border-radius: inherit;
+    background:
+      radial-gradient(
+        80% 50% at 50% 0%,
+        rgba(0, 188, 212, 0.18) 0%,
+        rgba(0, 188, 212, 0) 60%
+      );
+    z-index: 0;
+  }
+
+  /* ---------- Card de impresora ---------- */
+  .printer-card {
+    @apply relative overflow-hidden rounded-xl border border-white/10
+           bg-white/[0.03] px-3.5 py-3 transition-all duration-200;
+  }
+  .printer-card:hover {
+    @apply border-white/15 bg-white/[0.05];
+  }
+
+  /* ---------- Job item ---------- */
+  .job-item {
+    @apply relative overflow-hidden rounded-lg border border-white/[0.08]
+           bg-white/[0.025] transition-colors duration-200;
+  }
+  .job-item:hover {
+    @apply border-white/[0.12] bg-white/[0.045];
+  }
+
+  /* ---------- Scroll dark ---------- */
+  .scroll-dark::-webkit-scrollbar {
+    width: 6px;
+  }
+  .scroll-dark::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scroll-dark::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 3px;
+  }
+  .scroll-dark::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 188, 212, 0.3);
+  }
+}
+
+@layer utilities {
+  .glass-card {
+    background: rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .text-balance {
+    text-wrap: balance;
+  }
+}
