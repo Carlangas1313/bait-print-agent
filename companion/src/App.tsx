@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useMemo } from "react";
 import { motion } from "framer-motion";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { Toaster } from "./components/ui/toaster";
@@ -8,7 +8,12 @@ import { AppFooter } from "./components/AppFooter";
 import { StatusTab } from "./components/StatusTab";
 import { RecentJobsTab } from "./components/RecentJobsTab";
 import { ActionsTab } from "./components/ActionsTab";
-import { api } from "./lib/api";
+import { useAgentStatus, useRecentJobs } from "./hooks/use-agent-status";
+import {
+  discoveredPrintersToView,
+  jobsToView,
+  statusToAgentState,
+} from "./lib/mappers";
 import type { AgentState, PrinterInfo, PrintJob } from "./lib/mock-data";
 
 // Tauri window helpers (lazy-load: si corremos `vite` puro fuera de tauri, no rompen).
@@ -37,35 +42,36 @@ async function tauriExit() {
 }
 
 function App() {
-  const [state, setState] = useState<AgentState | null>(null);
-  const [printers, setPrinters] = useState<PrinterInfo[]>([]);
-  const [jobs, setJobs] = useState<PrintJob[]>([]);
+  // Polling de status (5s) y jobs recientes (10s). Los hooks pausan
+  // automaticamente cuando la ventana esta hidden y refrescan al volver.
+  const statusQuery = useAgentStatus();
+  const jobsQuery = useRecentJobs(20);
 
-  // Fetch inicial + polling cada 4s mientras la ventana esté visible
-  useEffect(() => {
-    let alive = true;
-    const refresh = async () => {
-      try {
-        const [s, p, j] = await Promise.all([
-          api.getState(),
-          api.getPrinters(),
-          api.getRecentJobs(20),
-        ]);
-        if (!alive) return;
-        setState(s);
-        setPrinters(p);
-        setJobs(j);
-      } catch (e) {
-        console.error("[companion] refresh failed", e);
-      }
-    };
-    refresh();
-    const interval = setInterval(refresh, 4000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, []);
+  // Si el primer fetch fallo (agente apagado, sin config), `data` queda
+  // null y `error` se setea. La UI muestra "DESCONECTADO" en el header.
+  const isDisconnected = statusQuery.error !== null && statusQuery.data === null;
+
+  const agentState: AgentState | null = useMemo(() => {
+    if (!statusQuery.data) return null;
+    const mapped = statusToAgentState(statusQuery.data);
+    // Si tenemos error pero data stale, marcamos como offline igual: el
+    // user merece saber que perdimos contacto. Si en cambio el error
+    // viene del primer fetch (data=null), seguimos siendo offline.
+    if (statusQuery.error !== null) {
+      return { ...mapped, status: "offline" };
+    }
+    return mapped;
+  }, [statusQuery.data, statusQuery.error]);
+
+  const printers: PrinterInfo[] = useMemo(() => {
+    if (!statusQuery.data) return [];
+    return discoveredPrintersToView(statusQuery.data.discovered_printers);
+  }, [statusQuery.data]);
+
+  const jobs: PrintJob[] = useMemo(() => {
+    if (!jobsQuery.data) return [];
+    return jobsToView(jobsQuery.data);
+  }, [jobsQuery.data]);
 
   return (
     <TooltipProvider delayDuration={200}>
@@ -78,9 +84,10 @@ function App() {
       >
         {/* Header con drag region */}
         <AppHeader
-          state={state}
+          state={agentState}
           onHide={tauriHide}
           onExit={tauriExit}
+          isDisconnected={isDisconnected}
         />
 
         {/* Body: tabs */}
@@ -93,20 +100,37 @@ function App() {
             </TabsList>
 
             <TabsContent value="status" className="flex-1 min-h-0 mt-3">
-              <StatusTab state={state} printers={printers} />
+              <StatusTab
+                state={agentState}
+                printers={printers}
+                isLoading={statusQuery.isLoading}
+                isDisconnected={isDisconnected}
+                errorMessage={statusQuery.error?.message ?? null}
+              />
             </TabsContent>
 
             <TabsContent value="jobs" className="flex-1 min-h-0 mt-3">
-              <RecentJobsTab jobs={jobs} />
+              <RecentJobsTab
+                jobs={jobs}
+                onReprintSuccess={() => void jobsQuery.refresh()}
+                isDisconnected={isDisconnected}
+              />
             </TabsContent>
 
             <TabsContent value="actions" className="flex-1 min-h-0 mt-3">
-              <ActionsTab printers={printers} />
+              <ActionsTab
+                printers={printers}
+                isDisconnected={isDisconnected}
+                onQueueRefreshed={() => {
+                  void statusQuery.refresh();
+                  void jobsQuery.refresh();
+                }}
+              />
             </TabsContent>
           </Tabs>
         </main>
 
-        <AppFooter agentVersion={state?.agent_version} />
+        <AppFooter agentVersion={agentState?.agent_version} />
       </motion.div>
 
       <Toaster />

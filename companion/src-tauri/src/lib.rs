@@ -15,15 +15,99 @@
 //
 // Click izquierdo en el icono: toggle show/hide de la window principal.
 
+use std::path::PathBuf;
+
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, LogicalPosition, LogicalSize, Manager, WindowEvent,
+    AppHandle, Manager, WindowEvent,
 };
 use tauri_plugin_opener::OpenerExt;
 
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/tray-icon.png");
+
+// ---------- Agent home helpers ----------
+
+/// Resuelve la carpeta `~/.bait-print-agent/` (donde vive config.json + logs/).
+///
+/// Respeta el env var `BAIT_AGENT_HOME`: si esta seteado lo usamos tal cual,
+/// sin appendear `.bait-print-agent`. Util para dev local sin tocar la config
+/// real del cliente (ej: BAIT_AGENT_HOME=C:\dev\.bait-print-agent-dev).
+///
+/// En produccion (sin override), construimos `<home>/.bait-print-agent` con
+/// `dirs::home_dir()` para portabilidad cross-platform.
+fn resolve_agent_home() -> Result<PathBuf, String> {
+    if let Ok(override_path) = std::env::var("BAIT_AGENT_HOME") {
+        let trimmed = override_path.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+    let home = dirs::home_dir()
+        .ok_or_else(|| "No pude resolver el directorio HOME del usuario.".to_string())?;
+    Ok(home.join(".bait-print-agent"))
+}
+
+// ---------- Tauri commands ----------
+
+/// Abre la carpeta de logs del agente con el explorador del sistema.
+///
+/// Idem que el item "Ver logs" del tray, pero invocable desde el
+/// frontend (Tab "Acciones"). Centralizamos la logica aca para que la
+/// resolucion de `BAIT_AGENT_HOME` viva solo en un lugar.
+#[tauri::command]
+fn open_logs_folder(app: AppHandle) -> Result<(), String> {
+    let home = resolve_agent_home()?;
+    let logs = home.join("logs");
+    // Si la carpeta de logs aun no existe (primera instalacion), abrimos
+    // el folder padre para que el user al menos vea donde deberia estar todo.
+    let target = if logs.exists() { logs } else { home };
+    app.opener()
+        .open_path(target.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| format!("No pude abrir la carpeta de logs: {e}"))
+}
+
+/// Lee `<agent_home>/config.json` y devuelve el `local_api_token` que el
+/// frontend usa como Bearer auth contra el HTTP server local del agente.
+///
+/// Errores user-friendly:
+///  - Archivo no existe → "Servicio no configurado todavia..."
+///  - JSON corrupto → "config.json corrupto..."
+///  - Falta el campo `local_api_token` → "Servicio antiguo sin local API..."
+///
+/// El token es cacheado en JS-side (modulo state) — este comando se invoca
+/// una sola vez al primer fetch, o cuando el cache se invalida por 401.
+#[tauri::command]
+fn read_local_api_token() -> Result<String, String> {
+    let home = resolve_agent_home()?;
+    let config_path = home.join("config.json");
+
+    if !config_path.exists() {
+        return Err(
+            "Servicio no configurado todavia. Corre el wizard de setup primero.".to_string(),
+        );
+    }
+
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("No pude leer config.json: {e}"))?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|_| "config.json corrupto".to_string())?;
+
+    let token = parsed
+        .get("local_api_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "Servicio antiguo sin local API. Actualiza el agente a v0.5.5+".to_string()
+        })?;
+
+    if token.trim().is_empty() {
+        return Err("Servicio antiguo sin local API. Actualiza el agente a v0.5.5+".to_string());
+    }
+
+    Ok(token.to_string())
+}
 
 // ---------- Window helpers ----------
 
@@ -125,8 +209,9 @@ fn handle_menu_event(app: &AppHandle, event_id: &str) {
             }
         }
         "view-logs" => {
-            // TODO: cuando wireup HTTP server, abrir %USERPROFILE%\.bait-print-agent\logs\
-            log::info!("[menu] view-logs — pendiente wireup");
+            if let Err(e) = open_logs_folder(app.clone()) {
+                log::error!("[menu] view-logs fallo: {e}");
+            }
         }
         "exit" => {
             log::info!("[menu] exit → cerrando companion");
@@ -141,8 +226,21 @@ fn handle_menu_event(app: &AppHandle, event_id: &str) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance: si el usuario lanza un 2do bait-print-companion.exe
+        // (doble click en el shortcut, autostart + manual, etc), el callback de
+        // abajo se ejecuta en la instancia que YA estaba viva. Le mostramos la
+        // window al primero y dejamos que el 2do muera solo. Sin esto terminamos
+        // con N icons en el tray.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            log::info!("[single-instance] 2da instancia detectada, mostrando window de la 1ra");
+            show_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
+        .invoke_handler(tauri::generate_handler![
+            read_local_api_token,
+            open_logs_folder
+        ])
         .setup(|app| {
             let handle = app.handle().clone();
 

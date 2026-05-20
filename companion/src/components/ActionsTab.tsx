@@ -1,78 +1,175 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import {
   Printer,
   RotateCcw,
-  KeyRound,
   ExternalLink,
   ChevronDown,
   ScrollText,
+  Loader2,
 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button } from "./ui/button";
 import { ScrollArea } from "./ui/scroll-area";
 import { useToast } from "@/hooks/use-toast";
-import { api } from "@/lib/api";
+import {
+  refreshQueue,
+  testPrint,
+  AgentOfflineError,
+  NotImplementedError,
+} from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { PrinterInfo } from "@/lib/mock-data";
 
 interface ActionsTabProps {
   printers: PrinterInfo[];
+  /** Si no hay contacto con el servicio, deshabilitamos las acciones. */
+  isDisconnected?: boolean;
+  /**
+   * Llamado cuando el refresh-queue del server termino exitoso. La parent
+   * lo usa para forzar un re-fetch de status + jobs (asi el contador de
+   * "pendientes" se actualiza al instante).
+   */
+  onQueueRefreshed?: () => void;
 }
 
-export function ActionsTab({ printers }: ActionsTabProps) {
+export function ActionsTab({
+  printers,
+  isDisconnected,
+  onQueueRefreshed,
+}: ActionsTabProps) {
   const { toast } = useToast();
   const [printerDropdownOpen, setPrinterDropdownOpen] = useState(false);
   const [selectedPrinter, setSelectedPrinter] = useState<PrinterInfo | null>(
-    printers[0] ?? null
+    null
   );
 
-  const pendingToast = (action: string) =>
-    toast({
-      title: "Funcionalidad pendiente",
-      description: `Espera el wireup al HTTP server para ${action}.`,
-      variant: "warning",
-    });
+  // Cuando llega la primera lista de printers, pre-seleccionamos la
+  // primera (preferir default/primary). Si la lista cambia y la
+  // seleccionada desaparecio, caemos a la primera disponible.
+  useEffect(() => {
+    if (!selectedPrinter && printers.length > 0) {
+      const preferred = printers.find((p) => p.is_primary) ?? printers[0];
+      setSelectedPrinter(preferred);
+      return;
+    }
+    if (
+      selectedPrinter &&
+      !printers.some((p) => p.id === selectedPrinter.id)
+    ) {
+      setSelectedPrinter(printers[0] ?? null);
+    }
+  }, [printers, selectedPrinter]);
 
+  // -------- Acciones --------
+
+  const [testRunning, setTestRunning] = useState(false);
   const handleTestPrint = async () => {
+    if (testRunning) return;
     if (!selectedPrinter) {
       toast({
         title: "Sin impresora",
-        description: "Configurá al menos una impresora antes de probar.",
+        description: "No hay impresoras descubiertas en el sistema.",
         variant: "destructive",
       });
       return;
     }
-    const res = await api.testPrint(selectedPrinter.id);
-    if (res.ok) {
+    setTestRunning(true);
+    try {
+      await testPrint(selectedPrinter.id);
+      // No deberiamos llegar aca mientras el endpoint sea stub (501).
+      // Si en el futuro responde 200, mostramos el ok.
       toast({
         title: "Test enviado",
         description: `→ ${selectedPrinter.name}`,
         variant: "success",
       });
+    } catch (err) {
+      if (err instanceof NotImplementedError) {
+        toast({
+          title: "Funcionalidad en desarrollo",
+          description:
+            "El endpoint de test de impresión todavía no está disponible.",
+          variant: "warning",
+        });
+      } else if (err instanceof AgentOfflineError) {
+        toast({
+          title: "Servicio no disponible",
+          description: "El agente no respondió. Verifica que esté corriendo.",
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: "Error al imprimir test",
+          description:
+            err instanceof Error ? err.message : "Error desconocido.",
+          variant: "destructive",
+        });
+      }
+    } finally {
+      setTestRunning(false);
     }
-    pendingToast(`imprimir test real en ${selectedPrinter.name}`);
   };
 
+  const [restartRunning, setRestartRunning] = useState(false);
   const handleRestartQueue = async () => {
-    await api.restartQueue();
-    pendingToast("reiniciar la cola");
+    if (restartRunning) return;
+    setRestartRunning(true);
+    try {
+      const { processed } = await refreshQueue();
+      toast({
+        title: "Cola reiniciada",
+        description:
+          processed > 0
+            ? `Se reprocesaron ${processed} job${processed === 1 ? "" : "s"}.`
+            : "No había jobs pendientes para reprocesar.",
+        variant: "success",
+      });
+      onQueueRefreshed?.();
+    } catch (err) {
+      const offline = err instanceof AgentOfflineError;
+      toast({
+        title: "No se pudo reiniciar la cola",
+        description: offline
+          ? "El servicio no está corriendo."
+          : err instanceof Error
+            ? err.message
+            : "Error desconocido.",
+        variant: "destructive",
+      });
+    } finally {
+      setRestartRunning(false);
+    }
   };
 
-  const handleResetPairing = async () => {
-    await api.resetPairing();
-    pendingToast("regenerar código de pairing");
+  const handleOpenBaitApp = async () => {
+    try {
+      await openUrl("https://bait-app.cl");
+    } catch (e) {
+      console.warn("[actions] opener no disponible:", e);
+      // Fallback: en Vite puro abrimos en una nueva pestaña.
+      window.open("https://bait-app.cl", "_blank");
+    }
   };
 
-  const handleOpenBaitApp = () => {
-    // TODO: usar @tauri-apps/plugin-opener cuando esté wireup-eado al servicio
-    console.log("[actions] abrir https://bait-app.cl");
-    pendingToast("abrir bait-app.cl desde el host nativo");
+  const handleViewLogs = async () => {
+    // El comando Rust ya resuelve `BAIT_AGENT_HOME` con la misma logica
+    // que el menu del tray — desde aca solo lo invocamos.
+    try {
+      await invoke("open_logs_folder");
+    } catch (e) {
+      console.warn("[actions] no pude abrir logs:", e);
+      toast({
+        title: "No se pudieron abrir los logs",
+        description:
+          "Abre manualmente la carpeta %USERPROFILE%\\.bait-print-agent\\logs",
+        variant: "warning",
+      });
+    }
   };
 
-  const handleViewLogs = () => {
-    console.log("[actions] ver logs");
-    pendingToast("abrir la carpeta de logs");
-  };
+  const actionsDisabled = !!isDisconnected;
 
   return (
     <ScrollArea className="h-[calc(540px-176px)] pr-1.5 -mr-1.5 scroll-dark">
@@ -103,13 +200,19 @@ export function ActionsTab({ printers }: ActionsTabProps) {
             <button
               type="button"
               onClick={() => setPrinterDropdownOpen((v) => !v)}
+              disabled={printers.length === 0}
               className={cn(
                 "w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md",
-                "border border-white/15 bg-white/[0.04] hover:bg-white/[0.07] transition-colors text-[11.5px]"
+                "border border-white/15 bg-white/[0.04] hover:bg-white/[0.07] transition-colors text-[11.5px]",
+                "disabled:opacity-50 disabled:cursor-not-allowed"
               )}
             >
               <span className="truncate text-foreground/90">
-                {selectedPrinter ? selectedPrinter.name : "Elegir impresora"}
+                {selectedPrinter
+                  ? selectedPrinter.name
+                  : printers.length === 0
+                    ? "Sin impresoras descubiertas"
+                    : "Elegir impresora"}
               </span>
               <ChevronDown
                 className={cn(
@@ -118,7 +221,7 @@ export function ActionsTab({ printers }: ActionsTabProps) {
                 )}
               />
             </button>
-            {printerDropdownOpen && (
+            {printerDropdownOpen && printers.length > 0 && (
               <motion.ul
                 initial={{ opacity: 0, y: -4 }}
                 animate={{ opacity: 1, y: 0 }}
@@ -161,31 +264,38 @@ export function ActionsTab({ printers }: ActionsTabProps) {
             )}
           </div>
 
-          <Button onClick={handleTestPrint} variant="default" className="w-full">
-            <Printer className="h-3.5 w-3.5" />
+          <Button
+            onClick={handleTestPrint}
+            variant="default"
+            className="w-full"
+            disabled={
+              actionsDisabled || testRunning || !selectedPrinter
+            }
+          >
+            {testRunning ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Printer className="h-3.5 w-3.5" />
+            )}
             Imprimir test
           </Button>
         </div>
 
         {/* ---------- Cola ---------- */}
         <ActionCard
-          icon={<RotateCcw className="h-4 w-4" />}
+          icon={
+            restartRunning ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <RotateCcw className="h-4 w-4" />
+            )
+          }
           title="Reiniciar cola"
-          description="Limpia jobs colgados y vuelve a engancharse al realtime."
+          description="Hace un backfill de jobs pendientes en Supabase."
           onClick={handleRestartQueue}
-          buttonLabel="Reiniciar"
+          buttonLabel={restartRunning ? "Reiniciando..." : "Reiniciar"}
           variant="secondary"
-        />
-
-        {/* ---------- Pairing ---------- */}
-        <ActionCard
-          icon={<KeyRound className="h-4 w-4" />}
-          title="Reconfigurar pairing"
-          description="Pide un código nuevo en bait-app.cl y vincula esta PC otra vez."
-          onClick={handleResetPairing}
-          buttonLabel="Regenerar"
-          variant="secondary"
-          tone="warning"
+          disabled={actionsDisabled || restartRunning}
         />
 
         {/* ---------- Quick links ---------- */}
@@ -214,6 +324,7 @@ function ActionCard({
   buttonLabel,
   variant = "secondary",
   tone,
+  disabled,
 }: {
   icon: React.ReactNode;
   title: string;
@@ -222,6 +333,7 @@ function ActionCard({
   buttonLabel: string;
   variant?: "default" | "secondary";
   tone?: "warning";
+  disabled?: boolean;
 }) {
   return (
     <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 flex items-start gap-2.5">
@@ -245,6 +357,7 @@ function ActionCard({
           variant={variant}
           size="sm"
           className="text-[11px] h-7"
+          disabled={disabled}
         >
           {buttonLabel}
         </Button>

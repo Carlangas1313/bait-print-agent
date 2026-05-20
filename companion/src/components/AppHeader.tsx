@@ -9,14 +9,22 @@ interface AppHeaderProps {
   state: AgentState | null;
   onHide: () => void;
   onExit: () => void;
+  /**
+   * Si el companion no logro contactar al agente. Forza el dot rojo y el
+   * label "DESCONECTADO" en mayuscula chica — vale mas que el status
+   * derivado del state (que puede ser stale).
+   */
+  isDisconnected?: boolean;
 }
 
-export function AppHeader({ state, onHide, onExit }: AppHeaderProps) {
-  const status = state?.status ?? "offline";
+export function AppHeader({ state, onHide, onExit, isDisconnected }: AppHeaderProps) {
+  // Cuando estamos en disconnected, forzamos offline aunque tengamos
+  // data stale: el user merece saber que perdimos contacto.
+  const status = isDisconnected ? "offline" : state?.status ?? "offline";
   const STATUS_LABEL: Record<typeof status, string> = {
     online: "operativo",
     degraded: "con avisos",
-    offline: "sin conexión",
+    offline: isDisconnected ? "desconectado" : "sin conexión",
   };
 
   return (
@@ -61,7 +69,9 @@ export function AppHeader({ state, onHide, onExit }: AppHeaderProps) {
             )}
             title={state?.location_name ?? "—"}
           >
-            {state?.location_name ?? "Conectando..."}
+            {isDisconnected
+              ? "Servicio caído"
+              : state?.location_name ?? "Conectando..."}
           </p>
         </div>
       </motion.div>

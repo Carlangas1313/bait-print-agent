@@ -16,7 +16,11 @@ jobs:
   build-windows:
     name: Build SEA executable (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 15
+    # Cold cargo cache compila tauri+wry+tao y ~400 crates desde 0 (~8-10 min).
+    # Cache hit baja a ~2 min. Sumamos margen para el Node SEA packaging + Inno
+    # Setup + smoke tests. 30 min es comodo para el peor caso (1ra release con
+    # bump de tauri o cambio de Cargo.lock).
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -31,6 +35,23 @@ jobs:
         with:
           node-version: '22'
           cache: 'npm'
+
+      - name: Setup Rust toolchain
+        # Necesario para compilar el companion (Tauri 2 = Rust crate). Usamos
+        # stable porque Tauri 2 no requiere nightly y queremos reproducibilidad
+        # del build (la imagen de windows-latest puede traer otra version de
+        # rustc preinstalada que cambia entre runs).
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + companion target
+        # Sin cache, la 1ra compilacion del companion tarda ~7-10 min en CI
+        # (compila tauri + wry + tao + 400+ crates desde cero). Con cache hit,
+        # baja a ~1-2 min. La key incluye Cargo.lock para invalidar cuando se
+        # actualizan deps; el working-directory apunta a src-tauri/ para que
+        # Swatinem/rust-cache encuentre Cargo.toml + target/ del companion.
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: companion/src-tauri -> target
 
       - name: Install dependencies
         run: npm ci
@@ -67,6 +88,39 @@ jobs:
           $sizeKB = ((Get-Item vendor/nssm.exe).Length / 1KB).ToString('F1')
           Write-Host "NSSM x64 vendored OK ($sizeKB KB)"
 
+      - name: Install companion deps
+        # El companion (Tauri 2 + Vite + React) vive en companion/ y tiene su
+        # propio package.json — npm ci ahi para no contaminar las deps del
+        # agente. Setup-node v4 ya tiene el cache npm prendido para la lockfile
+        # del root; companion/package-lock.json se cachea aparte la 1ra vez.
+        working-directory: companion
+        run: npm ci
+
+      - name: Build companion (Tauri release)
+        # --no-bundle: queremos solo el .exe pelado en target/release/, NO el
+        # MSI/NSIS de Tauri. Inno Setup empaqueta el .exe del companion junto
+        # con el agente en bait-print-agent-setup.exe (un solo instalador).
+        # Como defensa adicional, tauri.conf.json tiene bundle.active=false +
+        # bundle.targets=[] por si el flag --no-bundle desaparece en una
+        # version futura de Tauri CLI.
+        working-directory: companion
+        run: npm run tauri:build -- --no-bundle
+
+      - name: Verify companion.exe
+        # Sanity check: el .exe del companion debe quedar en target/release/.
+        # Si Tauri cambia el output path en una version futura, lo agarramos
+        # aca antes de seguir al Inno Setup (que falla con "file not found"
+        # con un error menos util).
+        shell: pwsh
+        run: |
+          $exe = "companion/src-tauri/target/release/bait-print-companion.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "No existe $exe — el build del companion no genero el .exe esperado."
+            exit 1
+          }
+          $sizeMB = ((Get-Item $exe).Length / 1MB).ToString('F1')
+          Write-Host "Companion .exe OK ($sizeMB MB)"
+
       - name: Package for Windows
         run: npm run package:win
 
@@ -81,8 +135,9 @@ jobs:
           }
           $output = & $exe --version
           Write-Host "Output de --version: $output"
-          if ($output -notmatch "0\.1\.0|${{ github.ref_name }}".TrimStart('v')) {
-            Write-Warning "El output de --version no matchea el tag, pero seguimos."
+          $expected = "${{ github.ref_name }}".TrimStart('v')
+          if ($output -notmatch [regex]::Escape($expected)) {
+            Write-Warning "El output de --version no matchea el tag ($expected), pero seguimos."
           }
 
       - name: Compute version (strip v prefix)
@@ -138,6 +193,18 @@ jobs:
           Write-Host "SHA256: $hash"
           $hash | Out-File -FilePath dist/bait-print-agent-win-x64.exe.sha256 -Encoding ascii
 
+      - name: Stage companion .exe for release asset
+        # Copiamos el .exe del companion a dist/ con un nombre versionado para
+        # que aparezca en el release de GitHub. Asi un cliente que ya tiene el
+        # servicio instalado puede bajar solo el companion si lo desinstalo
+        # o quiere reinstalarlo, sin re-correr el wizard completo.
+        shell: pwsh
+        run: |
+          $src = "companion/src-tauri/target/release/bait-print-companion.exe"
+          $dst = "dist/bait-print-companion-win-x64.exe"
+          Copy-Item -Path $src -Destination $dst -Force
+          Write-Host "Companion copiado a $dst"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -151,6 +218,7 @@ jobs:
             dist/Output/bait-print-agent-setup.exe
             dist/bait-print-agent-win-x64.exe
             dist/bait-print-agent-win-x64.exe.sha256
+            dist/bait-print-companion-win-x64.exe
           body: |
             ## bait-print-agent ${{ github.ref_name }}
 

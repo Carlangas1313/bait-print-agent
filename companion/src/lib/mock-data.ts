@@ -1,55 +1,149 @@
 /**
- * Mock data — refleja la shape esperada del HTTP server local del agente
- * (`http://127.0.0.1:17891`). Cuando el server real esté listo, lib/api.ts
- * reemplaza estos mocks por fetch().
+ * View-models de la UI del companion.
+ *
+ * Originalmente este archivo tenia mocks. Ahora los datos reales vienen
+ * del HTTP server local del agente via `lib/api.ts`. Mantenemos este
+ * archivo (en vez de borrarlo) por dos razones:
+ *
+ *  1. Los componentes (StatusTab, RecentJobsTab, ActionsTab, etc) ya
+ *     importan los types desde aca. Cambiar todos los imports a
+ *     `./api` haria el diff mas ruidoso; mejor mantenemos la frontera
+ *     "tipos que la UI consume" en un archivo separado.
+ *  2. La shape que la UI muestra NO es identica a la shape del HTTP
+ *     server. Aca exponemos un "view model" mas amigable (por ejemplo
+ *     `area: string` derivado del payload, `items: PrintJobItem[]`
+ *     extraidos del JSONB del job). Los mappers viven en
+ *     `lib/mappers.ts`.
+ *
+ * Si alguien grep-ea por "mock" va a llegar aca y va a poder seguir el
+ * trail al wireup real. No hay datos hardcodeados aca: solo types.
  */
 
+// ----------------------------------------------------------------------
+// Status del agente (lo que ve la UI en StatusTab / AppHeader)
+// ----------------------------------------------------------------------
+
+/**
+ * Estado de salud que la UI pinta en el header:
+ *  - online: agente respondiendo + Supabase + Realtime OK
+ *  - degraded: agente responde pero supabase o realtime caidos
+ *  - offline: agente no respondio (companion en estado "desconectado")
+ */
 export type AgentStatus = "online" | "degraded" | "offline";
 
+/**
+ * Status de una impresora. El HTTP server expone `discovered_printers`
+ * (lo que Get-Printer ve en el OS); no expone heartbeats per-printer,
+ * asi que clasificamos heuristicamente: si esta en la lista la marcamos
+ * `online`, si no hay datos (loading) `unknown`. `offline` queda
+ * reservado para cuando agreguemos health-check per-printer en futuro.
+ */
+export type PrinterStatus = "online" | "offline" | "unknown";
+
+/**
+ * Status de un job. Espejo del enum del backend — incluimos `cancelled`
+ * porque puede aparecer en `/v1/jobs/recent`. La UI lo mapea a un badge
+ * `muted` con texto "cancelado".
+ */
 export type JobStatus =
   | "pending"
   | "waiting_printer"
   | "printing"
   | "printed"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
-export type PrinterStatus = "online" | "offline" | "unknown";
+/**
+ * Tipos de job — los recibimos del backend en el field `job_type`. La UI
+ * los renderiza con labels humanos via `jobTypeLabels` (abajo).
+ */
+export type JobType =
+  | "kitchen_order"
+  | "bar_order"
+  | "kitchen_cancel"
+  | "bill_proforma"
+  | "sii_receipt"
+  | "cash_close";
 
+// ----------------------------------------------------------------------
+// View models
+// ----------------------------------------------------------------------
+
+/**
+ * Impresora tal cual la muestra la UI. Derivado de `DiscoveredPrinter`
+ * del HTTP server (mapper en `lib/mappers.ts`).
+ */
 export interface PrinterInfo {
+  /** Para React keys + para el endpoint /printers/:id/test. Usamos `device_id`. */
   id: string;
+  /** Nombre tal cual aparece en Windows. */
   name: string;
-  area: string; // "Cocina Principal" | "Barra" | ...
-  driver: string; // "HP_OfficeJet" | "EPSON_TM-T20III" | ...
+  /**
+   * Texto de area que pintamos como subtitulo. El HTTP server no expone
+   * "area" porque las areas viven en Supabase (tabla `print_areas`). Por
+   * ahora ponemos el kind (USB/Network/...) ahi para no dejar el campo
+   * vacio. Cuando el endpoint exponga area mapeada, lo cambiamos.
+   */
+  area: string;
+  /** Driver/kind crudo (USB/NETWORK/...). Usado como meta visual. */
+  driver: string;
   status: PrinterStatus;
+  /**
+   * Si Windows tiene esta impresora marcada como default. La UI le pone
+   * un badge "Principal" — semantica no es 100% la misma que primary del
+   * agente pero hasta que tengamos ese dato propio, es lo mas cercano.
+   */
   is_primary: boolean;
   last_seen_at: string | null;
 }
 
+/**
+ * Items renderizados de un job. Para `kitchen_order` y `bar_order` vienen
+ * del payload `KitchenJobPayload`; para `bill_proforma` los mapeamos al
+ * mismo shape; para `cash_close` mostramos una sola fila resumen.
+ */
 export interface PrintJobItem {
   name: string;
   qty: number;
   note?: string;
 }
 
+/**
+ * Job tal cual la UI lo muestra. La shape NO es identica a la del HTTP
+ * server (que devuelve `payload: jsonb`) — el mapper se encarga de
+ * extraer table_label/area/items del payload.
+ */
 export interface PrintJob {
   id: string;
-  job_type:
-    | "kitchen_order"
-    | "bar_order"
-    | "kitchen_cancel"
-    | "bill_proforma"
-    | "cash_close";
+  job_type: JobType;
   status: JobStatus;
+  /** Derivado del payload o del print_area_id (mapper). */
   area: string;
+  /** Derivado del payload (table_number/table_display_name). null si no aplica. */
   table_label: string | null;
+  /**
+   * Nombre de la impresora a la que se mandó. Por ahora el HTTP server
+   * NO expone el nombre de la printer en el payload de recent (solo el
+   * print_area_id). Lo dejamos null hasta que el server lo exponga.
+   */
   printer_name: string | null;
   created_at: string;
   printed_at: string | null;
+  /** Es `attempts` en la shape del server, lo renombramos para mantener compat. */
   attempt_count: number;
   last_error: string | null;
   items: PrintJobItem[];
 }
 
+/**
+ * Estado del agente que la UI muestra en el StatusTab y AppHeader.
+ *
+ * Derivado de `AgentStatus` del HTTP server (mapper). Los counters
+ * `printed_today` y `failed_today` NO los expone el server hoy — los
+ * dejamos como undefined (la UI muestra "—"). Si quisieramos los counts,
+ * habria que agregar un endpoint nuevo o calcularlos client-side a
+ * partir de `/v1/jobs/recent` (con la limitacion del limit=100).
+ */
 export interface AgentState {
   agent_id: string;
   agent_version: string;
@@ -59,218 +153,21 @@ export interface AgentState {
   supabase_connected: boolean;
   realtime_connected: boolean;
   last_heartbeat_at: string;
-  printed_today: number;
+  printed_today: number | undefined;
   pending_jobs: number;
-  failed_today: number;
-  uptime_seconds: number;
+  failed_today: number | undefined;
+  uptime_seconds: number | undefined;
 }
 
-// ---------- Estado del agente ----------
+// ----------------------------------------------------------------------
+// Labels usados en la UI
+// ----------------------------------------------------------------------
 
-export const mockAgentState: AgentState = {
-  agent_id: "00000000-0000-0000-0000-00000000aaaa",
-  agent_version: "0.4.2",
-  location_name: "La Cocina · Plaza Perú",
-  restaurant_name: "La Cocina",
-  status: "online",
-  supabase_connected: true,
-  realtime_connected: true,
-  last_heartbeat_at: new Date(Date.now() - 8 * 1000).toISOString(),
-  printed_today: 142,
-  pending_jobs: 2,
-  failed_today: 1,
-  uptime_seconds: 3 * 3600 + 24 * 60 + 11,
-};
-
-// ---------- Impresoras ----------
-
-export const mockPrinters: PrinterInfo[] = [
-  {
-    id: "prn-cocina-01",
-    name: "Cocina Principal",
-    area: "Cocina caliente",
-    driver: "HP_OfficeJet",
-    status: "online",
-    is_primary: true,
-    last_seen_at: new Date(Date.now() - 12 * 1000).toISOString(),
-  },
-  {
-    id: "prn-barra-01",
-    name: "Barra",
-    area: "Barra",
-    driver: "EPSON_TM-T20III",
-    status: "offline",
-    is_primary: false,
-    last_seen_at: new Date(Date.now() - 9 * 60 * 1000).toISOString(),
-  },
-];
-
-// ---------- Jobs recientes (~10 con mix de estados) ----------
-
-const minutesAgo = (n: number) =>
-  new Date(Date.now() - n * 60 * 1000).toISOString();
-
-export const mockRecentJobs: PrintJob[] = [
-  {
-    id: "job-1001",
-    job_type: "kitchen_order",
-    status: "printed",
-    area: "Cocina caliente",
-    table_label: "Mesa 4",
-    printer_name: "Cocina Principal",
-    created_at: minutesAgo(2),
-    printed_at: minutesAgo(2),
-    attempt_count: 1,
-    last_error: null,
-    items: [
-      { name: "Lomo a lo pobre", qty: 2, note: "Sin huevo" },
-      { name: "Ensalada chilena", qty: 1 },
-    ],
-  },
-  {
-    id: "job-1002",
-    job_type: "bar_order",
-    status: "failed",
-    area: "Barra",
-    table_label: "Mesa 7",
-    printer_name: "Barra",
-    created_at: minutesAgo(4),
-    printed_at: null,
-    attempt_count: 3,
-    last_error: "Printer no responde (timeout TCP 9100 — 5s)",
-    items: [
-      { name: "Pisco sour", qty: 3 },
-      { name: "Cerveza Kunstmann", qty: 2 },
-    ],
-  },
-  {
-    id: "job-1003",
-    job_type: "kitchen_order",
-    status: "printing",
-    area: "Cocina caliente",
-    table_label: "Mesa 12",
-    printer_name: "Cocina Principal",
-    created_at: minutesAgo(0.2),
-    printed_at: null,
-    attempt_count: 1,
-    last_error: null,
-    items: [
-      { name: "Hamburguesa La Cocina", qty: 1, note: "Sin cebolla" },
-      { name: "Papas fritas grandes", qty: 1 },
-    ],
-  },
-  {
-    id: "job-1004",
-    job_type: "kitchen_cancel",
-    status: "printed",
-    area: "Cocina caliente",
-    table_label: "Mesa 4",
-    printer_name: "Cocina Principal",
-    created_at: minutesAgo(6),
-    printed_at: minutesAgo(6),
-    attempt_count: 1,
-    last_error: null,
-    items: [{ name: "Ensalada chilena", qty: 1, note: "ANULADO" }],
-  },
-  {
-    id: "job-1005",
-    job_type: "bill_proforma",
-    status: "printed",
-    area: "Caja",
-    table_label: "Mesa 3",
-    printer_name: "Cocina Principal",
-    created_at: minutesAgo(8),
-    printed_at: minutesAgo(8),
-    attempt_count: 1,
-    last_error: null,
-    items: [
-      { name: "Pre-cuenta", qty: 1, note: "$ 38.500" },
-    ],
-  },
-  {
-    id: "job-1006",
-    job_type: "kitchen_order",
-    status: "waiting_printer",
-    area: "Cocina caliente",
-    table_label: "Mesa 9",
-    printer_name: "Cocina Principal",
-    created_at: minutesAgo(0.5),
-    printed_at: null,
-    attempt_count: 0,
-    last_error: null,
-    items: [
-      { name: "Pastel de jaiba", qty: 1 },
-      { name: "Empanada de pino", qty: 4 },
-    ],
-  },
-  {
-    id: "job-1007",
-    job_type: "bar_order",
-    status: "pending",
-    area: "Barra",
-    table_label: "Mesa 11",
-    printer_name: "Barra",
-    created_at: minutesAgo(0.1),
-    printed_at: null,
-    attempt_count: 0,
-    last_error: null,
-    items: [
-      { name: "Mojito", qty: 2 },
-      { name: "Agua mineral", qty: 1 },
-    ],
-  },
-  {
-    id: "job-1008",
-    job_type: "kitchen_order",
-    status: "printed",
-    area: "Cocina caliente",
-    table_label: "Mesa 2",
-    printer_name: "Cocina Principal",
-    created_at: minutesAgo(15),
-    printed_at: minutesAgo(15),
-    attempt_count: 1,
-    last_error: null,
-    items: [
-      { name: "Caldillo de congrio", qty: 1 },
-      { name: "Marraqueta", qty: 2 },
-    ],
-  },
-  {
-    id: "job-1009",
-    job_type: "cash_close",
-    status: "printed",
-    area: "Caja",
-    table_label: null,
-    printer_name: "Cocina Principal",
-    created_at: minutesAgo(45),
-    printed_at: minutesAgo(45),
-    attempt_count: 1,
-    last_error: null,
-    items: [{ name: "Cierre de caja — turno tarde", qty: 1 }],
-  },
-  {
-    id: "job-1010",
-    job_type: "kitchen_order",
-    status: "printed",
-    area: "Cocina caliente",
-    table_label: "Mesa 6",
-    printer_name: "Cocina Principal",
-    created_at: minutesAgo(70),
-    printed_at: minutesAgo(70),
-    attempt_count: 2,
-    last_error: null,
-    items: [
-      { name: "Asado de tira", qty: 1, note: "Término medio" },
-      { name: "Pure de papas", qty: 1 },
-      { name: "Coca-Cola 350ml", qty: 1 },
-    ],
-  },
-];
-
-export const jobTypeLabels: Record<PrintJob["job_type"], string> = {
+export const jobTypeLabels: Record<JobType, string> = {
   kitchen_order: "Cocina",
   bar_order: "Barra",
   kitchen_cancel: "Anulación",
   bill_proforma: "Pre-cuenta",
+  sii_receipt: "Boleta SII",
   cash_close: "Cierre",
 };

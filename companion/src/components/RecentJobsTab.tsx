@@ -1,8 +1,16 @@
 import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { ChevronRight, AlertCircle, Loader2 } from "lucide-react";
+import {
+  ChevronRight,
+  AlertCircle,
+  Loader2,
+  RotateCcw,
+} from "lucide-react";
 import { Badge } from "./ui/badge";
+import { Button } from "./ui/button";
 import { ScrollArea } from "./ui/scroll-area";
+import { useToast } from "@/hooks/use-toast";
+import { reprintJob, AgentOfflineError } from "@/lib/api";
 import { cn, formatTime } from "@/lib/utils";
 import {
   jobTypeLabels,
@@ -12,6 +20,9 @@ import {
 
 interface RecentJobsTabProps {
   jobs: PrintJob[];
+  /** Llamado tras un reprint exitoso para refrescar la lista. */
+  onReprintSuccess?: () => void;
+  isDisconnected?: boolean;
 }
 
 const STATUS_VARIANT: Record<
@@ -23,9 +34,24 @@ const STATUS_VARIANT: Record<
   waiting_printer: { variant: "warning", label: "esperando" },
   printing: { variant: "default", label: "imprimiendo" },
   pending: { variant: "muted", label: "pendiente" },
+  cancelled: { variant: "muted", label: "cancelado" },
 };
 
-export function RecentJobsTab({ jobs }: RecentJobsTabProps) {
+/**
+ * Estados desde los cuales el agente permite reimprimir (CAS server-side).
+ * Los demas (printing/pending/cancelled) NO ofrecen el boton.
+ */
+const REPRINTABLE_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
+  "printed",
+  "failed",
+  "waiting_printer",
+]);
+
+export function RecentJobsTab({
+  jobs,
+  onReprintSuccess,
+  isDisconnected,
+}: RecentJobsTabProps) {
   const [expanded, setExpanded] = useState<string | null>(null);
 
   return (
@@ -38,7 +64,9 @@ export function RecentJobsTab({ jobs }: RecentJobsTabProps) {
       >
         {jobs.length === 0 ? (
           <p className="text-center text-xs text-muted-foreground italic py-8">
-            Sin jobs en el historial reciente.
+            {isDisconnected
+              ? "Sin contacto con el servicio."
+              : "Sin jobs en el historial reciente."}
           </p>
         ) : (
           jobs.map((job) => (
@@ -49,6 +77,8 @@ export function RecentJobsTab({ jobs }: RecentJobsTabProps) {
               onToggle={() =>
                 setExpanded((prev) => (prev === job.id ? null : job.id))
               }
+              onReprintSuccess={onReprintSuccess}
+              isDisconnected={isDisconnected}
             />
           ))
         )}
@@ -61,13 +91,49 @@ function JobRow({
   job,
   isExpanded,
   onToggle,
+  onReprintSuccess,
+  isDisconnected,
 }: {
   job: PrintJob;
   isExpanded: boolean;
   onToggle: () => void;
+  onReprintSuccess?: () => void;
+  isDisconnected?: boolean;
 }) {
   const { variant, label } = STATUS_VARIANT[job.status];
   const isLive = job.status === "printing";
+  const canReprint = REPRINTABLE_STATUSES.has(job.status);
+  const { toast } = useToast();
+  const [reprinting, setReprinting] = useState(false);
+
+  const handleReprint = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (reprinting) return;
+    setReprinting(true);
+    try {
+      await reprintJob(job.id);
+      toast({
+        title: "Reimpresión solicitada",
+        description: `Job ${shortId(job.id)} vuelto a la cola.`,
+        variant: "success",
+      });
+      onReprintSuccess?.();
+    } catch (err) {
+      const message =
+        err instanceof AgentOfflineError
+          ? "El servicio no está corriendo."
+          : err instanceof Error
+            ? err.message
+            : "No se pudo reimprimir.";
+      toast({
+        title: "No se pudo reimprimir",
+        description: message,
+        variant: "destructive",
+      });
+    } finally {
+      setReprinting(false);
+    }
+  };
 
   return (
     <div className="job-item">
@@ -134,27 +200,33 @@ function JobRow({
                 <p className="text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground mb-1.5 font-medium">
                   Items
                 </p>
-                <ul className="space-y-0.5">
-                  {job.items.map((item, idx) => (
-                    <li
-                      key={idx}
-                      className="text-[11.5px] flex items-baseline gap-1.5 text-foreground/85"
-                    >
-                      <span className="font-mono text-bait-cyan-300 shrink-0">
-                        {item.qty}×
-                      </span>
-                      <span className="flex-1">
-                        {item.name}
-                        {item.note && (
-                          <span className="text-muted-foreground italic">
-                            {" "}
-                            — {item.note}
-                          </span>
-                        )}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
+                {job.items.length > 0 ? (
+                  <ul className="space-y-0.5">
+                    {job.items.map((item, idx) => (
+                      <li
+                        key={idx}
+                        className="text-[11.5px] flex items-baseline gap-1.5 text-foreground/85"
+                      >
+                        <span className="font-mono text-bait-cyan-300 shrink-0">
+                          {item.qty}×
+                        </span>
+                        <span className="flex-1">
+                          {item.name}
+                          {item.note && (
+                            <span className="text-muted-foreground italic">
+                              {" "}
+                              — {item.note}
+                            </span>
+                          )}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-[11px] text-muted-foreground italic">
+                    Sin detalle de items en el payload.
+                  </p>
+                )}
               </div>
 
               {/* Error si falló */}
@@ -172,11 +244,30 @@ function JobRow({
                 </div>
               )}
 
-              {/* Meta */}
+              {/* Meta + acciones */}
               <div className="grid grid-cols-2 gap-1.5 text-[10px] text-muted-foreground pt-1 border-t border-white/[0.05]">
                 <MetaRow label="Job ID" value={job.id} mono />
                 <MetaRow label="Área" value={job.area} />
               </div>
+
+              {canReprint && (
+                <div className="pt-1.5 flex justify-end">
+                  <Button
+                    onClick={handleReprint}
+                    disabled={reprinting || isDisconnected}
+                    variant="secondary"
+                    size="sm"
+                    className="text-[11px] h-7"
+                  >
+                    {reprinting ? (
+                      <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                    ) : (
+                      <RotateCcw className="h-3 w-3 mr-1" />
+                    )}
+                    Reimprimir
+                  </Button>
+                </div>
+              )}
             </div>
           </motion.div>
         )}
@@ -209,4 +300,8 @@ function MetaRow({
       </p>
     </div>
   );
+}
+
+function shortId(id: string): string {
+  return id.length > 8 ? `${id.slice(0, 8)}…` : id;
 }

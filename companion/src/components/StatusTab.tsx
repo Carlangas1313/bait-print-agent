@@ -16,9 +16,23 @@ import type { AgentState, PrinterInfo } from "@/lib/mock-data";
 interface StatusTabProps {
   state: AgentState | null;
   printers: PrinterInfo[];
+  /** Primera carga aun no termino — la UI muestra "—" en counters. */
+  isLoading?: boolean;
+  /** El primer fetch fallo (agente apagado o config rota). */
+  isDisconnected?: boolean;
+  /** Mensaje user-friendly del ultimo error. Lo mostramos en un banner. */
+  errorMessage?: string | null;
 }
 
-export function StatusTab({ state, printers }: StatusTabProps) {
+export function StatusTab({
+  state,
+  printers,
+  isDisconnected,
+  errorMessage,
+}: StatusTabProps) {
+  const printedToday = state?.printed_today;
+  const failedToday = state?.failed_today;
+  const pendingJobs = state?.pending_jobs ?? 0;
   return (
     <ScrollArea className="h-[calc(540px-176px)] pr-1.5 -mr-1.5 scroll-dark">
       <motion.div
@@ -27,22 +41,41 @@ export function StatusTab({ state, printers }: StatusTabProps) {
         transition={{ duration: 0.25 }}
         className="space-y-2.5 pb-2"
       >
+        {/* ---------- Banner desconectado ---------- */}
+        {isDisconnected && (
+          <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-2 flex items-start gap-1.5">
+            <AlertTriangle className="h-3.5 w-3.5 text-red-300 shrink-0 mt-px" />
+            <div className="min-w-0 flex-1">
+              <p className="text-[11.5px] font-semibold text-red-200">
+                No hay contacto con el servicio
+              </p>
+              <p className="text-[10.5px] text-red-300/80 leading-relaxed truncate">
+                {errorMessage ?? "El agente no respondió. Reintentando..."}
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* ---------- Metrics row ---------- */}
         <div className="grid grid-cols-3 gap-2">
           <MetricCard
             label="Impresos hoy"
-            value={state?.printed_today ?? "—"}
+            value={printedToday ?? "—"}
             tone="cyan"
           />
           <MetricCard
             label="Pendientes"
-            value={state?.pending_jobs ?? "—"}
-            tone={state && state.pending_jobs > 0 ? "warn" : "neutral"}
+            value={state ? pendingJobs : "—"}
+            tone={state && pendingJobs > 0 ? "warn" : "neutral"}
           />
           <MetricCard
             label="Fallidos"
-            value={state?.failed_today ?? "—"}
-            tone={state && state.failed_today > 0 ? "danger" : "neutral"}
+            value={failedToday ?? "—"}
+            tone={
+              state && failedToday !== undefined && failedToday > 0
+                ? "danger"
+                : "neutral"
+            }
           />
         </div>
 

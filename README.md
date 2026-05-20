@@ -239,8 +239,40 @@ en bait-app.cl).
 
 El agente se distribuye en dos formatos:
 
-- **Instalador con UI** (`bait-print-agent-setup.exe`) — recomendado para clientes finales. Wizard en español, copia el binario a `Program Files`, lo registra como servicio Windows y lo arranca. Pide el código de pairing en una página del wizard, no en la consola.
+- **Instalador con UI** (`bait-print-agent-setup.exe`) — recomendado para clientes finales. Wizard en español, copia el binario a `Program Files`, lo registra como servicio Windows y lo arranca. Pide el código de pairing en una página del wizard, no en la consola. **Desde v0.6.0 también empaqueta y arranca el companion** (ver sección siguiente).
 - **Binario pelado** (`bait-print-agent-win-x64.exe`, ~83 MB) — recomendado para integradores que quieran instalar el agente desde un script. Single binary generado con [Node.js Single Executable Applications (SEA)](https://nodejs.org/api/single-executable-applications.html). No requiere Node instalado.
+- **Companion pelado** (`bait-print-companion-win-x64.exe`, ~10-15 MB) — el .exe del companion solo, por si el cajero lo cierra accidentalmente o quiere reinstalarlo sin re-correr todo el wizard del agente.
+
+---
+
+## Companion (tray icon)
+
+Desde **v0.6.0** el instalador incluye un companion que vive en el tray de Windows y le da al cajero una UI premium para ver el estado del agente, los jobs recientes y ejecutar acciones (test de impresión, reiniciar cola, etc.).
+
+### Por qué un companion separado
+
+El servicio Windows (`bAItPrintAgent`) corre en **Session 0**, una sesión aislada de Windows que NO tiene desktop ni puede mostrar tray icons. Es la decisión correcta para un servicio en background (arranca antes del login, sobrevive logoffs), pero significa que la UI tiene que ser un proceso aparte corriendo en la sesión del usuario.
+
+El companion (`bait-print-companion.exe`) es una app Tauri 2 (~10-15 MB, sin Electron) que vive ahí, se comunica con el servicio por HTTP local en `127.0.0.1:17891`, y le pone cara al sistema.
+
+### Cómo se instala
+
+El **instalador del agente (`bait-print-agent-setup.exe`) empaqueta los dos .exe en uno solo**. Cuando el cliente corre el wizard:
+
+1. Se copia `bait-print-companion.exe` a `C:\Program Files\bAIt Print Agent\` junto al servicio.
+2. Se registra el companion en `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` para que arranque automáticamente cuando el usuario hace login.
+3. Al terminar el wizard, el companion se lanza por primera vez (checkbox marcado por default — el user puede destildarlo).
+4. Se crea un shortcut en el Start Menu (`bAIt > bAIt Print Companion`) por si el user lo cierra y quiere volver a abrirlo.
+
+### Cómo se controla
+
+- **Click izquierdo en el tray** → abre/oculta la ventana flotante (380×540, transparent, alwaysOnTop, sin decorations).
+- **Click derecho en el tray** → menú con: Estado del servicio, Test de impresión, Reiniciar cola, Abrir bait-app.cl, Ver logs, Salir del companion.
+- **Click en la X del header de la ventana** → la oculta (NO cierra la app — sigue en el tray). Para cerrar el companion del todo: click derecho tray → "Salir del companion".
+
+### Cómo se desinstala
+
+Se va junto con el agente. El uninstaller corre `taskkill /F /IM bait-print-companion.exe` antes de borrar archivos para evitar el clásico "file in use" de Windows. La entry de autostart en HKCU se borra automáticamente por el flag `uninsdeletevalue` del Inno Setup.
 
 ---
 

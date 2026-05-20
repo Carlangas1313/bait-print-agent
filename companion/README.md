@@ -5,9 +5,12 @@ sesión del usuario (no en Session 0 de Windows como el servicio) y le da
 al cajero una UI premium para ver el estado del agente, los jobs recientes
 y ejecutar acciones (test de impresión, reiniciar cola, etc.).
 
-> **Estado:** scaffold V0 — todo el frontend renderiza con datos mock.
-> El wireup al HTTP server local del agente (127.0.0.1:17891) está
-> pendiente en `src/lib/api.ts` detrás del flag `USE_MOCKS`.
+> **Estado:** wireup HTTP completo. El companion lee
+> `~/.bait-print-agent/config.json` para el Bearer token y polea
+> `http://127.0.0.1:17891` cada 5s (status) / 10s (recent jobs).
+> Si el agente no está corriendo el header muestra "DESCONECTADO"
+> en rojo y las acciones quedan deshabilitadas. Apenas el servicio
+> vuelve, el polling reconecta solo.
 
 ## Stack
 
@@ -74,6 +77,30 @@ cd companion
 npm install
 npm run dev
 # abre http://localhost:1420
+```
+
+> En modo Vite puro el comando Tauri `read_local_api_token` no existe,
+> así que cualquier `fetch` al HTTP server del agente va a fallar con un
+> error. El frontend pinta "DESCONECTADO" en el header — es el
+> comportamiento esperado mientras no haya runtime Tauri.
+
+### Variables de entorno para dev
+
+| Var | Default | Para qué sirve |
+|-----|---------|----------------|
+| `BAIT_AGENT_HOME` | `%USERPROFILE%\.bait-print-agent` | Override del directorio donde vive `config.json` + `logs/`. Útil para tener una config de dev separada de la productiva (ej. `C:\dev\.bait-agent-dev`). Lo respeta tanto el comando Rust `read_local_api_token` como el botón "Ver logs". |
+
+Para usarlo en dev:
+
+```powershell
+# PowerShell, sesión del companion (Vite o tauri:dev)
+$env:BAIT_AGENT_HOME = "C:\dev\.bait-agent-dev"
+npm run tauri:dev
+```
+
+```bash
+# bash WSL/Git Bash
+BAIT_AGENT_HOME=/c/dev/.bait-agent-dev npm run tauri:dev
 ```
 
 ### Tauri completo (con tray + window flotante)
@@ -150,10 +177,11 @@ El tray icon vive en `src-tauri/src/lib.rs`. Implementa:
   ocultamos la window en vez de cerrar la app — el companion vive en el
   tray.
 
-> Los handlers que dependen del HTTP server del agente (test print real,
-> restart queue, ver logs) están dejados como `TODO` en `handle_menu_event`.
-> Cuando el otro sub-agent termine el endpoint, se wireup-ean con un
-> comando Tauri `#[tauri::command]` que hace el fetch a 127.0.0.1:17891.
+> "Ver logs" abre la carpeta `~/.bait-print-agent/logs/` vía
+> `tauri-plugin-opener` (respeta `BAIT_AGENT_HOME` para dev local).
+> Los otros items del menú (Estado / Test / Reiniciar cola) por ahora
+> solo abren la ventana — falta wirear el deep-link al tab correcto
+> (`app.emit("menu-action", id)` + listener en `App.tsx`).
 
 ## Icono placeholder
 
@@ -176,58 +204,53 @@ los tamaños incluyendo `.ico` (Windows) y `.icns` (macOS).
 > Cuando se generen `.ico` y `.icns` con `tauri icon`, agregarlos al
 > array `bundle.icon`.
 
-## Mock data
+## Datos en vivo
 
-Todo el JSON mock está en `src/lib/mock-data.ts`:
+Los hooks `useAgentStatus` y `useRecentJobs` (en `src/hooks/use-agent-status.ts`)
+polean el HTTP server local del agente:
 
-- `mockAgentState` — status online, 142 impresos hoy, 2 pendientes, 1 fallido
-- `mockPrinters` — Cocina Principal (HP_OfficeJet, online, primary) +
-  Barra (EPSON_TM-T20III, offline)
-- `mockRecentJobs` — 10 jobs con mix de status: `printed` (5), `failed` (1),
-  `printing` (1), `waiting_printer` (1), `pending` (1), `kitchen_cancel` (1)
+| Hook | Endpoint | Intervalo |
+|------|----------|-----------|
+| `useAgentStatus` | `GET /v1/status` | 5s |
+| `useRecentJobs(20)` | `GET /v1/jobs/recent?limit=20` | 10s |
 
-El polling cada 4 seg en `App.tsx` simula refresh real. El último heartbeat
-se actualiza a `now` en cada fetch para que el "hace X seg" sea siempre fresco.
+Ambos pausan automáticamente cuando la ventana está hidden (Page
+Visibility API). Cuando vuelve visible, hacen un fetch inmediato sin
+esperar al próximo tick.
 
-## TODOs pendientes (wireup HTTP server)
+La shape cruda del HTTP server NO es 1:1 con lo que muestra la UI — los
+mappers de `src/lib/mappers.ts` traducen entre `AgentStatus`/`PrintJob`
+del API y los view-models `AgentState`/`PrinterInfo`/`PrintJob` de la UI.
 
-Cuando el sub-agent del servicio termine el HTTP server local en
-`127.0.0.1:17891`:
+`src/lib/mock-data.ts` ya NO contiene datos hardcodeados: solo los tipos
+que la UI consume. El archivo se mantiene para no romper imports y para
+documentar la frontera entre API y view-model.
 
-1. **`src/lib/api.ts`** — `USE_MOCKS = false` y verificar que los endpoints
-   matcheen con la shape esperada (ver comentario en cabecera del archivo).
-   Endpoints esperados:
-   - `GET  /v1/state` → `AgentState`
-   - `GET  /v1/printers` → `PrinterInfo[]`
-   - `GET  /v1/jobs/recent?limit=20` → `PrintJob[]`
-   - `POST /v1/test-print` `{ printer_id }` → `{ ok, job_id }`
-   - `POST /v1/queue/restart` → `{ ok }`
-   - `POST /v1/pairing/reset` → `{ ok }`
-2. **CORS** — el HTTP server necesita aceptar requests desde
-   `http://localhost:1420` (dev Vite) y desde `tauri://localhost` (release
-   webview de Windows). Probablemente con un `Access-Control-Allow-Origin: *`
-   alcanza ya que el server solo escucha en loopback.
-3. **`src-tauri/src/lib.rs`** — los handlers de menú (`test-print`,
-   `restart-queue`, `view-logs`) deberían no solo abrir la window sino
-   también dispatchar un evento custom al frontend (vía `app.emit("menu-action", id)`)
-   para que el frontend reaccione (ej: cambiar al tab "Acciones" y abrir
-   el dropdown de la impresora).
-4. **Heartbeat watchdog** — si `getState()` falla 3 veces seguidas, mostrar
-   un toast destructive "Servicio caído" y cambiar el StatusDot a rojo.
-5. **Auth** — el HTTP server local probablemente quiere un token de pairing
-   leído de `%USERPROFILE%\.bait-print-agent\config.json`. Agregar un
-   header `X-Companion-Token` en `lib/api.ts` con valor leído al boot vía
-   un comando Tauri `#[tauri::command] read_pairing_token()`.
-6. **Auto-start del companion** — agregar a `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
-   un acceso al `.exe` instalado en `Program Files\bAIt Print Companion\`.
-   Probablemente como una flag en el wizard del instalador del agente.
-7. **Refinar el icono del tray** — el placeholder geométrico se ve bien
-   en 128px pero a 16-32px del tray pierde definición. Reemplazar con
-   un PNG hecho en Figma con anti-aliasing pixel-perfect.
-8. **Empaquetado conjunto** — decidir si el companion se distribuye junto
-   al agente (`bait-print-agent-setup.exe` instala ambos) o como un
-   `.exe` separado. Lo más limpio es que el instalador del agente
-   pregunte "¿instalar companion?" como opcional.
+## TODOs pendientes
+
+1. **`POST /v1/printers/:id/test`** — el server local hoy devuelve 501 con
+   un `error: 'not_implemented'`. El companion lo detecta y muestra
+   "Funcionalidad en desarrollo" en un toast warning. Para activarlo hay
+   que agregar `job_type='test'` al enum de Supabase y un mecanismo de
+   `forced_printer_id` (ver TODO en `src/local-api/handlers.ts` del repo padre).
+2. **Counters históricos** — `/v1/status` hoy no devuelve `printed_today` /
+   `failed_today`. La UI los muestra como "—". Habría que agregar un
+   endpoint nuevo (`GET /v1/stats/today`) o calcularlos client-side a
+   partir de `/v1/jobs/recent`.
+3. **Nombre de `print_area` en jobs** — `/v1/jobs/recent` devuelve
+   `print_area_id` pero no el nombre de la print_area. Lo dejamos como
+   `printer_name: null` en el view-model. El server podría hacer un join
+   con la tabla `print_areas` antes de devolver.
+4. **Menu del tray → deep-link al tab** — los items "Estado", "Test", "Reiniciar
+   cola" abren la ventana pero no enrutan al tab correcto. Falta wirear
+   un evento Tauri (`app.emit("menu-action", id)`) y un listener en
+   `App.tsx` que cambie el `defaultValue` del `<Tabs>`.
+5. **Auto-start del companion** — agregar al `HKCU\...\Run` del instalador del
+   agente.
+6. **Refinar el icono del tray** — placeholder geométrico, pixel-fuera de
+   foco a 16-32px.
+7. **Empaquetado conjunto** — `bait-print-agent-setup.exe` debería instalar
+   el companion como opcional.
 
 ## Verificado en este scaffold
 

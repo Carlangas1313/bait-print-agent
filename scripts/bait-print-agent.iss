@@ -32,6 +32,11 @@
 #define AppURL           "https://bait-app.cl"
 #define AppExeName       "bait-print-agent.exe"
 #define SourceExe        "..\dist\bait-print-agent-win-x64.exe"
+; Companion (tray icon + ventana flotante) — Tauri 2 .exe que vive en la
+; sesion del usuario, complementa el servicio (que corre en Session 0 y no
+; puede mostrar UI). El CI build lo deja en companion/src-tauri/target/release.
+#define CompanionExeName "bait-print-companion.exe"
+#define CompanionSourceExe "..\companion\src-tauri\target\release\bait-print-companion.exe"
 
 [Setup]
 AppId={#AppId}
@@ -76,13 +81,42 @@ Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: igno
 ; valido. Sin esto el servicio crashea con error 1053 al arrancar. ~300 KB.
 Source: "..\dist\nssm.exe"; DestDir: "{app}"; Flags: ignoreversion
 
+; Companion (tray icon + ventana flotante). Tauri 2 build pelado (~10-15 MB),
+; sin MSI/NSIS — Inno Setup lo empaqueta junto al servicio en UN solo instalador.
+; El [Registry] HKCU\...\Run lo autoarranca al login del user; el [Run] de mas
+; abajo lo lanza una primera vez al finalizar el wizard. El servicio sigue
+; corriendo independiente en Session 0 — el companion es solo UI premium del
+; cajero, no es critico para el flujo de impresion.
+Source: "{#CompanionSourceExe}"; DestDir: "{app}"; Flags: ignoreversion
+
 [Icons]
-; Atajo principal: ejecuta el agente en modo virtual para que el cliente pueda
-; mirar las comandas en una ventana sin tocar el servicio. Util para troubleshooting.
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "--mode virtual"; Comment: "Abre el agente en una ventana de prueba (no requiere servicio detenido)"
+; Atajo principal del companion: abre directamente el tray + ventana flotante.
+; Lo dejamos primero porque es lo que el cajero usa todos los dias para ver
+; cola y estado de impresoras. Comment se ve como tooltip en el Start Menu.
+Name: "{group}\bAIt Print Companion"; Filename: "{app}\{#CompanionExeName}"; Comment: "Abre el dashboard del agente en el tray (estado, jobs recientes, test de impresion)"
+; Atajo de troubleshooting: ejecuta el agente en modo virtual para que el cliente pueda
+; mirar las comandas en una ventana sin tocar el servicio. Util para soporte.
+Name: "{group}\{#AppName} (modo virtual)"; Filename: "{app}\{#AppExeName}"; Parameters: "--mode virtual"; Comment: "Abre el agente en una ventana de prueba (no requiere servicio detenido)"
 Name: "{group}\Reconfigurar codigo"; Filename: "{app}\{#AppExeName}"; Parameters: "setup"; Comment: "Pega un nuevo codigo de pairing"
 Name: "{group}\Estado del servicio"; Filename: "{app}\{#AppExeName}"; Parameters: "service-status"; Comment: "Muestra si el servicio esta corriendo"
 Name: "{group}\Desinstalar {#AppName}"; Filename: "{uninstallexe}"
+
+[Registry]
+; Autostart del companion al login del user actual. HKCU (no HKLM) porque el
+; companion vive en la sesion del usuario — Session 0 (donde corre el servicio
+; Windows) no tiene desktop ni tray icons. uninsdeletevalue borra la entry
+; cuando se desinstala el agente, asi no quedan keys huerfanas en el registry.
+;
+; Nota: HKCU se escribe en el contexto del user que esta corriendo el setup
+; (que con PrivilegesRequired=admin sigue siendo el user humano, no SYSTEM).
+; Si el restaurant tiene varios users Windows que se loguean en la misma PC,
+; el companion solo va a arrancar para el user que instalo. Para autostart
+; multi-user habria que usar HKLM\...\Run, pero eso requiere repensar el
+; tema de ventanas alwaysOnTop entre sesiones.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
+  ValueType: string; ValueName: "bAItPrintCompanion"; \
+  ValueData: """{app}\{#CompanionExeName}"""; \
+  Flags: uninsdeletevalue
 
 [Run]
 ; ----------------------------------------------------------------------------
@@ -110,16 +144,38 @@ Filename: "{app}\{#AppExeName}"; \
   Check: ShouldInstallService; \
   AfterInstall: ShowServiceErrorIfAny
 
-; 3. Checkbox opcional al final del wizard: abrir el navegador para que el
+; 3. Lanzar el companion en el tray al terminar el wizard. postinstall +
+;    skipifsilent = checkbox marcado por default en la pagina final del wizard
+;    que el user puede destildar (ej. si esta instalando remotamente y no
+;    necesita el tray ahi). nowait = no esperamos a que el companion termine
+;    porque es long-running (vive en el tray hasta que el user lo cierre).
+;    En reinicios futuros el companion arranca solo por el HKCU\...\Run entry.
+Filename: "{app}\{#CompanionExeName}"; \
+  Description: "Iniciar bAIt Print Companion en el tray"; \
+  Flags: nowait postinstall skipifsilent
+
+; 4. Checkbox opcional al final del wizard: abrir el navegador para que el
 ;    cliente confirme visualmente que el agente aparece "online".
 Filename: "https://bait-app.cl/settings/printers"; \
   Description: "Abrir bait-app.cl para verificar que el agente esta conectado"; \
   Flags: postinstall shellexec nowait skipifsilent unchecked
 
 [UninstallRun]
-; Detener y borrar el servicio ANTES de que el motor de uninstall intente
-; borrar el .exe — sino Windows tira "file in use" porque el servicio lo tiene.
-; RunOnceId evita ejecutar dos veces si el user clickea uninstall doble.
+; 1. Matar el companion ANTES de borrar archivos. Sin esto el .exe del
+;    companion queda lockeado (el user lo dejo corriendo en el tray) y Inno
+;    tira "file in use" exactamente igual que pasaria con el servicio.
+;    /F = forzar, /T = matar hijos del proceso (por si lanza webview2 hijo).
+;    2>nul = no escupir error si el proceso no esta corriendo (el user pudo
+;    haberlo cerrado a mano antes de desinstalar). RunOnceId evita re-ejecutar
+;    si Inno reintenta la fase de uninstall.
+Filename: "{cmd}"; \
+  Parameters: "/C taskkill /F /IM {#CompanionExeName} /T 2>nul"; \
+  Flags: runhidden; \
+  RunOnceId: "KillCompanion"
+
+; 2. Detener y borrar el servicio ANTES de que el motor de uninstall intente
+;    borrar el .exe — sino Windows tira "file in use" porque el servicio lo tiene.
+;    RunOnceId evita ejecutar dos veces si el user clickea uninstall doble.
 Filename: "{app}\{#AppExeName}"; \
   Parameters: "uninstall-service"; \
   Flags: runhidden waituntilterminated; \
