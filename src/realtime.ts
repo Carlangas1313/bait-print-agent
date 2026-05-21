@@ -143,6 +143,31 @@ export async function backfillPendingJobs(
   return { processed: pendingJobs.length };
 }
 
+/**
+ * Delays del backoff de reconexion del canal Realtime, en milisegundos.
+ * El indice es el numero de fallo consecutivo (1-based). Despues de 5 fallos
+ * seguidos saturamos en 5 min — el agente sigue intentando indefinido pero
+ * no satura logs ni anchos de banda.
+ *
+ * Si el server vuelve, una sola SUBSCRIBED exitosa resetea el contador.
+ */
+const REALTIME_RECONNECT_DELAYS_MS = [
+  2_000,    // 1er fallo:  2s
+  5_000,    // 2do fallo:  5s
+  15_000,   // 3er fallo:  15s
+  60_000,   // 4to fallo:  1 min
+  300_000   // 5to+ fallo: 5 min (cap)
+];
+
+/**
+ * Wrapper que expone al caller solo lo que necesita (unsubscribe en shutdown)
+ * sin atarlo al `RealtimeChannel` concreto. Por dentro, el canal se reemplaza
+ * cada vez que cae y reconectamos — sin que el caller tenga que enterarse.
+ */
+export type RealtimeHandle = {
+  unsubscribe: () => Promise<void>;
+};
+
 export async function startRealtimeListener(
   supabase: SupabaseClient,
   config: AgentConfig,
@@ -152,98 +177,178 @@ export async function startRealtimeListener(
    * Callback opcional para que el caller observe cambios de status del canal
    * Realtime ('SUBSCRIBED', 'CHANNEL_ERROR', 'CLOSED', 'TIMED_OUT', etc).
    * Usado por la API local para reportar `realtime_status` en /v1/status.
+   *
+   * Status sinteticos que NO vienen de supabase-js pero que reportamos
+   * igual para visibilidad:
+   *   - 'RECONNECTING' mientras esperamos el backoff antes de re-subscribir.
    */
   onStatusChange?: (status: string) => void
-): Promise<RealtimeChannel> {
+): Promise<RealtimeHandle> {
   // ------------------------------------------------------------------
   // 1) Backfill: jobs que quedaron pending mientras el agente estaba off.
   // ------------------------------------------------------------------
   await backfillPendingJobs(supabase, config, logger, onJob);
 
   // ------------------------------------------------------------------
-  // 2) Streaming via postgres_changes.
+  // 2) Streaming via postgres_changes con auto-reconnect.
   // ------------------------------------------------------------------
   const channelName = `print-jobs-${config.location_id}`;
-  const channel = supabase.channel(channelName);
-
   const filter = `location_id=eq.${config.location_id}`;
 
-  channel.on(
-    'postgres_changes',
-    {
-      event: 'INSERT',
-      schema: 'public',
-      table: 'print_jobs',
-      filter
-    },
-    (payload) => {
-      const job = payload.new as PrintJobRow;
-      logger.info(
-        { jobId: job.id, jobType: job.job_type },
-        'Evento Realtime INSERT recibido'
+  // Estado mutable de la sesion de Realtime. `currentChannel` apunta al canal
+  // activo, que puede cambiar tras una reconexion. `consecutiveFailures` lleva
+  // la cuenta para el backoff. `disposed` corta el loop cuando el caller
+  // hace unsubscribe en el shutdown.
+  let currentChannel: RealtimeChannel | null = null;
+  let consecutiveFailures = 0;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let disposed = false;
+
+  const safeStatusChange = (status: string) => {
+    if (!onStatusChange) return;
+    try {
+      onStatusChange(status);
+    } catch (cbErr) {
+      logger.warn(
+        { err: cbErr instanceof Error ? cbErr.message : String(cbErr) },
+        'onStatusChange callback tiro (lo ignoramos)'
       );
-      if (job.status === 'pending') {
-        // No await — el handler de Realtime debe retornar rapido.
-        void claimAndRun(supabase, logger, job, onJob);
-      }
     }
-  );
+  };
 
-  channel.on(
-    'postgres_changes',
-    {
-      event: 'UPDATE',
-      schema: 'public',
-      table: 'print_jobs',
-      filter
-    },
-    (payload) => {
-      const newJob = payload.new as PrintJobRow;
-      const oldJob = payload.old as Partial<PrintJobRow>;
+  const setupChannel = () => {
+    if (disposed) return;
 
-      // Caso "Reintentar": el usuario forzo el job de failed/printed a pending,
-      // o el retry-scheduler resucito un waiting_printer pasandolo a pending,
-      // o el auto-recovery del heartbeat lo desperto.
-      if (newJob.status === 'pending' && oldJob.status !== 'pending') {
+    const channel = supabase.channel(channelName);
+    currentChannel = channel;
+
+    channel.on(
+      'postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'print_jobs', filter },
+      (payload) => {
+        const job = payload.new as PrintJobRow;
         logger.info(
-          {
-            jobId: newJob.id,
-            jobType: newJob.job_type,
-            previousStatus: oldJob.status
-          },
-          'Evento Realtime UPDATE -> pending recibido (reintento)'
+          { jobId: job.id, jobType: job.job_type },
+          'Evento Realtime INSERT recibido'
         );
-        void claimAndRun(supabase, logger, newJob, onJob);
+        if (job.status === 'pending') {
+          // No await — el handler de Realtime debe retornar rapido.
+          void claimAndRun(supabase, logger, job, onJob);
+        }
       }
-    }
-  );
-
-  channel.subscribe((status, err) => {
-    // Reportamos al observer (API local) en cada cambio, incluido el caso
-    // de error. Asi el companion ve "CHANNEL_ERROR" o "CLOSED" en tiempo
-    // real en /v1/status sin tener que adivinar.
-    if (onStatusChange) {
-      try {
-        onStatusChange(status);
-      } catch (cbErr) {
-        logger.warn(
-          { err: cbErr instanceof Error ? cbErr.message : String(cbErr) },
-          'onStatusChange callback tiro (lo ignoramos)'
-        );
-      }
-    }
-
-    if (err) {
-      logger.error({ err, status }, 'Error suscribiendo al canal Realtime');
-      return;
-    }
-    logger.info(
-      { status, locationId: config.location_id },
-      'Realtime listener iniciado en location_id=' + config.location_id
     );
-  });
 
-  return channel;
+    channel.on(
+      'postgres_changes',
+      { event: 'UPDATE', schema: 'public', table: 'print_jobs', filter },
+      (payload) => {
+        const newJob = payload.new as PrintJobRow;
+        const oldJob = payload.old as Partial<PrintJobRow>;
+
+        // Caso "Reintentar": el usuario forzo el job de failed/printed a pending,
+        // o el retry-scheduler resucito un waiting_printer pasandolo a pending,
+        // o el auto-recovery del heartbeat lo desperto.
+        if (newJob.status === 'pending' && oldJob.status !== 'pending') {
+          logger.info(
+            {
+              jobId: newJob.id,
+              jobType: newJob.job_type,
+              previousStatus: oldJob.status
+            },
+            'Evento Realtime UPDATE -> pending recibido (reintento)'
+          );
+          void claimAndRun(supabase, logger, newJob, onJob);
+        }
+      }
+    );
+
+    channel.subscribe((status, err) => {
+      // Reportamos al observer (API local) en cada cambio, incluido el caso
+      // de error. Asi el companion ve "CHANNEL_ERROR" o "CLOSED" en tiempo
+      // real en /v1/status sin tener que adivinar.
+      safeStatusChange(status);
+
+      if (err || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        // Pre-fix (<= v0.7.2): aca solo logueabamos y returnabamos, dejando el
+        // canal muerto sin reintentar. El agente quedaba escuchando "en silencio"
+        // y los jobs nuevos solo llegaban via backfill manual desde el companion.
+        // Diagnosticado 2026-05-21 cuando el listener cayo con "socket closed:
+        // 1006" y nunca volvio.
+        if (disposed) return;
+        consecutiveFailures += 1;
+        const delayMs =
+          REALTIME_RECONNECT_DELAYS_MS[
+            Math.min(consecutiveFailures - 1, REALTIME_RECONNECT_DELAYS_MS.length - 1)
+          ];
+        logger.error(
+          {
+            err: err ?? null,
+            status,
+            consecutiveFailures,
+            reconnectInMs: delayMs
+          },
+          'Canal Realtime cayo — reconectando con backoff'
+        );
+
+        // Limpiar el canal muerto y agendar reconexion. Importante:
+        // unsubscribe es async — no esperamos, pero capturamos errores
+        // para no dejar promesas colgadas.
+        const dead = channel;
+        Promise.resolve(dead.unsubscribe()).catch((unsubErr) => {
+          logger.warn(
+            { err: unsubErr instanceof Error ? unsubErr.message : String(unsubErr) },
+            'unsubscribe del canal muerto fallo (lo ignoramos)'
+          );
+        });
+        if (currentChannel === dead) {
+          currentChannel = null;
+        }
+
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          safeStatusChange('RECONNECTING');
+          setupChannel();
+        }, delayMs);
+        return;
+      }
+
+      if (status === 'SUBSCRIBED') {
+        // Reset del contador apenas conectamos OK. Asi la proxima caida
+        // arranca con 2s, no con 5min, dando reconexion rapida en cortes
+        // breves de red.
+        consecutiveFailures = 0;
+      }
+
+      logger.info(
+        { status, locationId: config.location_id },
+        'Realtime listener iniciado en location_id=' + config.location_id
+      );
+    });
+  };
+
+  setupChannel();
+
+  return {
+    unsubscribe: async () => {
+      disposed = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (currentChannel) {
+        try {
+          await currentChannel.unsubscribe();
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'unsubscribe en shutdown fallo (lo ignoramos)'
+          );
+        }
+        currentChannel = null;
+      }
+    }
+  };
 }
 
 /**

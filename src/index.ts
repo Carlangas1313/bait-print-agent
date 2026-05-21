@@ -654,7 +654,12 @@ async function runAgent(): Promise<void> {
     if (updateCheckerId) clearInterval(updateCheckerId);
     if (printersRefreshId) clearInterval(printersRefreshId);
     try {
-      await supabase.removeChannel(channel);
+      // channel ahora es un RealtimeHandle (wrapper con auto-reconnect interno)
+      // — su unsubscribe() cancela cualquier reintento pendiente y cierra el
+      // canal activo. No usamos supabase.removeChannel porque la referencia
+      // concreta al RealtimeChannel se reemplaza internamente en cada
+      // reconexion y no queremos tocar ese estado desde afuera.
+      await channel.unsubscribe();
     } catch (err) {
       logger.warn({ err }, 'Error cerrando canal Realtime (ignorado)');
     }
