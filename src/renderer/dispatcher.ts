@@ -1,40 +1,40 @@
 /**
- * Dispatcher de jobs: decide que renderer usar segun el modo activo del
- * agente, y para el modo `usb` resuelve la printer destino.
+ * Dispatcher de jobs: el flow productivo SIEMPRE pasa por `renderJobToPrinter`
+ * (que internamente delega a `sendEscPos` y elige USB spooler RAW / TCP raw
+ * 9100 / COM virtual segun `printer.connection_type`).
  *
- * Esta capa existe para que `realtime.ts` no tenga que conocer los detalles
- * de cada backend: pasa el job y el dispatcher se encarga.
+ * Los renderers `console` y `virtual` son SOLO para debug/troubleshooting,
+ * activables via env var `BAIT_DEBUG_RENDERER`. Nunca son la opcion default
+ * del cliente final.
+ *
+ * Esta capa existe para que `realtime.ts` no tenga que conocer ninguno de
+ * estos detalles: pasa el job + el debug_renderer (puede ser null) y nosotros
+ * decidimos.
  *
  * ----------------------------------------------------------------------
  * Clasificacion de errores (v0.5.5+)
  *
- * En vez de tirar exceptions crudas para todo, ahora retornamos un objeto
+ * En vez de tirar exceptions crudas para todo, retornamos un objeto
  * { kind: 'transient' | 'permanent', message } cuando algo falla. El caller
  * en realtime.ts usa esa clasificacion para decidir:
  *
  *   - transient -> backoff exponencial, status='waiting_printer'.
- *     Vale la pena reintentar mas tarde.
  *     Casos: impresora offline, timeout LAN, sin papel, network error.
  *
  *   - permanent -> status='failed' inmediato, sin reintento.
- *     Casos: payload no matchea su type guard (validacion zod-like),
- *            print_area_id apunta a algo que no existe en la DB,
- *            RLS deniega el UPDATE, connection_type no soportado, etc.
- *
- * El exito sigue siendo "la promesa resuelve sin throw"; el caller decide
- * en base a eso si marca 'printed' o entra al flow de error.
+ *     Casos: payload no matchea su type guard, print_area_id apunta a algo
+ *            inexistente, RLS deniega, connection_type no soportado, etc.
  * ----------------------------------------------------------------------
  */
 
 import type { Logger } from '../logger.js';
+import type { DebugRenderer } from '../config.js';
 import type { PrintJobRow, ErrorKind } from '../types.js';
 import type { PrinterRow } from '../printers/registry.js';
 import { pickPrinterForJob } from '../printers/registry.js';
 import { renderJob } from './console.js';
 import { renderJobToVirtual } from './virtual.js';
 import { renderJobToPrinter } from './usb.js';
-
-export type RenderMode = 'console' | 'virtual' | 'usb';
 
 /**
  * Resultado de un dispatch fallido. Lo retornamos en vez de tirar para
@@ -133,54 +133,42 @@ export type DispatchResult =
 
 export async function dispatchJob(
   job: PrintJobRow,
-  mode: RenderMode,
+  debugRenderer: DebugRenderer,
   printers: PrinterRow[],
   logger: Logger
 ): Promise<DispatchResult> {
   try {
-    switch (mode) {
-      case 'console':
-        await renderJob(job, logger);
-        return { ok: true };
-
-      case 'virtual':
-        await renderJobToVirtual(job, logger);
-        return { ok: true };
-
-      case 'usb': {
-        const printer = pickPrinterForJob(printers, job);
-        if (!printer) {
-          const where = job.print_area_id
-            ? `print_area ${job.print_area_id}`
-            : 'la caja default (is_primary)';
-          // Permanent: faltan datos de configuracion. Reintentar no ayuda.
-          return {
-            ok: false,
-            error: {
-              kind: 'permanent',
-              message:
-                `No hay impresora configurada para ${where}. ` +
-                `Agrega una en bait-app.cl -> Configuracion -> Impresoras.`
-            }
-          };
-        }
-        await renderJobToPrinter(job, printer, logger);
-        return { ok: true };
-      }
-
-      default: {
-        // TS exhaustive check: si alguien agrega un nuevo modo y se olvida
-        // de un case, el compilador lo cacha.
-        const exhaustive: never = mode;
-        return {
-          ok: false,
-          error: {
-            kind: 'permanent',
-            message: `Modo de renderer desconocido: ${String(exhaustive)}`
-          }
-        };
-      }
+    // Caso debug: bypass del renderer productivo. Util en dev y para
+    // troubleshooting visual ("¿que ASCII va a mandar?") sin tocar el
+    // hardware. Nunca se activa por default; solo via BAIT_DEBUG_RENDERER.
+    if (debugRenderer === 'console') {
+      await renderJob(job, logger);
+      return { ok: true };
     }
+    if (debugRenderer === 'virtual') {
+      await renderJobToVirtual(job, logger);
+      return { ok: true };
+    }
+
+    // Productivo: imprimir en hardware real via ESC/POS.
+    const printer = pickPrinterForJob(printers, job);
+    if (!printer) {
+      const where = job.print_area_id
+        ? `print_area ${job.print_area_id}`
+        : 'la caja default (is_primary)';
+      // Permanent: faltan datos de configuracion. Reintentar no ayuda.
+      return {
+        ok: false,
+        error: {
+          kind: 'permanent',
+          message:
+            `No hay impresora configurada para ${where}. ` +
+            `Agrega una en bait-app.cl -> Configuracion -> Impresoras.`
+        }
+      };
+    }
+    await renderJobToPrinter(job, printer, logger);
+    return { ok: true };
   } catch (err) {
     return { ok: false, error: classifyError(err) };
   }

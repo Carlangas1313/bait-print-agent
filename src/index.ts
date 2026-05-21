@@ -89,11 +89,11 @@ function isUpdateCheckEnabled(): boolean {
  *   bait-print-agent reset                 borra la config persistente (pide confirmacion)
  *   bait-print-agent status                muestra estado actual de la config
  *
- * Flags globales:
- *   --mode <console|virtual|usb>           override del modo de renderizado
+ * No hay flag CLI de modo: el agente siempre arranca en modo productivo
+ * (imprime fisico via ESC/POS). Para debug, exportar `BAIT_DEBUG_RENDERER`:
+ *   - BAIT_DEBUG_RENDERER=console  → escribe tickets a stdout (no toca printers)
+ *   - BAIT_DEBUG_RENDERER=virtual  → escribe tickets a ~/bait-print-out/
  */
-
-type RenderMode = 'console' | 'virtual' | 'usb';
 
 const program = new Command();
 
@@ -362,13 +362,8 @@ program
 // Comando default: arrancar el agente
 // -------------------------------------------------------------------
 program
-  .option(
-    '--mode <mode>',
-    'Modo de renderizado: console | virtual | usb',
-    parseMode
-  )
-  .action(async (opts: { mode?: RenderMode }) => {
-    await runAgent(opts.mode);
+  .action(async () => {
+    await runAgent();
   });
 
 // Si no hay subcomando, parsea como default action.
@@ -390,13 +385,6 @@ program.parseAsync(process.argv).catch((err) => {
 // ====================================================================
 // Helpers
 // ====================================================================
-
-function parseMode(value: string): RenderMode {
-  if (value === 'console' || value === 'virtual' || value === 'usb') {
-    return value;
-  }
-  throw new Error(`Valor invalido para --mode: ${value}. Validos: console | virtual | usb`);
-}
 
 /**
  * Lee una linea desde stdin. Usado en `reset` para confirmar el borrado.
@@ -433,25 +421,27 @@ function readPrintersRefreshIntervalMinutes(): number {
 }
 
 /**
- * Arranque del agente en modo persistente o legacy. Loop principal:
- * heartbeat + realtime listener. Se queda corriendo hasta SIGINT/SIGTERM.
+ * Arranque del agente. Loop principal: heartbeat + realtime listener.
+ * Se queda corriendo hasta SIGINT/SIGTERM.
+ *
+ * El agente arranca SIEMPRE en modo productivo (imprime fisico via ESC/POS).
+ * Si la env var `BAIT_DEBUG_RENDERER` esta seteada a 'console' o 'virtual',
+ * el dispatcher hace bypass del renderer real y escribe a stdout/archivo —
+ * pero ese modo es solo para dev. Nunca es el path del cliente final.
  */
-async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
-  const baseConfig = loadConfig();
-  const config: AgentConfig = modeOverride
-    ? { ...baseConfig, agent_mode: modeOverride }
-    : baseConfig;
-
+async function runAgent(): Promise<void> {
+  const config: AgentConfig = loadConfig();
   const logger = createLogger(config.log_level);
 
+  const renderTag = config.debug_renderer ?? 'productivo';
   logger.info(
     {
       version: AGENT_VERSION,
-      mode: config.agent_mode,
+      renderer: renderTag,
       agentName: config.agent_name,
       locationId: config.location_id
     },
-    `bait-print-agent v${AGENT_VERSION} iniciando en modo ${config.agent_mode} para location ${config.location_id}`
+    `bait-print-agent v${AGENT_VERSION} iniciando (renderer: ${renderTag}) para location ${config.location_id}`
   );
 
   // ------------------------------------------------------------------
@@ -462,79 +452,63 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
   const supabase = await createAuthenticatedSupabase(config);
 
   // ------------------------------------------------------------------
-  // Resolver el modo efectivo y cargar printers si corresponde.
+  // Cargar printers configuradas + arrancar refresh cada N min.
   //
-  // - usb: cargamos las impresoras configuradas para la location. Si la
-  //   lista esta vacia, warning + fallback a virtual (no queremos que
-  //   se acumule la cola por falta de configuracion).
-  // - virtual: archivos en ~/bait-print-out/.
-  // - console: stdout.
+  // Lo hacemos SIEMPRE (incluido cuando debug_renderer esta activo) para
+  // que el snapshot de printers este disponible si alguien apaga el debug
+  // override en vivo. Pero si el load falla, NO bloqueamos el arranque —
+  // solo logueamos: el caller del jobHandler va a ver la lista vacia y el
+  // dispatcher va a clasificar el job como 'permanent' con mensaje claro.
   //
-  // El cache de printers es mutable porque lo refrescamos cada N minutos
-  // via setInterval (ver mas abajo). El handler del realtime captura la
-  // referencia mutable a `printersCache` y lee siempre el ultimo snapshot.
+  // El cache es mutable porque lo refrescamos cada N min via setInterval.
+  // El handler del realtime captura la referencia mutable y lee siempre el
+  // ultimo snapshot.
   // ------------------------------------------------------------------
-  let effectiveMode: RenderMode = config.agent_mode;
   let printersCache: PrinterRow[] = [];
   let printersRefreshId: NodeJS.Timeout | null = null;
 
-  if (effectiveMode === 'usb') {
-    try {
-      printersCache = await loadPrintersForLocation(
-        supabase,
-        config.location_id,
-        logger
-      );
-    } catch (err) {
-      logger.error(
-        { err: err instanceof Error ? err.message : String(err) },
-        'No pude cargar impresoras al arrancar, fallback a modo virtual'
-      );
-      effectiveMode = 'virtual';
-    }
-
-    if (effectiveMode === 'usb' && printersCache.length === 0) {
-      logger.warn(
-        {
-          locationId: config.location_id
-        },
-        'Modo USB pero no hay impresoras configuradas. Configurá impresoras en bait-app.cl → Configuración → Impresoras. Cayendo a modo virtual para no perder los tickets.'
-      );
-      effectiveMode = 'virtual';
-    }
-
-    // Si seguimos en modo usb tras los chequeos, arrancamos el refresh.
-    if (effectiveMode === 'usb') {
-      const refreshMinutes = readPrintersRefreshIntervalMinutes();
-      logger.info(
-        { intervalMinutes: refreshMinutes },
-        `Refresh de impresoras cada ${refreshMinutes} min`
-      );
-      printersRefreshId = setInterval(() => {
-        void loadPrintersForLocation(
-          supabase,
-          config.location_id,
-          logger
-        )
-          .then((fresh) => {
-            printersCache = fresh;
-          })
-          .catch((err) => {
-            // Mantener el cache anterior si el refresh falla — preferible
-            // a vaciarlo y que todos los jobs caigan al retry path.
-            logger.warn(
-              { err: err instanceof Error ? err.message : String(err) },
-              'Refresh de impresoras fallo, mantengo cache anterior'
-            );
-          });
-      }, refreshMinutes * 60 * 1000);
-    }
+  try {
+    printersCache = await loadPrintersForLocation(
+      supabase,
+      config.location_id,
+      logger
+    );
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      'No pude cargar impresoras al arrancar — los jobs van a fallar con permanent hasta que se configuren'
+    );
   }
 
-  if (effectiveMode === 'virtual') {
-    logger.info(
-      { outDir: getVirtualOutDir() },
-      `Modo virtual activo. Los tickets se guardaran en ${getVirtualOutDir()}/`
+  if (printersCache.length === 0 && config.debug_renderer === null) {
+    logger.warn(
+      { locationId: config.location_id },
+      'No hay impresoras configuradas en esta location. Los jobs van a fallar con permanent hasta que agregues alguna en bait-app.cl → Configuración → Impresoras.'
+    );
+  }
+
+  const refreshMinutes = readPrintersRefreshIntervalMinutes();
+  logger.info(
+    { intervalMinutes: refreshMinutes },
+    `Refresh de impresoras cada ${refreshMinutes} min`
+  );
+  printersRefreshId = setInterval(() => {
+    void loadPrintersForLocation(supabase, config.location_id, logger)
+      .then((fresh) => {
+        printersCache = fresh;
+      })
+      .catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Refresh de impresoras fallo, mantengo cache anterior'
+        );
+      });
+  }, refreshMinutes * 60 * 1000);
+
+  if (config.debug_renderer) {
+    logger.warn(
+      { renderer: config.debug_renderer, outDir: getVirtualOutDir() },
+      `BAIT_DEBUG_RENDERER=${config.debug_renderer} activo. El renderer productivo (ESC/POS) esta deshabilitado — los tickets ${config.debug_renderer === 'virtual' ? `se guardan en ${getVirtualOutDir()}/` : 'salen a stdout'}.`
     );
   }
 
@@ -565,7 +539,12 @@ async function runAgent(modeOverride: RenderMode | undefined): Promise<void> {
   // mostrar "Ultimo job: hace 12s" en su panel.
   // ------------------------------------------------------------------
   const jobHandler = async (job: Parameters<typeof dispatchJob>[0]) => {
-    const result = await dispatchJob(job, effectiveMode, printersCache, logger);
+    const result = await dispatchJob(
+      job,
+      config.debug_renderer,
+      printersCache,
+      logger
+    );
     runtimeState.last_job_at = new Date().toISOString();
     return result;
   };

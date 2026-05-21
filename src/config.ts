@@ -23,7 +23,6 @@ const EnvConfigSchema = z.object({
   BAIT_AGENT_ID: z.string().uuid(),
   BAIT_RESTAURANT_ID: z.string().uuid(),
   BAIT_LOCATION_ID: z.string().uuid(),
-  BAIT_AGENT_MODE: z.enum(['console', 'virtual', 'usb']).default('console'),
   LOG_LEVEL: z
     .enum(['trace', 'debug', 'info', 'warn', 'error'])
     .default('info'),
@@ -35,6 +34,25 @@ export type EnvConfig = z.infer<typeof EnvConfigSchema>;
 // -------------------------------------------------------------------
 // Schema unificado que consume el resto del runtime (realtime, heartbeat).
 // -------------------------------------------------------------------
+/**
+ * Override de renderer SOLO para debug/dev. En produccion, el renderer
+ * siempre es `renderJobToPrinter` (que via sendEscPos enruta a USB spooler
+ * Win32 / TCP raw 9100 / COM virtual segun `printer.connection_type` de
+ * cada printer individual).
+ *
+ * Activable por env var `BAIT_DEBUG_RENDERER`:
+ *   - 'console'  → ticket a stdout (sin tocar impresoras fisicas)
+ *   - 'virtual'  → ticket a archivo en ~/bait-print-out/ (sin imprimir)
+ *   - sin setear → modo productivo (default y unico que el cliente final usa)
+ *
+ * El concepto previo `agent_mode` con default 'console' fue la causa del
+ * bug reportado por Carlos (jobs marcados printed sin que la Rongta sacara
+ * papel): el servicio arrancaba en console y renderizaba a stdout.log sin
+ * tocar impresoras. Eliminamos esa config user-facing — console/virtual
+ * son herramientas de debug, no opciones de produccion.
+ */
+export type DebugRenderer = 'console' | 'virtual' | null;
+
 export type AgentConfig = {
   agent_id: string;
   restaurant_id: string;
@@ -48,23 +66,23 @@ export type AgentConfig = {
   auth_password: string | null;
   /** Solo seteado en modo env-legacy. Bypassa RLS. */
   service_role_key: string | null;
-  agent_mode: 'console' | 'virtual' | 'usb';
+  /**
+   * null = modo productivo (default).
+   * 'console'/'virtual' = bypass del renderer real (solo dev/troubleshooting).
+   */
+  debug_renderer: DebugRenderer;
   log_level: 'trace' | 'debug' | 'info' | 'warn' | 'error';
   heartbeat_interval_seconds: number;
 };
 
 /**
- * Helpers privados para leer overrides comunes (LOG_LEVEL, heartbeat, mode)
- * desde env vars cuando estamos en modo persistente. Defaults razonables
- * si no estan seteadas.
+ * Helpers privados para leer overrides comunes desde env vars.
  */
 const LogLevelSchema = z
   .enum(['trace', 'debug', 'info', 'warn', 'error'])
   .default('info');
 
 const HeartbeatSchema = z.coerce.number().int().min(10).max(300).default(30);
-
-const ModeSchema = z.enum(['console', 'virtual', 'usb']).default('console');
 
 function readLogLevelOverride(): AgentConfig['log_level'] {
   return LogLevelSchema.parse(process.env.LOG_LEVEL ?? 'info');
@@ -76,8 +94,24 @@ function readHeartbeatOverride(): number {
   );
 }
 
-function readModeOverride(): AgentConfig['agent_mode'] {
-  return ModeSchema.parse(process.env.BAIT_AGENT_MODE ?? 'console');
+/**
+ * Lee `BAIT_DEBUG_RENDERER` del env. Acepta solo 'console' o 'virtual';
+ * cualquier otro valor (incluido sin setear) → null = productivo.
+ *
+ * Tambien aceptamos el viejo `BAIT_AGENT_MODE=console|virtual` como alias
+ * temporal solo para no romper terminales de dev en transicion. Si el value
+ * viene 'usb' (productivo viejo), lo mapeamos a null. Una vez todos los
+ * setups esten en v0.7+, removemos este alias.
+ */
+function readDebugRendererOverride(): DebugRenderer {
+  const raw = (process.env.BAIT_DEBUG_RENDERER ?? '').trim().toLowerCase();
+  if (raw === 'console' || raw === 'virtual') return raw;
+
+  // Compat temporal: BAIT_AGENT_MODE (legacy).
+  const legacy = (process.env.BAIT_AGENT_MODE ?? '').trim().toLowerCase();
+  if (legacy === 'console' || legacy === 'virtual') return legacy;
+
+  return null;
 }
 
 /**
@@ -98,7 +132,7 @@ export function loadConfigFromPersistent(): AgentConfig | null {
     auth_email: persistent.auth_email,
     auth_password: persistent.auth_password,
     service_role_key: null,
-    agent_mode: readModeOverride(),
+    debug_renderer: readDebugRendererOverride(),
     log_level: readLogLevelOverride(),
     heartbeat_interval_seconds: readHeartbeatOverride()
   };
@@ -123,7 +157,7 @@ function loadConfigFromEnv(): AgentConfig | null {
     auth_email: null,
     auth_password: null,
     service_role_key: env.SUPABASE_SERVICE_ROLE_KEY,
-    agent_mode: env.BAIT_AGENT_MODE,
+    debug_renderer: readDebugRendererOverride(),
     log_level: env.LOG_LEVEL,
     heartbeat_interval_seconds: env.HEARTBEAT_INTERVAL_SECONDS
   };
