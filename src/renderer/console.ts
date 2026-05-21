@@ -184,7 +184,7 @@ function renderKitchenOrder(jobType: 'kitchen_order' | 'bar_order', payload: Kit
 
   const waiter = payload.waiter_name ?? '—';
   const time = formatTime(payload.opened_at);
-  const subtitle = `Mozo: ${waiter} · ${time}`;
+  const subtitle = `Mesero: ${waiter} · ${time}`;
 
   out.push(line(WIDTH));
   out.push(padCenter(title, WIDTH));
@@ -225,7 +225,7 @@ function renderKitchenCancel(payload: KitchenJobPayload): string {
 
   const waiter = payload.waiter_name ?? '—';
   const time = formatTime(payload.opened_at);
-  const subtitle = `Mozo: ${waiter} · ${time}`;
+  const subtitle = `Mesero: ${waiter} · ${time}`;
 
   out.push(line(WIDTH));
   out.push(padCenter(title, WIDTH));
@@ -325,7 +325,7 @@ function renderBillProforma(payload: BillProformaPayload): string {
     out.push(`Para llevar   Comensales: ${payload.guests}   ${time}`);
   }
   if (payload.waiter_name) {
-    out.push(`Mozo: ${payload.waiter_name}`);
+    out.push(`Mesero: ${payload.waiter_name}`);
   }
   out.push(divider(WIDTH));
   out.push('');
@@ -403,7 +403,7 @@ function renderBillPreview(payload: BillPreviewPayload): string {
     out.push(`Para llevar   Comensales: ${payload.guests}   ${time}`);
   }
   if (payload.waiter_name) {
-    out.push(`Mozo: ${payload.waiter_name}`);
+    out.push(`Mesero: ${payload.waiter_name}`);
   }
   out.push(divider(WIDTH));
   out.push('');

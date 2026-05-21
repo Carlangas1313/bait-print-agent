@@ -272,7 +272,7 @@ export function renderKitchenOrderEscPos(
   tp.bold(false);
 
   // Subtitle: mozo · hora · comensales
-  tp.println(`Mozo: ${waiter} · ${time}`);
+  tp.println(`Mesero: ${waiter} · ${time}`);
   tp.println(`Comensales: ${payload.guests}`);
   tp.alignLeft();
   tp.drawLine();
@@ -326,7 +326,7 @@ export function renderKitchenCancelEscPos(
   tp.setTextNormal();
   tp.bold(false);
 
-  tp.println(`Mozo: ${waiter} · ${time}`);
+  tp.println(`Mesero: ${waiter} · ${time}`);
   tp.alignLeft();
   tp.drawLine();
   tp.newLine();
@@ -377,7 +377,7 @@ export function renderBillPreviewEscPos(
   }
   tp.println(`Hora: ${time}`);
   if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
-    tp.println(`Mozo: ${payload.waiter_name.trim()}`);
+    tp.println(`Mesero: ${payload.waiter_name.trim()}`);
   }
   tp.drawLine();
   tp.newLine();
@@ -449,7 +449,7 @@ export function renderBillProformaEscPos(
   }
   tp.println(`Hora: ${time}`);
   if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
-    tp.println(`Mozo: ${payload.waiter_name.trim()}`);
+    tp.println(`Mesero: ${payload.waiter_name.trim()}`);
   }
   tp.drawLine();
   tp.newLine();
