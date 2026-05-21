@@ -56,19 +56,46 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify package version matches tag
-        # Sanity check: el version del package.json debe coincidir con el tag,
-        # asi no publicamos un .exe que diga "0.1.0" cuando el tag dice "v0.2.0".
+      - name: Verify package version matches tag (agente + companion)
+        # Sanity check: TODOS los manifests de version deben coincidir con el
+        # tag. El agente Node.js tiene package.json; el companion Tauri tiene
+        # SU package.json y SU tauri.conf.json, ambos deben matchear.
+        #
+        # Bug que fix (2026-05-21): liberamos v0.8.0 con el companion bumpeado
+        # solo a 0.7.2 (el bump del agente no toco companion/). El companion
+        # detectaba 0.7.2 != 0.8.0 release y ofrecia update infinitamente
+        # porque al instalar 0.8.0 el .exe del companion seguia siendo 0.7.2.
+        # Loop de update sin progreso. Este guard previene que vuelva a pasar.
         shell: pwsh
         run: |
-          $pkgVersion = (Get-Content package.json | ConvertFrom-Json).version
           $tagVersion = "${{ github.ref_name }}".TrimStart('v')
-          Write-Host "package.json version: $pkgVersion"
-          Write-Host "tag version:          $tagVersion"
-          if ($pkgVersion -ne $tagVersion) {
-            Write-Error "Mismatch: package.json ($pkgVersion) != tag ($tagVersion). Actualiza package.json antes de tagear."
+          Write-Host "tag version:                          $tagVersion"
+
+          $agentVersion = (Get-Content package.json | ConvertFrom-Json).version
+          Write-Host "agente package.json:                  $agentVersion"
+
+          $companionPkgVersion = (Get-Content companion/package.json | ConvertFrom-Json).version
+          Write-Host "companion package.json:               $companionPkgVersion"
+
+          $companionTauriVersion = (Get-Content companion/src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          Write-Host "companion src-tauri/tauri.conf.json:  $companionTauriVersion"
+
+          $mismatches = @()
+          if ($agentVersion -ne $tagVersion) {
+            $mismatches += "agent package.json ($agentVersion)"
+          }
+          if ($companionPkgVersion -ne $tagVersion) {
+            $mismatches += "companion package.json ($companionPkgVersion)"
+          }
+          if ($companionTauriVersion -ne $tagVersion) {
+            $mismatches += "companion tauri.conf.json ($companionTauriVersion)"
+          }
+
+          if ($mismatches.Count -gt 0) {
+            Write-Error ("Version mismatch contra tag {0}: {1}. Bumpear los 4 lugares (package.json + src/constants.ts + companion/package.json + companion/src-tauri/tauri.conf.json) antes de tagear." -f $tagVersion, ($mismatches -join ', '))
             exit 1
           }
+          Write-Host "OK: agent + companion (package.json + tauri.conf.json) todos en $tagVersion"
 
       - name: Typecheck
         run: npm run typecheck
