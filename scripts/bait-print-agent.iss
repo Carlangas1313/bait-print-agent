@@ -210,10 +210,39 @@ var
   // skipea entera y forzamos pairing — sino el cliente reinstala despues de
   // desinstalar y queda con servicio en crash loop por config faltante.
   ExistingConfigFound: Boolean;
+  // True cuando el setup fue lanzado por el companion (boton "Instalar update").
+  // El companion pasa /COMPANIONUPDATE como argumento al Start-Process. En ese
+  // caso saltamos Welcome + SelectDir + las paginas de pairing (asume Saltar)
+  // porque sabemos que es un upgrade con config preservada. Si el user corre
+  // el setup manual (doble click desde Downloads), este flag queda False y el
+  // wizard muestra todas las opciones para que pueda re-vincular o re-configurar.
+  IsCompanionUpdate: Boolean;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// Chequea si alguno de los argumentos pasados al setup.exe es `flag`
+// (case-insensitive). El companion lo invoca con /COMPANIONUPDATE cuando
+// quiere ejecutar un upgrade "smart defaults" sin preguntas redundantes.
+//
+// Inno expone los args via ParamCount/ParamStr (sintaxis Pascal-like). El
+// matching es exacto (no permite ":valor" tipo /CODE:XXXX); para flags
+// booleanos eso alcanza.
+function HasCmdLineFlag(const Flag: String): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 1 to ParamCount do
+  begin
+    if CompareText(ParamStr(i), Flag) = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
 
 // Valida el formato del codigo XXXX-XXXX (o XXXXXXXX sin guion). Acepta
 // minusculas (las normalizamos a mayuscula antes de pasarlo al .exe). Mantiene
@@ -294,6 +323,26 @@ begin
   // -------------------------------------------------------------------------
   ExistingConfigFound := FileExists(
     GetEnv('USERPROFILE') + '\.bait-print-agent\config.json');
+
+  // -------------------------------------------------------------------------
+  // Modo "update via companion" — el companion paso /COMPANIONUPDATE.
+  // En este modo asumimos upgrade silencioso: skip Welcome, SelectDir,
+  // SkipPairingCheck y PairingPage. Solo el user ve Tasks (desktop shortcut)
+  // + Ready (1 click confirm) + Installing + Finished.
+  //
+  // Si NO esta el flag (instalacion manual descargada de GitHub), el wizard
+  // muestra todas las paginas como siempre — el user controla todo.
+  // -------------------------------------------------------------------------
+  IsCompanionUpdate := HasCmdLineFlag('/COMPANIONUPDATE');
+  if IsCompanionUpdate and ExistingConfigFound then
+  begin
+    // En upgrade via companion con config: pre-elegimos "Saltar" porque
+    // ShouldSkipPage va a esconder SkipPairingCheck y NextButtonClick no
+    // se va a invocar para esa pagina. Sin esto, SkipPairing quedaria
+    // False y ShouldRunSetup intentaria correr `setup --code` con codigo
+    // vacio (que romperia el upgrade).
+    SkipPairing := True;
+  end;
 
   // -------------------------------------------------------------------------
   // Pagina 1 (condicional): "Saltar configuracion" — checkbox para reinstalaciones.
@@ -387,14 +436,36 @@ end;
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := False;
-  // Si no hay config previa, ocultamos la pagina de "Saltar configuracion"
-  // entera y mandamos al user directo a la pagina del codigo.
+
+  // -------------------------------------------------------------------------
+  // Update via companion (flag /COMPANIONUPDATE + config existente):
+  // saltamos las paginas que el companion ya sabe.
+  // -------------------------------------------------------------------------
+  if IsCompanionUpdate and ExistingConfigFound then
+  begin
+    if (PageID = wpWelcome) or
+       (PageID = wpSelectDir) or
+       (PageID = SkipPairingCheck.ID) or
+       (PageID = PairingPage.ID) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    // Tasks (desktop shortcut), Ready y Finished se MANTIENEN visibles
+    // — son confirmaciones rapidas que el user puede tildar/destildar.
+  end;
+
+  // -------------------------------------------------------------------------
+  // Instalacion manual (sin flag): comportamiento clasico.
+  // -------------------------------------------------------------------------
+  // Si no hay config previa, ocultamos "Saltar configuracion" y mandamos
+  // directo a la pagina del codigo.
   if (PageID = SkipPairingCheck.ID) and (not ExistingConfigFound) then
   begin
     Result := True;
     Exit;
   end;
-  // Si hay config previa y el user eligio "saltar", skipeamos la pagina del codigo.
+  // Si hay config previa y el user eligio "saltar", skipeamos PairingPage.
   if (PageID = PairingPage.ID) and (SkipPairingCheck.SelectedValueIndex = 1) then
     Result := True;
 end;

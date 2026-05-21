@@ -142,14 +142,20 @@ async fn install_update(download_url: String) -> Result<String, String> {
     let installer_path = temp_dir.join("bait-print-agent-setup-update.exe");
     let installer_path_str = installer_path.to_string_lossy().to_string();
 
-    // Script PowerShell: descarga + lanza con RunAs. `$ErrorActionPreference
-    // = 'Stop'` hace que cualquier fallo (red caida, 404, etc.) tire excepcion
-    // y deje stderr legible.
+    // Script PowerShell: descarga + lanza con RunAs y el flag /COMPANIONUPDATE.
+    // Ese flag le dice al wizard del .iss "este es un upgrade via companion,
+    // saltea las paginas que el companion ya sabe" (Welcome, SelectDir,
+    // SkipPairingCheck, PairingPage). Si el user en cambio descarga el setup
+    // manual de GitHub y lo corre, no hay flag y el wizard se muestra
+    // completo — permite re-pairing, cambiar dir, etc.
+    //
+    // `$ErrorActionPreference='Stop'` hace que cualquier fallo (red caida, 404,
+    // etc.) tire excepcion y deje stderr legible.
     let ps_script = format!(
         "$ErrorActionPreference='Stop'; \
          $ProgressPreference='SilentlyContinue'; \
          Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing; \
-         Start-Process -Verb RunAs -FilePath '{}'",
+         Start-Process -Verb RunAs -FilePath '{}' -ArgumentList '/COMPANIONUPDATE'",
         download_url, installer_path_str, installer_path_str
     );
 
