@@ -133,11 +133,73 @@ async function sendUsbViaSpooler(
   tp.clear();
   populate(tp);
   const buffer = tp.getBuffer();
-  await sendRawToWindowsPrinter(printer.name, buffer, logger);
+
+  // Resolver el QUEUE NAME que Win32 OpenPrinter espera.
+  //
+  // Historicamente la app guardaba `target` como UNC share (\\localhost\<name>)
+  // porque la version vieja del agente usaba el `file` backend. Con el spooler
+  // RAW de Win32 (v0.6.4+), `target` debe ser el queue name plano. Como hay
+  // configs viejas en produccion con UNC, soportamos ambos:
+  //
+  //   target='\\localhost\PrintCaja' → extraemos 'PrintCaja'
+  //   target='\\OFFICE-PC\HP'        → extraemos 'HP' (UNC remoto, OpenPrinter
+  //                                      lo resuelve via spooler de OFFICE-PC)
+  //   target='PrintCaja'             → tal cual (caso optimo)
+  //   target=NULL o vacio            → fallback a printer.name (alias humano)
+  const queueName = resolveWindowsQueueName(printer);
+  if (!queueName) {
+    throw new Error(
+      `No pude resolver el queue name de la impresora "${printer.name}". ` +
+        `Configura el campo "Destino" en bait-app.cl -> Impresoras con el ` +
+        `nombre exacto de la cola de Windows (ej: "PrintCaja"). ` +
+        `Verifica con: Get-Printer | Select Name`
+    );
+  }
+
   logger.debug(
-    { printer: printer.name, bytes: buffer.length },
+    { printerName: printer.name, queueName, rawTarget: printer.target },
+    'USB spooler: resolved queue name from printer config'
+  );
+
+  await sendRawToWindowsPrinter(queueName, buffer, logger);
+  logger.debug(
+    { printer: printer.name, queueName, bytes: buffer.length },
     'sendEscPos USB via spooler RAW completado'
   );
+}
+
+/**
+ * Extrae el queue name de Windows desde el target de la printer. Maneja UNC
+ * paths historicos (\\host\share) tirando el prefijo, y cae a printer.name
+ * si target esta vacio.
+ *
+ * Casos:
+ *   '\\localhost\PrintCaja'  → 'PrintCaja'
+ *   '\\OFFICE-PC\HP4000'     → 'HP4000'
+ *   '\\\\localhost\\PrintCaja' (double escape in JSON) → 'PrintCaja'
+ *   'PrintCaja'              → 'PrintCaja' (tal cual)
+ *   ''  o  null              → printer.name
+ *   '\\'                     → null (mal formado)
+ */
+function resolveWindowsQueueName(printer: PrinterRow): string | null {
+  const target = (printer.target ?? '').trim();
+  if (target.length === 0) {
+    const name = (printer.name ?? '').trim();
+    return name.length > 0 ? name : null;
+  }
+
+  // UNC: \\host\share → quedarse con "share" (la parte despues del 2do \).
+  if (target.startsWith('\\\\')) {
+    // Strip leading '\\', luego buscar el primer '\' que separa host de share.
+    const rest = target.slice(2);
+    const slash = rest.indexOf('\\');
+    if (slash < 0) return null; // mal formado
+    const share = rest.slice(slash + 1).trim();
+    return share.length > 0 ? share : null;
+  }
+
+  // Caso plano: target ya es el queue name.
+  return target;
 }
 
 /**
