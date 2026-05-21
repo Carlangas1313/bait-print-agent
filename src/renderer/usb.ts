@@ -142,14 +142,24 @@ function discoveredToSyntheticPrinter(
   const connectionType: PrinterRow['connection_type'] =
     discovered.kind === 'unknown' ? 'usb' : discovered.kind;
 
+  // BUG QUE FIX:
+  // Para USB, `target` debe ser el QUEUE NAME de Windows, NO el PortName/
+  // device_id (USB001, COM7, etc). El helper resolveWindowsQueueName
+  // prioriza target sobre name, y antes poniamos device_id que es el port —
+  // tiraba el error CLIXML porque Win32 OpenPrinter("USB001") no existe.
+  //
+  // Solucion: para USB queremos que tanto name como target apunten al
+  // queue name (`discovered.name` = "PrintCaja"). Para network/bluetooth,
+  // device_id es el target legitimo (IP:9100 o COMn).
+  const target =
+    connectionType === 'usb' ? discovered.name : discovered.device_id;
+
   return {
     id: `test-${discovered.device_id}`,
     name: discovered.name,
     printer_type: 'thermal_test',
     connection_type: connectionType,
-    // Para USB el helper ignora target (usa name como queue). Para network
-    // y bluetooth el target ES requerido y viene del device_id del OS.
-    target: discovered.device_id,
+    target,
     print_area_id: null,
     is_primary: false,
     copies: 1,
