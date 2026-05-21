@@ -5,13 +5,17 @@
  * refresca cada N minutos para captar cambios hechos desde bait-app.cl
  * (admin agrega/quita/modifica printers mientras el agente corre).
  *
- * El matching job -> printer es:
- *   1. Si el job trae print_area_id, buscar la printer con ese mismo
- *      print_area_id.
- *   2. Si no encuentra o el job no tiene print_area_id, usar la printer
- *      `is_primary = true` (la "caja default").
- *   3. Si tampoco hay primary, usar la primera disponible.
- *   4. Si la lista esta vacia, retornar null y el caller decide.
+ * El matching job -> printer es (en orden de preferencia):
+ *   1. Si el job trae target_printer_id (RPC migration 050+), match
+ *      directo por id. Es la ruta moderna: la RPC ya decidio que
+ *      printer fisica recibe esta comanda.
+ *   2. Si target_printer_id es NULL pero el job trae print_area_id
+ *      (jobs viejos, pre-050, o flows que no setean target), buscar
+ *      por area: primary del area, sino primera printer del area.
+ *   3. Sin target_printer_id ni print_area_id, fallback a la printer
+ *      `is_primary = true` (la "caja default" del location).
+ *   4. Si la lista esta vacia o nada matchea, retornar null y el caller
+ *      decide (dispatcher lo clasifica como permanent).
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -121,12 +125,30 @@ export async function loadPrintersForLocation(
 }
 
 /**
- * Elige la printer apropiada para un job dado:
+ * Elige la printer apropiada para un job dado.
  *
- *   1. Si el job tiene print_area_id, buscar match exacto.
- *   2. Si no, usar la printer marcada como is_primary.
- *   3. Si tampoco hay primary, agarrar la primera.
- *   4. Si no hay ninguna, retornar null (caller decide).
+ * Orden de preferencia (cada paso solo aplica si el anterior no resolvio):
+ *
+ *   1. **target_printer_id explicito** (RPC migration 050+): match directo
+ *      por id en el array. Si la printer fue desactivada o eliminada
+ *      entre el encolado y el dispatch, NO caemos a fallback — retornamos
+ *      null. Razon: la RPC decidio especificamente esa printer (ej. una
+ *      estacion concreta dentro de un area multi-terminal). Caer al
+ *      primary del area aca enviaria el item a la printer equivocada.
+ *      El dispatcher lo clasifica como permanent y el admin tiene que
+ *      reactivar la printer o reasignar el item desde el editor.
+ *
+ *   2. **print_area_id (legacy fallback)**: jobs viejos pre-050 no traen
+ *      target_printer_id. Mantenemos el comportamiento historico:
+ *        a) primera printer con `print_area_id === job.print_area_id`,
+ *        b) si no hay, primary del location ("caja default"),
+ *        c) si tampoco, primera printer disponible.
+ *
+ *   3. **Sin info de routing**: job sin target_printer_id ni
+ *      print_area_id (ej. bill_proforma viejo). Cae al primary del
+ *      location.
+ *
+ *   4. Lista vacia o nada matchea: null → caller decide.
  */
 export function pickPrinterForJob(
   printers: PrinterRow[],
@@ -134,17 +156,25 @@ export function pickPrinterForJob(
 ): PrinterRow | null {
   if (printers.length === 0) return null;
 
-  // 1. Match exacto por print_area_id.
+  // 1. Match explicito por target_printer_id (ruta moderna, RPC 050+).
+  // Si vino seteado, esa es LA decision; no caemos a fallback por area.
+  if (job.target_printer_id) {
+    const exact = printers.find((p) => p.id === job.target_printer_id);
+    return exact ?? null;
+  }
+
+  // 2. Fallback legacy: match por print_area_id (jobs pre-050).
   if (job.print_area_id) {
     const exact = printers.find((p) => p.print_area_id === job.print_area_id);
     if (exact) return exact;
   }
 
-  // 2. Primary (la "caja default").
+  // 3. Primary del location (la "caja default") para jobs sin area
+  // ni printer explicita.
   const primary = printers.find((p) => p.is_primary);
   if (primary) return primary;
 
-  // 3. Cualquiera. Ya estan ordenadas por is_primary DESC, name ASC, asi
+  // 4. Cualquiera. Ya estan ordenadas por is_primary DESC, name ASC, asi
   // que la primera es la mas "razonable" en ausencia de match explicito.
   return printers[0] ?? null;
 }

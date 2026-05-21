@@ -37,6 +37,15 @@ export type PrintJobRow = {
   restaurant_id: string;
   location_id: string;
   print_area_id: string | null;
+  /**
+   * Printer fisica destino, resuelta por la RPC al encolar el job
+   * (ver migration 050 bait-pos). Tiene precedencia sobre el lookup
+   * historico por print_area_id (primary del area).
+   *
+   * Si esta NULL, el job es de un schema viejo (pre-050) y el agente
+   * cae al flow legacy: matchear por print_area_id → printer is_primary.
+   */
+  target_printer_id: string | null;
   job_type: JobType;
   payload: Record<string, unknown>;
   order_id: string | null;
