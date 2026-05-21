@@ -10,9 +10,11 @@ import {
   type PrintJobRow,
   type KitchenJobPayload,
   type KitchenJobItem,
+  type BillPreviewPayload,
   type BillProformaPayload,
   type CashClosePayload,
   isKitchenJobPayload,
+  isBillPreviewPayload,
   isBillProformaPayload,
   isCashClosePayload
 } from '../types.js';
@@ -53,6 +55,13 @@ export function formatJob(job: PrintJobRow, logger: Logger): string {
         return renderKitchenCancel(job.payload);
       }
       return unsupportedFallback(job, logger, 'payload no matchea KitchenJobPayload');
+    }
+
+    case 'bill_preview': {
+      if (isBillPreviewPayload(job.payload)) {
+        return renderBillPreview(job.payload);
+      }
+      return unsupportedFallback(job, logger, 'payload no matchea BillPreviewPayload');
     }
 
     case 'bill_proforma': {
@@ -352,6 +361,96 @@ function renderBillProforma(payload: BillProformaPayload): string {
   out.push(padCenter('al momento del pago.', WIDTH));
   out.push('');
   out.push(padCenter('Gracias por su preferencia!', WIDTH));
+  out.push('');
+
+  return out.join('\n');
+}
+
+/**
+ * Layout bill_preview (PRE-CUENTA). Similar al bill_proforma pero con
+ * propina sugerida 10% y sin metodo de pago (todavia no se cobro).
+ * Solo se usa en el renderer de debug (console/virtual). El render real
+ * en impresora va por escpos-layouts.ts con doble altura + QR.
+ */
+function renderBillPreview(payload: BillPreviewPayload): string {
+  const out: string[] = [];
+
+  // Header del local
+  out.push(line(WIDTH));
+  out.push(padCenter(payload.restaurant.name, WIDTH));
+  if (payload.restaurant.address && payload.restaurant.address.trim().length > 0) {
+    out.push(padCenter(payload.restaurant.address.trim(), WIDTH));
+  }
+  const comuna = payload.restaurant.comuna?.trim() ?? '';
+  const phone = payload.restaurant.phone?.trim() ?? '';
+  if (comuna.length > 0 || phone.length > 0) {
+    const parts: string[] = [];
+    if (comuna.length > 0) parts.push(comuna);
+    if (phone.length > 0) parts.push(`Fono ${phone}`);
+    out.push(padCenter(parts.join(' · '), WIDTH));
+  }
+  out.push(line(WIDTH));
+
+  // Badge PRE-CUENTA + numero
+  out.push(padCenter(`* PRE-CUENTA #${payload.order_number} *`, WIDTH));
+  out.push(line(WIDTH));
+
+  // Linea de mesa
+  const time = formatTime(payload.opened_at);
+  if (payload.table_number) {
+    out.push(`Mesa ${payload.table_number}   Comensales: ${payload.guests}   ${time}`);
+  } else {
+    out.push(`Para llevar   Comensales: ${payload.guests}   ${time}`);
+  }
+  if (payload.waiter_name) {
+    out.push(`Mozo: ${payload.waiter_name}`);
+  }
+  out.push(divider(WIDTH));
+  out.push('');
+
+  // Items
+  for (const item of payload.items) {
+    out.push(renderBillItemLine(item.name, item.quantity, item.subtotal));
+  }
+
+  out.push('');
+  out.push(divider(WIDTH));
+
+  // Subtotal + IVA + Total
+  const subtotalLabel = 'Subtotal';
+  const ivaLabel = 'IVA (19%)';
+  const totalLabel = 'TOTAL';
+
+  const subtotalAmount = formatCLP(payload.subtotal).replace('$ ', '');
+  const ivaAmount = formatCLP(payload.iva).replace('$ ', '');
+  const totalAmount = formatCLP(payload.total).replace('$ ', '');
+
+  out.push(subtotalLabel + padLeft(subtotalAmount, WIDTH - subtotalLabel.length));
+  out.push(ivaLabel + padLeft(ivaAmount, WIDTH - ivaLabel.length));
+  out.push(line(WIDTH));
+  out.push(totalLabel + padLeft(totalAmount, WIDTH - totalLabel.length));
+  out.push(line(WIDTH));
+  out.push('');
+
+  // Propina sugerida
+  out.push('Propina sugerida (10%):');
+  const tipAmount = formatCLP(payload.suggested_tip_amount).replace('$ ', '');
+  const totalWithTipAmount = formatCLP(payload.total_with_suggested_tip).replace('$ ', '');
+  out.push('  Propina' + padLeft(tipAmount, WIDTH - '  Propina'.length));
+  const totalTipLabel = 'TOTAL CON PROPINA';
+  out.push(totalTipLabel + padLeft(totalWithTipAmount, WIDTH - totalTipLabel.length));
+  out.push(divider(WIDTH));
+  out.push('');
+
+  // Footer NO tributario
+  out.push(padCenter('* Documento NO tributario *', WIDTH));
+  out.push(padCenter('La boleta SII se entrega', WIDTH));
+  out.push(padCenter('al momento del pago.', WIDTH));
+  out.push('');
+
+  const footerPhrase = payload.restaurant.print_footer_phrase?.trim();
+  const footer = footerPhrase && footerPhrase.length > 0 ? footerPhrase : 'Gracias por su preferencia!';
+  out.push(padCenter(footer, WIDTH));
   out.push('');
 
   return out.join('\n');

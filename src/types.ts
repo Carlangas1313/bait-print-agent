@@ -8,6 +8,7 @@
 export type JobType =
   | 'kitchen_order'
   | 'bar_order'
+  | 'bill_preview'
   | 'bill_proforma'
   | 'sii_receipt'
   | 'cash_close'
@@ -88,27 +89,102 @@ export type KitchenJobPayload = {
   area_name: string | null;
 };
 
-export type BillProformaPayload = {
+/**
+ * Datos del cobro asociados a una boleta final. Todos los sub-campos son
+ * opcionales porque el flujo viejo (pre-mig 051) podia emitir bill_proforma
+ * antes de capturar el cobro y queremos mantener compatibilidad.
+ *
+ * - method: identificador interno del medio de pago.
+ * - method_label: texto humano que el agente imprime tal cual ("Efectivo",
+ *   "Tarjeta MP"). La app web lo arma para no obligar al agente a tener
+ *   tablas de traduccion.
+ * - mp_last_four / mp_authorization_code: solo aplican cuando method='card_mp'.
+ * - received_cash / change: solo aplican cuando method='cash'.
+ */
+export type BillPaymentInfo = {
+  method: string;
+  method_label: string;
+  mp_last_four?: string | null;
+  mp_authorization_code?: string | null;
+  received_cash?: number | null;
+  change?: number | null;
+};
+
+/**
+ * Datos del local (header + footer de boletas/precuentas). Los 3 campos
+ * print_* vienen de mig 051 y son opcionales — si el restaurante no los
+ * configuro, los renderers caen al default ("Gracias por su preferencia").
+ */
+export type RestaurantPrintInfo = {
+  name: string;
+  address?: string | null;
+  comuna?: string | null;
+  phone?: string | null;
+  print_qr_url?: string | null;
+  print_qr_label?: string | null;
+  print_footer_phrase?: string | null;
+};
+
+/**
+ * Item de boleta/precuenta. Mismo shape para bill_preview y bill_proforma.
+ */
+export type BillItem = {
+  name: string;
+  quantity: number;
+  unit_price: number;
+  subtotal: number;
+};
+
+/**
+ * PRE-CUENTA: snapshot del consumo de la mesa antes de cobrar. No es boleta
+ * tributaria. Incluye sugerencia de propina del 10% sobre el total.
+ */
+export type BillPreviewPayload = {
   order_id: string;
+  order_number: number;
   table_number?: string | null;
   guests: number;
   opened_at: string;
   waiter_name?: string | null;
-  items: Array<{
-    name: string;
-    quantity: number;
-    unit_price: number;
-    subtotal: number;
-  }>;
+  items: BillItem[];
   subtotal: number;
   iva: number;
   total: number;
-  restaurant: {
-    name: string;
-    address?: string | null;
-    comuna?: string | null;
-    phone?: string | null;
-  };
+  /**
+   * Sugerencia de propina (10% sobre total) pre-calculada por la RPC.
+   * El agente NO recalcula: imprime tal cual. Si en el futuro la web
+   * quiere ofrecer mas tiers (5/10/15%), este shape cambia a array.
+   */
+  suggested_tip_amount: number;
+  total_with_suggested_tip: number;
+  restaurant: RestaurantPrintInfo;
+};
+
+/**
+ * BOLETA FINAL (proforma). Mismo shape que bill_preview pero con datos del
+ * cobro (metodo + propina cobrada + recibido/vuelto si efectivo).
+ */
+export type BillProformaPayload = {
+  order_id: string;
+  order_number: number;
+  table_number?: string | null;
+  guests: number;
+  opened_at: string;
+  waiter_name?: string | null;
+  items: BillItem[];
+  subtotal: number;
+  iva: number;
+  total: number;
+  /**
+   * Propina efectivamente cobrada (de orders.tip_amount). 0 si no hubo.
+   */
+  tip_amount: number;
+  /**
+   * Datos del cobro. NULL en flows legacy donde la boleta se emite sin
+   * cobro registrado todavia (compat con pre-mig 051).
+   */
+  payment?: BillPaymentInfo | null;
+  restaurant: RestaurantPrintInfo;
 };
 
 export type CashClosePayload = {
@@ -146,6 +222,19 @@ export function isKitchenJobPayload(p: unknown): p is KitchenJobPayload {
   );
 }
 
+export function isBillPreviewPayload(p: unknown): p is BillPreviewPayload {
+  return (
+    !!p &&
+    typeof p === 'object' &&
+    'items' in p &&
+    Array.isArray((p as BillPreviewPayload).items) &&
+    'total' in p &&
+    'restaurant' in p &&
+    'suggested_tip_amount' in p &&
+    'total_with_suggested_tip' in p
+  );
+}
+
 export function isBillProformaPayload(p: unknown): p is BillProformaPayload {
   return (
     !!p &&
@@ -153,7 +242,13 @@ export function isBillProformaPayload(p: unknown): p is BillProformaPayload {
     'items' in p &&
     Array.isArray((p as BillProformaPayload).items) &&
     'total' in p &&
-    'restaurant' in p
+    'restaurant' in p &&
+    // tip_amount es el discriminante vs BillPreviewPayload (que no lo tiene
+    // como campo top-level). Si llega un payload pre-mig 051 sin tip_amount,
+    // igual cae al render — el guard es laxo a proposito (`in` con number=0
+    // o undefined ambos satisfacen). Defensa: el renderer trata tip_amount
+    // como `?? 0`.
+    !('suggested_tip_amount' in p)
   );
 }
 

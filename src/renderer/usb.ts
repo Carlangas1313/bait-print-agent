@@ -5,17 +5,44 @@
  *
  * Toda la decision de "elegir transport" (USB spooler RAW Win32 vs TCP raw
  * 9100 vs COM virtual) vive en el helper. Aca solo importa el CONTENIDO
- * del ticket — esto evita duplicacion y deja que sumar un renderer nuevo
- * (notificaciones de cierre, ticket de propinas, etc) sea trivial.
+ * del ticket.
+ *
+ * Refactor v0.8.0:
+ * ----------------
+ * Antes: el contenido se generaba con `formatJob()` (strings ASCII) y se
+ * iteraba con `tp.println()` linea por linea. Resultado: ticket plano, sin
+ * doble altura, sin invert, sin QR, sin XL en el total.
+ *
+ * Ahora: dispatcheamos por `job.job_type` a las funciones de
+ * `escpos-layouts.ts` que emiten comandos ESC/POS nativos (doble altura
+ * en headers, badge invertido en PRE-CUENTA, QR opcional, TOTAL en XL,
+ * "TOTAL ITEMS" destacado en comanda).
+ *
+ * Compat: si llega un job_type no mapeado o un payload que falla el type
+ * guard, caemos al flow viejo (`formatJob` + println line by line) para
+ * no romper jobs legacy o tipos futuros como `sii_receipt`.
  */
 
 import type { Logger } from '../logger.js';
-import type { PrintJobRow } from '../types.js';
+import {
+  type PrintJobRow,
+  isKitchenJobPayload,
+  isBillPreviewPayload,
+  isBillProformaPayload,
+  isCashClosePayload,
+} from '../types.js';
 import { formatJob } from './console.js';
 import type { PrinterRow } from '../printers/registry.js';
 import type { DiscoveredPrinter } from '../printers/discover.js';
 import { AGENT_VERSION } from '../constants.js';
-import { sendEscPos } from '../printers/escpos-transport.js';
+import { sendEscPos, type PopulatePrinter } from '../printers/escpos-transport.js';
+import {
+  renderKitchenOrderEscPos,
+  renderKitchenCancelEscPos,
+  renderBillPreviewEscPos,
+  renderBillProformaEscPos,
+  renderCashCloseEscPos,
+} from './escpos-layouts.js';
 
 /**
  * Ancho del papel en chars. Misma constante que console.ts/format.ts.
@@ -27,6 +54,10 @@ const PRINTER_WIDTH = 32;
 /**
  * Lineas que destacamos en negrita: cabeceras tipo "COCINA - MESA 4",
  * totales, anulaciones. El match es por keywords case-insensitive.
+ *
+ * Solo se usa en el flow legacy (fallback) y en `renderTestPage`. Los layouts
+ * nuevos en `escpos-layouts.ts` aplican bold/invert/double-height
+ * directamente sin depender de este matcher.
  */
 const BOLD_KEYWORDS = ['MESA', 'COCINA', 'BARRA', 'TOTAL', 'CIERRE', 'ANULACION'];
 
@@ -43,14 +74,100 @@ function isBoldLine(rawLine: string): boolean {
 }
 
 /**
+ * Construye el `populate` callback que el transport va a invocar con un
+ * `ThermalPrinter` ya instanciado. Hace el dispatch por job_type a la
+ * funcion ESC/POS correspondiente.
+ *
+ * Si el job_type no tiene layout dedicado (sii_receipt, futuros) o el
+ * payload no matchea el type guard esperado, cae al flow legacy:
+ * `formatJob()` genera el ASCII + iteramos linea por linea aplicando
+ * bold por keyword. Esto preserva compat con cualquier job pendiente
+ * pre-v0.8.0.
+ */
+function buildPopulate(
+  job: PrintJobRow,
+  printer: PrinterRow,
+  logger: Logger
+): PopulatePrinter {
+  return (tp) => {
+    let usedEscPosLayout = false;
+
+    switch (job.job_type) {
+      case 'kitchen_order':
+      case 'bar_order': {
+        if (isKitchenJobPayload(job.payload)) {
+          renderKitchenOrderEscPos(tp, job.payload, job.job_type);
+          usedEscPosLayout = true;
+        }
+        break;
+      }
+      case 'kitchen_cancel': {
+        if (isKitchenJobPayload(job.payload)) {
+          renderKitchenCancelEscPos(tp, job.payload);
+          usedEscPosLayout = true;
+        }
+        break;
+      }
+      case 'bill_preview': {
+        if (isBillPreviewPayload(job.payload)) {
+          renderBillPreviewEscPos(tp, job.payload);
+          usedEscPosLayout = true;
+        }
+        break;
+      }
+      case 'bill_proforma': {
+        if (isBillProformaPayload(job.payload)) {
+          renderBillProformaEscPos(tp, job.payload);
+          usedEscPosLayout = true;
+        }
+        break;
+      }
+      case 'cash_close': {
+        if (isCashClosePayload(job.payload)) {
+          renderCashCloseEscPos(tp, job.payload);
+          usedEscPosLayout = true;
+        }
+        break;
+      }
+      // sii_receipt y cualquier otro job_type futuro caen al fallback abajo.
+    }
+
+    // Fallback: si no entramos a ningun layout ESC/POS nativo (job_type
+    // desconocido o payload invalido), generamos el ASCII viejo y lo
+    // emitimos linea por linea para que el job no se pierda. Logueamos
+    // warning para que el operador lo vea en los logs.
+    if (!usedEscPosLayout) {
+      logger.warn(
+        { jobId: job.id, jobType: job.job_type },
+        `No hay layout ESC/POS dedicado para ${job.job_type} o payload invalido — fallback ASCII`
+      );
+      const content = formatJob(job, logger);
+      const lines = content.split('\n');
+      for (const rawLine of lines) {
+        if (rawLine.length === 0) {
+          tp.newLine();
+          continue;
+        }
+        const bold = isBoldLine(rawLine);
+        if (bold) tp.bold(true);
+        tp.println(rawLine);
+        if (bold) tp.bold(false);
+      }
+    }
+
+    if (printer.beep) tp.beep();
+    if (printer.cut_paper) tp.cut();
+  };
+}
+
+/**
  * Imprime un job en una impresora fisica via ESC/POS.
  *
- * Flujo (refactor v0.6.7):
- *  1. formatJob() genera el bloque ASCII del ticket (mismo contenido que
- *     consola/virtual).
- *  2. Por cada copy (default 1), llamamos a sendEscPos del helper unificado.
- *     El callback popula el ThermalPrinter con las lineas + bold + beep + cut.
- *     El helper elige el transport:
+ * Flujo (refactor v0.8.0):
+ *  1. `buildPopulate(job, printer, logger)` arma el callback que dispatch
+ *     por job_type a la funcion de `escpos-layouts.ts` apropiada.
+ *  2. Por cada copy (default 1), llamamos a `sendEscPos` del helper unificado
+ *     con ese callback. El helper elige el transport:
  *       - USB → Win32 spooler RAW (bypass driver del fabricante)
  *       - network → tcp://target:9100
  *       - bluetooth → \\.\COMn
@@ -76,26 +193,12 @@ export async function renderJobToPrinter(
     `Renderizando job ${job.id} en impresora "${printer.name}" (${printer.connection_type})`
   );
 
-  const content = formatJob(job, logger);
-  const lines = content.split('\n');
   const copies = Math.max(1, printer.copies ?? 1);
 
   for (let copy = 1; copy <= copies; copy++) {
+    const populate = buildPopulate(job, printer, logger);
     try {
-      await sendEscPos(printer, (tp) => {
-        for (const rawLine of lines) {
-          if (rawLine.length === 0) {
-            tp.newLine();
-            continue;
-          }
-          const bold = isBoldLine(rawLine);
-          if (bold) tp.bold(true);
-          tp.println(rawLine);
-          if (bold) tp.bold(false);
-        }
-        if (printer.beep) tp.beep();
-        if (printer.cut_paper) tp.cut();
-      }, logger);
+      await sendEscPos(printer, populate, logger);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(
