@@ -950,34 +950,266 @@ export async function renderCashCloseEscPos(
 // son indistinguibles de "classic" hasta que sus implementaciones lleguen.
 // ====================================================================
 
+/**
+ * MINIMAL style para bill_preview:
+ *   - Sin badges invertidos
+ *   - Sin doble altura en el header (single-width)
+ *   - Whitespace generoso, sin separadores fuertes
+ *   - Sin ornament (mas zen, mas papel)
+ *
+ * Ver mockup en spec Anexo A.
+ */
 async function renderBillPreviewMinimal(
   tp: Printer,
   payload: BillPreviewPayload,
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
-  // STUB: fallback a classic hasta Task 4.6.
-  return renderBillPreviewClassic(tp, payload, supabase, logger);
+  // Logo respetando el toggle (en minimal generalmente OFF, pero respetamos
+  // la config del dueño).
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  // Nombre del local: simple, sin centrado bold gigante.
+  tp.alignLeft();
+  tp.println(payload.restaurant.name);
+  const address = payload.restaurant.address?.trim();
+  if (address && address.length > 0) {
+    tp.println(address);
+  }
+  tp.newLine();
+
+  // Titulo simple "PRE-CUENTA"
+  tp.println('PRE-CUENTA');
+
+  // Datos de mesa en linea simple
+  const time = formatTime(payload.opened_at);
+  const meta: string[] = [];
+  if (payload.table_number) meta.push(`Mesa ${payload.table_number}`);
+  if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
+    meta.push(payload.waiter_name.trim());
+  }
+  meta.push(time);
+  meta.push(`${payload.guests} pax`);
+  tp.println(meta.join(' · '));
+  tp.newLine();
+
+  // Items con formato "qty  nombre  monto" sin doble altura
+  for (const item of payload.items) {
+    printBillItem(tp, item);
+  }
+  tp.newLine();
+
+  // Totales sin separadores fuertes, sin XL.
+  printAmountRow(tp, 'Subtotal', payload.subtotal);
+  printAmountRow(tp, 'IVA', payload.iva);
+  printAmountRow(tp, 'Total', payload.total);
+  tp.newLine();
+
+  // Propina sugerida simple
+  printAmountRow(tp, 'Propina 10%', payload.suggested_tip_amount);
+  printAmountRow(tp, 'Con propina', payload.total_with_suggested_tip);
+  tp.newLine();
+
+  // Footer simple
+  const phrase = payload.restaurant.print_footer_phrase?.trim() || 'Gracias.';
+  tp.println(phrase);
+  tp.newLine();
 }
 
+/**
+ * BRAND style para bill_preview:
+ *   - Logo grande arriba (asume showLogo activo por defecto)
+ *   - Nombre del local centrado + slogan en cursiva visible
+ *   - Ornament en separadores
+ *   - QR grande al final
+ *
+ * Ver mockup en spec Anexo A.
+ */
 async function renderBillPreviewBrand(
   tp: Printer,
   payload: BillPreviewPayload,
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
-  // STUB: fallback a classic hasta Task 4.6.
-  return renderBillPreviewClassic(tp, payload, supabase, logger);
+  const ornament = payload.restaurant.print_ornament_char ?? null;
+
+  // Logo grande arriba (toggle del usuario).
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  // Nombre del local centrado + bold + doble altura.
+  tp.alignCenter();
+  tp.bold(true);
+  tp.setTextDoubleHeight();
+  tp.println(payload.restaurant.name);
+  tp.setTextNormal();
+  tp.bold(false);
+
+  // Slogan en lineas debajo del nombre — invitacion + caracter brand.
+  const slogan = payload.restaurant.slogan?.trim();
+  if (slogan && slogan.length > 0) {
+    tp.println(`"${slogan}"`);
+  }
+  tp.alignLeft();
+
+  // Ornament separator
+  ornamentSep(tp, ornament);
+
+  // Titulo PRE-CUENTA centrado en bold
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println(`PRE-CUENTA #${payload.order_number}`);
+  tp.bold(false);
+  tp.alignLeft();
+  ornamentSep(tp, ornament);
+
+  // Meta data
+  const time = formatTime(payload.opened_at);
+  if (payload.table_number) {
+    tp.println(`Mesa ${payload.table_number} · ${payload.guests} pax · ${time}`);
+  } else {
+    tp.println(`Para llevar · ${payload.guests} pax · ${time}`);
+  }
+  if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
+    tp.println(`Mesero: ${payload.waiter_name.trim()}`);
+  }
+  tp.newLine();
+
+  // Items
+  for (const item of payload.items) {
+    printBillItem(tp, item);
+  }
+  tp.newLine();
+
+  // Totales con énfasis brand
+  printAmountRow(tp, '  Subtotal', payload.subtotal, true);
+  printAmountRow(tp, '  IVA 19%', payload.iva, true);
+  tp.drawLine();
+  printXLTotal(tp, 'TOTAL', payload.total);
+  tp.newLine();
+
+  // Sugerencia de propina
+  tp.bold(true);
+  tp.println('Propina sugerida (10%):');
+  tp.bold(false);
+  printAmountRow(tp, '  Propina', payload.suggested_tip_amount, false);
+  tp.bold(true);
+  printAmountRow(tp, 'CON PROPINA', payload.total_with_suggested_tip);
+  tp.bold(false);
+  tp.newLine();
+
+  ornamentSep(tp, ornament);
+
+  // Footer: QR + frase con vinetas
+  printBillFooter(tp, payload.restaurant);
+
+  // Frase final destacada con ornament a los lados (si hay ornament).
+  if (ornament) {
+    tp.alignCenter();
+    tp.bold(true);
+    tp.println(`${ornament} ¡Gracias por elegirnos! ${ornament}`);
+    tp.bold(false);
+    tp.alignLeft();
+  }
+
+  ornamentSep(tp, ornament);
+  tp.newLine();
 }
 
+/**
+ * THERMAL_PRO style para bill_preview:
+ *   - Header denso con direccion + RUT + telefono en una linea cada uno
+ *   - Items con precio unitario debajo del nombre
+ *   - 3 sugerencias de propina (10/15/20%)
+ *   - Sin badges invertidos: minimal chrome, max info
+ *
+ * Ver mockup en spec Anexo A.
+ */
 async function renderBillPreviewThermalPro(
   tp: Printer,
   payload: BillPreviewPayload,
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
-  // STUB: fallback a classic hasta Task 4.6.
-  return renderBillPreviewClassic(tp, payload, supabase, logger);
+  // Logo respetando el toggle (en thermal_pro generalmente OFF para
+  // priorizar densidad de info).
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  // Header denso: nombre + direccion en una linea
+  tp.println('='.repeat(ESCPOS_WIDTH));
+  const name = payload.restaurant.name;
+  const addr = payload.restaurant.address?.trim();
+  if (addr && addr.length > 0) {
+    tp.println(`${name} · ${addr}`);
+  } else {
+    tp.println(name);
+  }
+
+  // Comuna + telefono
+  const comuna = payload.restaurant.comuna?.trim();
+  const phone = payload.restaurant.phone?.trim();
+  if (comuna && phone) {
+    tp.println(`${comuna} · Tel ${phone}`);
+  } else if (comuna) {
+    tp.println(comuna);
+  } else if (phone) {
+    tp.println(`Tel ${phone}`);
+  }
+  tp.println('='.repeat(ESCPOS_WIDTH));
+
+  // Titulo + numero
+  tp.bold(true);
+  tp.println(`PRE-CUENTA #${payload.order_number}`);
+  tp.bold(false);
+
+  // Fecha completa + mesa + mesero
+  const time = formatTime(payload.opened_at);
+  const dateTime = formatDateTime(payload.opened_at);
+  tp.println(dateTime || time);
+  const meta: string[] = [];
+  if (payload.table_number) meta.push(`Mesa ${payload.table_number}`);
+  if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
+    meta.push(payload.waiter_name.trim());
+  }
+  meta.push(`${payload.guests} comensales`);
+  tp.println(meta.join(' · '));
+  tp.drawLine();
+
+  // Items con precio unitario debajo
+  for (const item of payload.items) {
+    tp.println(`${item.quantity} ${item.name}`);
+    const unit = formatCLP(item.unit_price).replace('$ ', '');
+    const sub = formatCLP(item.subtotal).replace('$ ', '');
+    tp.leftRight(`   ${unit} c/u`, sub);
+  }
+  tp.drawLine();
+
+  // Subtotal + IVA simple
+  printAmountRow(tp, 'Subtotal', payload.subtotal);
+  printAmountRow(tp, 'IVA 19%', payload.iva);
+  tp.bold(true);
+  printAmountRow(tp, 'TOTAL', payload.total);
+  tp.bold(false);
+  tp.println('='.repeat(ESCPOS_WIDTH));
+
+  // 3 sugerencias de propina
+  tp.bold(true);
+  tp.println('PROPINA SUGERIDA:');
+  tp.bold(false);
+  const tipTiers: Array<{ pct: number; amount: number }> = [
+    { pct: 10, amount: Math.round(payload.total * 0.10) },
+    { pct: 15, amount: Math.round(payload.total * 0.15) },
+    { pct: 20, amount: Math.round(payload.total * 0.20) },
+  ];
+  for (const t of tipTiers) {
+    const tipFmt = formatCLP(t.amount).replace('$ ', '');
+    const totalWithTip = formatCLP(payload.total + t.amount).replace('$ ', '');
+    tp.println(`  ${String(t.pct).padStart(2)}%  ${tipFmt} -> total ${totalWithTip}`);
+  }
+  tp.println('='.repeat(ESCPOS_WIDTH));
+
+  // Footer (sin ornament, mantener look pro)
+  printBillFooter(tp, payload.restaurant);
+  tp.newLine();
 }
 
 async function renderBillProformaMinimal(
