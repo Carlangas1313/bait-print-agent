@@ -121,15 +121,32 @@ function unsupportedFallback(job: PrintJobRow, logger: Logger, reason: string): 
 }
 
 /**
- * Resuelve el titulo del header de cocina/barra a partir del job_type
- * y el area_name opcional del payload.
+ * Resuelve el titulo del header de cocina/barra.
  *
- * - bar_order + area "Barra Central" -> "BARRA CENTRAL"
- * - bar_order sin area -> "BARRA"
- * - kitchen_order + area "Cocina Caliente" -> "COCINA CALIENTE"
- * - kitchen_order sin area -> "COCINA"
+ * Precedencia (decision Carlos 2026-05-22): el operador necesita saber
+ * QUE estacion fisica especifica recibio la copia, no solo el area
+ * funcional. En areas con multiples estaciones ("Cocina" con Caliente,
+ * Fria, Pasta), un header "COCINA" confunde porque las 3 estaciones
+ * imprimen el mismo titulo.
+ *
+ *   1. printer_name (preferido — mig 050+056 lo setea siempre)
+ *   2. area_name (fallback para payloads viejos pre-mig 050)
+ *   3. default por job_type ("COCINA" / "BARRA")
+ *
+ * Ejemplos:
+ *   - printer "Termica Cocina Caliente" -> "TERMICA COCINA CALIENTE"
+ *   - printer "Pasta" + area "Cocina"  -> "PASTA"
+ *   - sin printer, area "Barra Central" -> "BARRA CENTRAL"
+ *   - sin printer ni area, kitchen_order -> "COCINA"
  */
-function resolveStationLabel(jobType: 'kitchen_order' | 'bar_order', areaName: string | null): string {
+function resolveStationLabel(
+  jobType: 'kitchen_order' | 'bar_order',
+  printerName: string | null | undefined,
+  areaName: string | null
+): string {
+  if (printerName && printerName.trim().length > 0) {
+    return printerName.trim().toUpperCase();
+  }
   if (areaName && areaName.trim().length > 0) {
     return areaName.trim().toUpperCase();
   }
@@ -178,7 +195,7 @@ function renderKitchenItem(item: KitchenJobItem, qtyPrefix = '  '): string[] {
 function renderKitchenOrder(jobType: 'kitchen_order' | 'bar_order', payload: KitchenJobPayload): string {
   const out: string[] = [];
 
-  const station = resolveStationLabel(jobType, payload.area_name);
+  const station = resolveStationLabel(jobType, payload.printer_name, payload.area_name);
   const destination = resolveDestination(payload);
   const title = `${station} - ${destination}`;
 
