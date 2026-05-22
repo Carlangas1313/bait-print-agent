@@ -1212,32 +1212,277 @@ async function renderBillPreviewThermalPro(
   tp.newLine();
 }
 
+/**
+ * MINIMAL style para bill_proforma:
+ *   - Sin badges invertidos, single-width, whitespace generoso.
+ *   - Mismo principio que bill_preview minimal pero con bloque de payment
+ *     al pie (propina cobrada + metodo + recibido/vuelto si efectivo).
+ */
 async function renderBillProformaMinimal(
   tp: Printer,
   payload: BillProformaPayload,
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
-  // STUB: fallback a classic hasta Task 4.7.
-  return renderBillProformaClassic(tp, payload, supabase, logger);
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  tp.alignLeft();
+  tp.println(payload.restaurant.name);
+  const address = payload.restaurant.address?.trim();
+  if (address && address.length > 0) {
+    tp.println(address);
+  }
+  tp.newLine();
+
+  tp.println(`BOLETA #${payload.order_number}`);
+
+  const time = formatTime(payload.opened_at);
+  const meta: string[] = [];
+  if (payload.table_number) meta.push(`Mesa ${payload.table_number}`);
+  if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
+    meta.push(payload.waiter_name.trim());
+  }
+  meta.push(time);
+  meta.push(`${payload.guests} pax`);
+  tp.println(meta.join(' · '));
+  tp.newLine();
+
+  // Items
+  for (const item of payload.items) {
+    printBillItem(tp, item);
+  }
+  tp.newLine();
+
+  // Totales
+  const tip = payload.tip_amount ?? 0;
+  printAmountRow(tp, 'Subtotal', payload.subtotal);
+  printAmountRow(tp, 'IVA', payload.iva);
+  if (tip > 0) {
+    printAmountRow(tp, 'Propina', tip);
+  }
+  printAmountRow(tp, 'Total', payload.total + tip);
+  tp.newLine();
+
+  // Payment simple (sin XL ni decoraciones)
+  if (payload.payment) {
+    tp.println(`Pago: ${payload.payment.method_label}`);
+    if (payload.payment.method === 'cash') {
+      if (payload.payment.received_cash != null) {
+        printAmountRow(tp, '  Recibido', payload.payment.received_cash);
+      }
+      if (payload.payment.change != null && payload.payment.change > 0) {
+        printAmountRow(tp, '  Vuelto', payload.payment.change);
+      }
+    } else if (payload.payment.method === 'card_mp') {
+      const last4 = payload.payment.mp_last_four?.trim();
+      if (last4) tp.println(`  Tarjeta •••• ${last4}`);
+    }
+    tp.newLine();
+  }
+
+  const phrase = payload.restaurant.print_footer_phrase?.trim() || 'Gracias.';
+  tp.println(phrase);
+  tp.newLine();
 }
 
+/**
+ * BRAND style para bill_proforma:
+ *   - Mismo enfasis branding que bill_preview brand pero terminando con
+ *     bloque de payment destacado y "BOLETA" en vez de "PRE-CUENTA".
+ */
 async function renderBillProformaBrand(
   tp: Printer,
   payload: BillProformaPayload,
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
-  // STUB: fallback a classic hasta Task 4.7.
-  return renderBillProformaClassic(tp, payload, supabase, logger);
+  const ornament = payload.restaurant.print_ornament_char ?? null;
+
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  tp.alignCenter();
+  tp.bold(true);
+  tp.setTextDoubleHeight();
+  tp.println(payload.restaurant.name);
+  tp.setTextNormal();
+  tp.bold(false);
+
+  const slogan = payload.restaurant.slogan?.trim();
+  if (slogan && slogan.length > 0) {
+    tp.println(`"${slogan}"`);
+  }
+  tp.alignLeft();
+
+  ornamentSep(tp, ornament);
+
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println(`BOLETA #${payload.order_number}`);
+  tp.bold(false);
+  tp.alignLeft();
+  ornamentSep(tp, ornament);
+
+  const time = formatTime(payload.opened_at);
+  if (payload.table_number) {
+    tp.println(`Mesa ${payload.table_number} · ${payload.guests} pax · ${time}`);
+  } else {
+    tp.println(`Para llevar · ${payload.guests} pax · ${time}`);
+  }
+  if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
+    tp.println(`Mesero: ${payload.waiter_name.trim()}`);
+  }
+  tp.newLine();
+
+  // Items
+  for (const item of payload.items) {
+    printBillItem(tp, item);
+  }
+  tp.newLine();
+
+  // Totales
+  const tip = payload.tip_amount ?? 0;
+  printAmountRow(tp, '  Subtotal', payload.subtotal, true);
+  printAmountRow(tp, '  IVA 19%', payload.iva, true);
+  if (tip > 0) {
+    printAmountRow(tp, '  Propina', tip, true);
+  }
+  tp.drawLine();
+  printXLTotal(tp, 'TOTAL', payload.total + tip);
+  tp.newLine();
+
+  // Payment destacado (centrado + bold)
+  if (payload.payment) {
+    ornamentSep(tp, ornament);
+    tp.alignCenter();
+    tp.bold(true);
+    tp.println(`Pago: ${payload.payment.method_label}`);
+    tp.bold(false);
+    tp.alignLeft();
+    if (payload.payment.method === 'cash') {
+      if (payload.payment.received_cash != null) {
+        printAmountRow(tp, '  Recibido', payload.payment.received_cash);
+      }
+      if (payload.payment.change != null && payload.payment.change > 0) {
+        printAmountRow(tp, '  Vuelto', payload.payment.change);
+      }
+    } else if (payload.payment.method === 'card_mp') {
+      const last4 = payload.payment.mp_last_four?.trim();
+      if (last4) {
+        tp.println(`  Tarjeta •••• ${last4}`);
+      }
+      const auth = payload.payment.mp_authorization_code?.trim();
+      if (auth) {
+        tp.println(`  Cod. autorizacion: ${auth}`);
+      }
+    }
+    tp.newLine();
+  }
+
+  ornamentSep(tp, ornament);
+  printBillFooter(tp, payload.restaurant);
+
+  if (ornament) {
+    tp.alignCenter();
+    tp.bold(true);
+    tp.println(`${ornament} ¡Gracias por elegirnos! ${ornament}`);
+    tp.bold(false);
+    tp.alignLeft();
+  }
+
+  ornamentSep(tp, ornament);
+  tp.newLine();
 }
 
+/**
+ * THERMAL_PRO style para bill_proforma:
+ *   - Header denso (nombre+direccion+RUT en 1-2 lineas).
+ *   - Items con precio unitario debajo.
+ *   - Sin sugerencias de propina (ya esta cobrada — esa info va en payment).
+ *   - Payment compacto al pie.
+ */
 async function renderBillProformaThermalPro(
   tp: Printer,
   payload: BillProformaPayload,
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
-  // STUB: fallback a classic hasta Task 4.7.
-  return renderBillProformaClassic(tp, payload, supabase, logger);
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  tp.println('='.repeat(ESCPOS_WIDTH));
+  const name = payload.restaurant.name;
+  const addr = payload.restaurant.address?.trim();
+  if (addr && addr.length > 0) {
+    tp.println(`${name} · ${addr}`);
+  } else {
+    tp.println(name);
+  }
+  const comuna = payload.restaurant.comuna?.trim();
+  const phone = payload.restaurant.phone?.trim();
+  if (comuna && phone) {
+    tp.println(`${comuna} · Tel ${phone}`);
+  } else if (comuna) {
+    tp.println(comuna);
+  } else if (phone) {
+    tp.println(`Tel ${phone}`);
+  }
+  tp.println('='.repeat(ESCPOS_WIDTH));
+
+  tp.bold(true);
+  tp.println(`BOLETA #${payload.order_number}`);
+  tp.bold(false);
+
+  const time = formatTime(payload.opened_at);
+  const dateTime = formatDateTime(payload.opened_at);
+  tp.println(dateTime || time);
+  const meta: string[] = [];
+  if (payload.table_number) meta.push(`Mesa ${payload.table_number}`);
+  if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
+    meta.push(payload.waiter_name.trim());
+  }
+  meta.push(`${payload.guests} comensales`);
+  tp.println(meta.join(' · '));
+  tp.drawLine();
+
+  for (const item of payload.items) {
+    tp.println(`${item.quantity} ${item.name}`);
+    const unit = formatCLP(item.unit_price).replace('$ ', '');
+    const sub = formatCLP(item.subtotal).replace('$ ', '');
+    tp.leftRight(`   ${unit} c/u`, sub);
+  }
+  tp.drawLine();
+
+  const tip = payload.tip_amount ?? 0;
+  printAmountRow(tp, 'Subtotal', payload.subtotal);
+  printAmountRow(tp, 'IVA 19%', payload.iva);
+  if (tip > 0) {
+    printAmountRow(tp, 'Propina', tip);
+  }
+  tp.bold(true);
+  printAmountRow(tp, 'TOTAL', payload.total + tip);
+  tp.bold(false);
+  tp.println('='.repeat(ESCPOS_WIDTH));
+
+  // Payment compacto
+  if (payload.payment) {
+    tp.bold(true);
+    tp.println(`PAGO: ${payload.payment.method_label}`);
+    tp.bold(false);
+    if (payload.payment.method === 'cash') {
+      if (payload.payment.received_cash != null) {
+        printAmountRow(tp, '  Recibido', payload.payment.received_cash);
+      }
+      if (payload.payment.change != null && payload.payment.change > 0) {
+        printAmountRow(tp, '  Vuelto', payload.payment.change);
+      }
+    } else if (payload.payment.method === 'card_mp') {
+      const last4 = payload.payment.mp_last_four?.trim();
+      if (last4) tp.println(`  Tarjeta •••• ${last4}`);
+      const auth = payload.payment.mp_authorization_code?.trim();
+      if (auth) tp.println(`  Auth: ${auth}`);
+    }
+    tp.println('='.repeat(ESCPOS_WIDTH));
+  }
+
+  printBillFooter(tp, payload.restaurant);
+  tp.newLine();
 }
