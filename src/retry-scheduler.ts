@@ -19,17 +19,24 @@
  *
  * Notas sobre matching impresora <-> job:
  *
- *   El schema de print_jobs NO tiene un campo "target_printer_id". El
- *   matcheo job -> impresora se hace en runtime via print_area_id
- *   (ver printers/registry.ts -> pickPrinterForJob). Por eso este
- *   scheduler NO necesita saber que impresora se uso: simplemente revive
- *   los jobs cuyo retry ya toca y deja que el dispatcher resuelva la
- *   impresora del momento al claimear (cualquier cambio de configuracion
- *   o de impresora primaria se aplica al reintento).
+ *   Desde migration 050 el schema de print_jobs tiene `target_printer_id`
+ *   (la RPC ya decidio que printer fisica usar al encolar). El matcheo
+ *   job -> impresora se hace en runtime con precedencia:
+ *     1) target_printer_id directo (ruta moderna), si esta seteado,
+ *     2) print_area_id (legacy, jobs pre-050 o flows que no setean target).
+ *   Ver printers/registry.ts -> pickPrinterForJob.
+ *
+ *   Por eso este scheduler NO necesita saber que impresora se uso:
+ *   simplemente revive los jobs cuyo retry ya toca y deja que el dispatcher
+ *   resuelva al claimear (cualquier cambio de configuracion o de impresora
+ *   primaria se aplica al reintento).
  *
  *   El auto-recovery por impresora especifica vive en heartbeat.ts:
- *   cuando una impresora aparece nueva en el discovery, despierta
- *   inmediatamente los jobs en waiting_printer del print_area asociado.
+ *   cuando una impresora aparece nueva en el discovery, despierta los jobs
+ *   en waiting_printer del print_area asociado. Como heuristica laxa,
+ *   tambien sirve para jobs con target_printer_id porque si la printer
+ *   nueva matchea su area, los wake los va a cubrir (y si no, el siguiente
+ *   tick del scheduler los reanima naturalmente cuando next_retry_at <= now).
  *
  * Hard cap:
  *

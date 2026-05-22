@@ -153,9 +153,17 @@ export async function dispatchJob(
     // Productivo: imprimir en hardware real via ESC/POS.
     const printer = pickPrinterForJob(printers, job);
     if (!printer) {
-      const where = job.print_area_id
-        ? `print_area ${job.print_area_id}`
-        : 'la caja default (is_primary)';
+      // El "donde" depende del path de routing que tomo pickPrinterForJob:
+      //   - target_printer_id seteado -> el caller pidio una printer concreta
+      //     que ahora no esta activa/cargada. El admin tiene que reactivarla.
+      //   - print_area_id seteado (legacy) -> no hay ninguna printer
+      //     configurada para esa area.
+      //   - ambos NULL -> no hay caja default (is_primary).
+      const where = job.target_printer_id
+        ? `la impresora id=${job.target_printer_id} (la pidio la RPC pero no esta activa)`
+        : job.print_area_id
+          ? `print_area ${job.print_area_id}`
+          : 'la caja default (is_primary)';
       // Permanent: faltan datos de configuracion. Reintentar no ayuda.
       return {
         ok: false,
@@ -163,7 +171,7 @@ export async function dispatchJob(
           kind: 'permanent',
           message:
             `No hay impresora configurada para ${where}. ` +
-            `Agrega una en bait-app.cl -> Configuracion -> Impresoras.`
+            `Agrega o reactiva una en bait-app.cl -> Configuracion -> Impresoras.`
         }
       };
     }
