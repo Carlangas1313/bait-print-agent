@@ -241,13 +241,20 @@ function printXLTotal(tp: Printer, label: string, amount: number): void {
 // ====================================================================
 
 /**
- * Resuelve el titulo de header de cocina/barra: area_name del payload o
- * fallback al tipo. Mismo comportamiento que `console.ts`.
+ * Resuelve el titulo de header de cocina/barra. Precedencia:
+ *   1. printer_name (mig 050+056 lo setea siempre)
+ *   2. area_name (fallback payloads viejos)
+ *   3. default por job_type
+ * Ver console.ts para racional completo. Mismo comportamiento.
  */
 function resolveStationLabel(
   jobType: 'kitchen_order' | 'bar_order',
+  printerName: string | null | undefined,
   areaName: string | null
 ): string {
+  if (printerName && printerName.trim().length > 0) {
+    return printerName.trim().toUpperCase();
+  }
   if (areaName && areaName.trim().length > 0) {
     return areaName.trim().toUpperCase();
   }
@@ -296,13 +303,19 @@ function printKitchenItem(tp: Printer, item: KitchenJobItem): void {
  *
  * El total de items es la suma de quantities, no el count de lineas — eso
  * lo que la cocina mira para saber cuanto va a salir.
+ *
+ * NOTE (Task 4.4 refactor v0.9.0): renombrada de `renderKitchenOrderEscPos`
+ * a `renderKitchenOrderClassic`. La funcion publica con el nombre original
+ * vive abajo (seccion "Dispatchers") y elige entre styles via print_options.
+ * Para kitchen_order no hay otros styles (Carlos prefiere classic) pero
+ * mantenemos el dispatcher para consistencia + futura extensibilidad.
  */
-export function renderKitchenOrderEscPos(
+function renderKitchenOrderClassic(
   tp: Printer,
   payload: KitchenJobPayload,
   jobType: 'kitchen_order' | 'bar_order' = 'kitchen_order'
 ): void {
-  const station = resolveStationLabel(jobType, payload.area_name);
+  const station = resolveStationLabel(jobType, payload.printer_name, payload.area_name);
   const destination = resolveDestination(payload);
   const waiter = payload.waiter_name?.trim() || '-';
   const time = formatTime(payload.opened_at);
@@ -351,8 +364,11 @@ export function renderKitchenOrderEscPos(
  * Anulacion: header invertido "ANULACION" + destino, mismo cuerpo que
  * kitchen_order pero items con prefijo [X] para que en cocina sea evidente
  * que tienen que SACAR de la comanda anterior.
+ *
+ * NOTE (Task 4.4 refactor v0.9.0): renombrada a `renderKitchenCancelClassic`.
+ * Dispatcher publico abajo.
  */
-export function renderKitchenCancelEscPos(
+function renderKitchenCancelClassic(
   tp: Printer,
   payload: KitchenJobPayload
 ): void {
@@ -401,8 +417,12 @@ export function renderKitchenCancelEscPos(
  * PRE-CUENTA: header del local, badge "PRE-CUENTA #N", datos de mesa,
  * items, subtotal/IVA/total XL, separador + sugerencia de propina 10%,
  * footer con QR opcional + frase custom.
+ *
+ * NOTE (Task 4.4 refactor v0.9.0): renombrada a `renderBillPreviewClassic`.
+ * Dispatcher publico abajo elige entre 4 styles (classic/minimal/brand/thermal_pro)
+ * segun `payload.print_options?.style`. Si no viene, default 'classic'.
  */
-export function renderBillPreviewEscPos(
+function renderBillPreviewClassic(
   tp: Printer,
   payload: BillPreviewPayload
 ): void {
@@ -473,8 +493,11 @@ export function renderBillPreviewEscPos(
  * BOLETA FINAL (proforma): similar al preview pero con metodo de pago,
  * propina cobrada y vuelto si efectivo. Sin sugerencia de propina (ya
  * pagada).
+ *
+ * NOTE (Task 4.4 refactor v0.9.0): renombrada a `renderBillProformaClassic`.
+ * Dispatcher publico abajo.
  */
-export function renderBillProformaEscPos(
+function renderBillProformaClassic(
   tp: Printer,
   payload: BillProformaPayload
 ): void {
@@ -586,8 +609,11 @@ function printPaymentSection(
 /**
  * Cierre Z (cash_close) con header doble altura y desglose claro. Mismo
  * contenido que el render ASCII, mejor presentado.
+ *
+ * NOTE (Task 4.4 refactor v0.9.0): renombrada a `renderCashCloseClassic`.
+ * Dispatcher publico abajo.
  */
-export function renderCashCloseEscPos(
+function renderCashCloseClassic(
   tp: Printer,
   payload: CashClosePayload
 ): void {
@@ -647,4 +673,143 @@ export function renderCashCloseEscPos(
 
   tp.drawLine();
   tp.newLine();
+}
+
+// ====================================================================
+// Dispatchers publicos (entry-points usados por usb.ts)
+// ====================================================================
+//
+// El dispatcher lee `payload.print_options?.style` y rutea a la variante
+// concreta del style. Si el style no esta implementado todavia para ese
+// tipo de ticket, cae a Classic como fallback seguro.
+//
+// Las funciones concretas de cada style se implementan en Tasks 4.6 y 4.7
+// (bill_preview + bill_proforma). Por ahora todos los styles distintos a
+// classic caen a classic — esto cierra la refactorizacion sin cambiar
+// comportamiento en runtime hasta que las nuevas funciones aparezcan.
+// ====================================================================
+
+/**
+ * Dispatcher publico para bill_preview. Rutea por print_options.style.
+ *
+ * Defaults: si payload.print_options o payload.print_options.style vienen
+ * undefined (RPC pre-mig 058), aplica style='classic'.
+ */
+export function renderBillPreviewEscPos(
+  tp: Printer,
+  payload: BillPreviewPayload
+): void {
+  const style = payload.print_options?.style ?? 'classic';
+  switch (style) {
+    case 'minimal':
+      return renderBillPreviewMinimal(tp, payload);
+    case 'brand':
+      return renderBillPreviewBrand(tp, payload);
+    case 'thermal_pro':
+      return renderBillPreviewThermalPro(tp, payload);
+    case 'classic':
+    default:
+      return renderBillPreviewClassic(tp, payload);
+  }
+}
+
+/**
+ * Dispatcher publico para bill_proforma. Misma logica que bill_preview.
+ */
+export function renderBillProformaEscPos(
+  tp: Printer,
+  payload: BillProformaPayload
+): void {
+  const style = payload.print_options?.style ?? 'classic';
+  switch (style) {
+    case 'minimal':
+      return renderBillProformaMinimal(tp, payload);
+    case 'brand':
+      return renderBillProformaBrand(tp, payload);
+    case 'thermal_pro':
+      return renderBillProformaThermalPro(tp, payload);
+    case 'classic':
+    default:
+      return renderBillProformaClassic(tp, payload);
+  }
+}
+
+/**
+ * Dispatcher publico para kitchen_order. Carlos prefiere classic, asi que
+ * el switch por style esta presente pero por ahora todos los styles caen
+ * al mismo render. Los toggles del payload.print_options se aplican DENTRO
+ * de renderKitchenOrderClassic (Task 4.8).
+ */
+export function renderKitchenOrderEscPos(
+  tp: Printer,
+  payload: KitchenJobPayload,
+  jobType: 'kitchen_order' | 'bar_order' = 'kitchen_order'
+): void {
+  // Por disenio: kitchen_order no tiene styles alternativos (los tickets
+  // operacionales son siempre classic). Si en el futuro se quieren styles,
+  // sumar aca el switch.
+  return renderKitchenOrderClassic(tp, payload, jobType);
+}
+
+/**
+ * Dispatcher publico para kitchen_cancel. Mismo argumento que kitchen_order:
+ * un solo style por ahora.
+ */
+export function renderKitchenCancelEscPos(
+  tp: Printer,
+  payload: KitchenJobPayload
+): void {
+  return renderKitchenCancelClassic(tp, payload);
+}
+
+/**
+ * Dispatcher publico para cash_close. Un solo style por ahora; los toggles
+ * (showHighlightedDiff, showMethodBreakdown) se aplican dentro del Classic
+ * (Task 4.9).
+ */
+export function renderCashCloseEscPos(
+  tp: Printer,
+  payload: CashClosePayload
+): void {
+  return renderCashCloseClassic(tp, payload);
+}
+
+// ====================================================================
+// Style variants stubs (Tasks 4.6 + 4.7 los implementan completos)
+// ====================================================================
+//
+// Por ahora todas las funciones de style alternativo caen al Classic.
+// Esto permite que el dispatcher exista desde Task 4.4 sin que el runtime
+// cambie de comportamiento — los styles "minimal"/"brand"/"thermal_pro"
+// son indistinguibles de "classic" hasta que sus implementaciones lleguen.
+// ====================================================================
+
+function renderBillPreviewMinimal(tp: Printer, payload: BillPreviewPayload): void {
+  // STUB: fallback a classic hasta Task 4.6.
+  return renderBillPreviewClassic(tp, payload);
+}
+
+function renderBillPreviewBrand(tp: Printer, payload: BillPreviewPayload): void {
+  // STUB: fallback a classic hasta Task 4.6.
+  return renderBillPreviewClassic(tp, payload);
+}
+
+function renderBillPreviewThermalPro(tp: Printer, payload: BillPreviewPayload): void {
+  // STUB: fallback a classic hasta Task 4.6.
+  return renderBillPreviewClassic(tp, payload);
+}
+
+function renderBillProformaMinimal(tp: Printer, payload: BillProformaPayload): void {
+  // STUB: fallback a classic hasta Task 4.7.
+  return renderBillProformaClassic(tp, payload);
+}
+
+function renderBillProformaBrand(tp: Printer, payload: BillProformaPayload): void {
+  // STUB: fallback a classic hasta Task 4.7.
+  return renderBillProformaClassic(tp, payload);
+}
+
+function renderBillProformaThermalPro(tp: Printer, payload: BillProformaPayload): void {
+  // STUB: fallback a classic hasta Task 4.7.
+  return renderBillProformaClassic(tp, payload);
 }
