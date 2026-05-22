@@ -159,7 +159,7 @@ function printAmountRow(
   indent = false
 ): void {
   const left = indent ? `  ${label}` : label;
-  tp.leftRight(left, formatCLP(amount).replace('$ ', ''));
+  tp.leftRight(left, formatCLP(amount));
 }
 
 /**
@@ -171,52 +171,29 @@ function printAmountRow(
  * monto quede pegado a la derecha (mas legible que columnas separadas).
  *
  * --------------------------------------------------------------------
- * BUG REPORTADO (Carlos, 2026-05-22): "items aparecen cargados a la
- * izquierda en la pre-cuenta y boleta — el monto no se ve a la derecha".
+ * BUG REPORTADO (Carlos, 2026-05-22) y FIXEADO:
+ *   "items aparecen cargados a la izquierda — el monto no se ve a la derecha"
  *
- * Estado del diagnostico: PENDIENTE (sin termica fisica disponible en
- * sesion Phase 4). El renderer YA usa tp.leftRight(), asi que el bug
- * no es "se olvidaron de alinear a la derecha". Hipotesis a verificar
- * con tickets reales en Phase 5 (QA con Carlos en La Cocina):
+ * Causa raíz (foto del ticket lo confirmó): la impresora era 80mm pero el
+ * renderer usaba PRINTER_WIDTH=32 hardcoded (asumía Rongta 58mm). El padding
+ * de leftRight() calculaba sobre 32 cols, dejando el monto en el medio del
+ * papel en lugar del borde derecho.
  *
- *   - Hipotesis A: formatCLP(...).replace('$ ', '') quita el signo peso
- *     y el separador de miles. El monto formatted termina mas corto de
- *     lo esperado ("8000" sale "8.000" pero sin "$ " son 5 chars; con
- *     "$ " serian 7). leftRight padea con espacios entre left y right;
- *     si el right es muy corto, el padding crece y visualmente queda
- *     "el numero pegado a la derecha pero la sensacion es de mucho
- *     whitespace en el medio". Fix candidato: NO quitar el '$ ' del
- *     monto (mantener "$ 8.000" como right).
+ * Fixes aplicados:
+ *   1. (mig 060) Columna `printers.width_chars` configurable per impresora
+ *      con valores 32/42/48 (58mm A/58mm B/80mm A). Default 32 = compat.
+ *   2. (este file) El renderer recibe `width` por parámetro desde el payload
+ *      (payload.printer.width_chars), threadeado a leftRight, ornamentSep,
+ *      printBillItem, etc. Fallback a 32 si el payload no trae printer.
+ *   3. (este file) Se quitó el `.replace('$ ', '')` en formatCLP — los items
+ *      ahora muestran "$ 8.000" igual que el TOTAL, consistencia visual.
  *
- *   - Hipotesis B: items con `note` se imprimen aparte con
- *     `tp.println(`   [${note}]`)` (ver printKitchenItem, no aplica a
- *     bill_*, pero si la cocina lo replica en bill, romperia). En el
- *     renderer actual de bill_*, los items NO tienen note — pero si
- *     en algun momento se sumara (kitchen + bill comparten KitchenJobItem
- *     vs BillItem son tipos distintos), revisar este path.
- *
- *   - Hipotesis C: tp.leftRight() en double-width no aplica para items
- *     (estan en width normal), pero el calculo de RIGHT_RESERVE no
- *     considera bien el caso "monto chico" — si amount="1.000" son 5
- *     chars + qtyPart="x1" son 2 + 2 espacios = 9 chars reservados a
- *     la derecha. nameMax = 32 - 9 - 2 = 21. Para "Cazuela" (7 chars)
- *     queda  "Cazuela x1                1.000" — visualmente OK pero
- *     muchos espacios en medio. NO es bug funcional.
- *
- * TODO Phase 5 (Carlos + termica fisica):
- *   1. Imprimir 4 items con distintas combinaciones de nombre/monto.
- *   2. Tomar foto del papel.
- *   3. Si confirma Hipotesis A: cambiar `replace('$ ', '')` por dejar
- *      el "$ " intacto. La columna se vera "$ 8.000" en vez de "8.000"
- *      pero queda mas pegada a la derecha del leftRight.
- *   4. Si confirma Hipotesis B: poner notas con leftRight tambien o
- *      como segunda linea indentada uniforme.
- *   5. Si es solo estetica (Hipotesis C): no aplicar fix, agregar nota
- *      en docs/PRINTING.md.
+ * El dueño tiene que configurar el ancho correcto en /settings/printers
+ * para cada impresora (default 32 sigue funcionando para Rongta 58mm).
  * --------------------------------------------------------------------
  */
 function printBillItem(tp: Printer, item: BillItem, width: number = ESCPOS_WIDTH): void {
-  const amount = formatCLP(item.subtotal).replace('$ ', '');
+  const amount = formatCLP(item.subtotal);
   const qtyPart = `x${item.quantity}`;
   // Reserva derecha aproximada: "x99   $999.999" ~ 14 chars. Nombre ocupa
   // el resto. Truncamos defensivamente al width del papel (32/42/48).
@@ -592,7 +569,7 @@ function printKitchenItemWithToggles(
   for (const mod of item.modifiers) {
     if (opts.showPrices && mod.priceDelta !== 0) {
       // Si showPrices y el modifier tiene delta, mostrar el delta
-      const fmt = formatCLP(mod.priceDelta).replace('$ ', '');
+      const fmt = formatCLP(mod.priceDelta);
       tp.println(`   - ${mod.name} (${mod.priceDelta > 0 ? '+' : ''}${fmt})`);
     } else {
       tp.println(`   - ${mod.name}`);
@@ -1397,8 +1374,8 @@ async function renderBillPreviewThermalPro(
   // Items con precio unitario debajo
   for (const item of payload.items) {
     tp.println(`${item.quantity} ${item.name}`);
-    const unit = formatCLP(item.unit_price).replace('$ ', '');
-    const sub = formatCLP(item.subtotal).replace('$ ', '');
+    const unit = formatCLP(item.unit_price);
+    const sub = formatCLP(item.subtotal);
     tp.leftRight(`   ${unit} c/u`, sub);
   }
   tp.drawLine();
@@ -1421,8 +1398,8 @@ async function renderBillPreviewThermalPro(
     { pct: 20, amount: Math.round(payload.total * 0.20) },
   ];
   for (const t of tipTiers) {
-    const tipFmt = formatCLP(t.amount).replace('$ ', '');
-    const totalWithTip = formatCLP(payload.total + t.amount).replace('$ ', '');
+    const tipFmt = formatCLP(t.amount);
+    const totalWithTip = formatCLP(payload.total + t.amount);
     tp.println(`  ${String(t.pct).padStart(2)}%  ${tipFmt} -> total ${totalWithTip}`);
   }
   tp.println('='.repeat(width));
@@ -1674,8 +1651,8 @@ async function renderBillProformaThermalPro(
 
   for (const item of payload.items) {
     tp.println(`${item.quantity} ${item.name}`);
-    const unit = formatCLP(item.unit_price).replace('$ ', '');
-    const sub = formatCLP(item.subtotal).replace('$ ', '');
+    const unit = formatCLP(item.unit_price);
+    const sub = formatCLP(item.subtotal);
     tp.leftRight(`   ${unit} c/u`, sub);
   }
   tp.drawLine();
