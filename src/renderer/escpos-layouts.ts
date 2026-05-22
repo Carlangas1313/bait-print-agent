@@ -323,11 +323,17 @@ async function printLogoIfEnabled(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
-  // Toggle del usuario: solo imprimimos si explicitamente esta on. Si
-  // viene undefined (RPC pre-mig 058), aplica un default razonable que
-  // es: imprimir SI hay logo configurado. Decision: respetar el toggle
-  // estricto — si el dueño no eligio activarlo, no imprimir.
-  if (payload.print_options?.showLogo !== true) return;
+  // Default ON: si el dueño subió un logo (print_logo_path) y NO desactivó
+  // explícitamente el toggle, imprimimos. Solo se skipa cuando
+  // `showLogo === false` (opt-out explícito).
+  //
+  // Bug original (Carlos 2026-05-22): la lógica anterior exigía
+  // `showLogo === true`. Si el dueño subía el logo en /settings pero no
+  // visitaba /settings/print-templates para guardar print_options, llegaba
+  // `print_options: {}` con showLogo=undefined → logo NUNCA se imprimía.
+  // Fix: respetar el opt-in del upload como default y dejar el toggle
+  // únicamente como opt-out.
+  if (payload.print_options?.showLogo === false) return;
 
   const { print_logo_path, print_logo_hash } = payload.restaurant;
   if (!print_logo_path || !print_logo_hash) return;
