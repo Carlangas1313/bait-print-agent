@@ -385,23 +385,11 @@ function resolveDestination(payload: KitchenJobPayload): string {
   return 'VENTA DIRECTA';
 }
 
-/**
- * Imprime un item de cocina con modificadores y nota indentados.
- * Modifiers van con guion, notas entre corchetes.
- */
-function printKitchenItem(tp: Printer, item: KitchenJobItem): void {
-  tp.bold(true);
-  tp.println(`${item.quantity}x ${item.name}`);
-  tp.bold(false);
-
-  for (const mod of item.modifiers) {
-    tp.println(`   - ${mod.name}`);
-  }
-
-  if (item.note && item.note.trim().length > 0) {
-    tp.println(`   [${item.note.trim()}]`);
-  }
-}
+// printKitchenItem (sin toggles) fue retirado en Task 4.8 — los unicos dos
+// callers eran kitchen_order/cancel y ambos inlinan su propia logica:
+//   - kitchen_order usa printKitchenItemWithToggles (definida abajo).
+//   - kitchen_cancel inlinea el item con prefijo "[X]" — quiere DIFFERENT
+//     formatting (no es un mero subset del kitchen_order).
 
 // ====================================================================
 // Layouts publicos
@@ -428,8 +416,27 @@ function renderKitchenOrderClassic(
 ): void {
   const station = resolveStationLabel(jobType, payload.printer_name, payload.area_name);
   const destination = resolveDestination(payload);
-  const waiter = payload.waiter_name?.trim() || '-';
   const time = formatTime(payload.opened_at);
+
+  // Toggles del print_options con defaults rich del Anexo C del spec.
+  // Si vienen undefined (RPC pre-mig 058), aplican estos defaults.
+  // Casteamos a KitchenOrderOptions sabiendo que el dispatcher rutea ambos
+  // kitchen_order/cancel a este mismo metodo; el dispatcher kitchen_cancel
+  // tiene su propia funcion y sus propios toggles.
+  const opts = (payload.print_options ?? {}) as {
+    showOpenTime?: boolean;
+    showHighlightedNotes?: boolean;
+    showGiftMark?: boolean;
+    showPrices?: boolean;
+    showWaiter?: boolean;
+    showGuests?: boolean;
+  };
+  const showOpenTime = opts.showOpenTime ?? true;
+  const showHighlightedNotes = opts.showHighlightedNotes ?? true;
+  const showGiftMark = opts.showGiftMark ?? true;
+  const showPrices = opts.showPrices ?? false; // default off para cocina
+  const showWaiter = opts.showWaiter ?? true;
+  const showGuests = opts.showGuests ?? true;
 
   // Header XL en 2 lineas: estacion arriba, destino abajo.
   tp.alignCenter();
@@ -440,22 +447,55 @@ function renderKitchenOrderClassic(
   tp.setTextNormal();
   tp.bold(false);
 
-  // Subtitle: mozo · hora · comensales
-  tp.println(`Mesero: ${waiter} · ${time}`);
-  tp.println(`Comensales: ${payload.guests}`);
+  // Subtitle line 1: hora (siempre) + "Hace X min" si showOpenTime
+  const headerLineParts: string[] = [time];
+  if (showOpenTime) {
+    const elapsedMin = minutesSinceOpened(payload.opened_at);
+    if (elapsedMin != null) {
+      headerLineParts.push(`Hace ${elapsedMin} min`);
+    }
+  }
+
+  // Mesero opcional via toggle
+  if (showWaiter) {
+    const waiter = payload.waiter_name?.trim() || '-';
+    headerLineParts.unshift(`Mesero: ${waiter}`);
+  }
+
+  if (headerLineParts.length > 0) {
+    tp.println(headerLineParts.join(' · '));
+  }
+
+  // Comensales opcional via toggle
+  if (showGuests) {
+    tp.println(`Comensales: ${payload.guests}`);
+  }
+
   tp.alignLeft();
   tp.drawLine();
   tp.newLine();
 
-  // Items
+  // Items con toggles aplicados.
   for (const item of payload.items) {
-    printKitchenItem(tp, item);
+    printKitchenItemWithToggles(tp, item, {
+      showHighlightedNotes,
+      showGiftMark,
+      showPrices,
+    });
   }
 
-  // Nota del cliente
+  // Nota del cliente (siempre — es parte del payload, no de los items)
   if (payload.customer_note && payload.customer_note.trim().length > 0) {
     tp.drawLine();
-    tp.println(`Notas mesa: ${payload.customer_note.trim()}`);
+    if (showHighlightedNotes) {
+      tp.bold(true);
+      tp.invert(true);
+      tp.println(` Notas mesa: ${payload.customer_note.trim()} `);
+      tp.invert(false);
+      tp.bold(false);
+    } else {
+      tp.println(`Notas mesa: ${payload.customer_note.trim()}`);
+    }
   }
 
   // Total items destacado (suma de quantities)
@@ -469,6 +509,71 @@ function renderKitchenOrderClassic(
   tp.bold(false);
   tp.alignLeft();
   tp.newLine();
+}
+
+/**
+ * Devuelve los minutos transcurridos desde `opened_at` (ISO string) hasta
+ * ahora. Util para el toggle `showOpenTime` ("Hace X min"). Si el ISO es
+ * invalido o cae en el futuro, retorna null.
+ */
+function minutesSinceOpened(isoString: string): number | null {
+  const opened = new Date(isoString);
+  if (Number.isNaN(opened.getTime())) return null;
+  const diffMs = Date.now() - opened.getTime();
+  if (diffMs < 0) return null;
+  return Math.floor(diffMs / 60_000);
+}
+
+/**
+ * Variante de `printKitchenItem` que aplica los toggles del print_options.
+ * El original (sin toggles) queda como compat para callers internos —
+ * aunque hoy solo lo usa kitchen_cancel.
+ */
+function printKitchenItemWithToggles(
+  tp: Printer,
+  item: KitchenJobItem,
+  opts: {
+    showHighlightedNotes: boolean;
+    showGiftMark: boolean;
+    showPrices: boolean;
+  }
+): void {
+  tp.bold(true);
+  // Si showPrices, embeber el precio (subtotal seria modifier sum + base —
+  // no esta en KitchenJobItem). Por ahora KitchenJobItem solo trae name +
+  // qty + modifiers (priceDelta). Skipping showPrices implementation full
+  // hasta que la RPC mande el subtotal del item al payload de cocina.
+  tp.println(`${item.quantity}x ${item.name}`);
+  tp.bold(false);
+
+  // ★ CORTESÍA si is_gift y showGiftMark
+  if (opts.showGiftMark && item.is_gift) {
+    tp.bold(true);
+    tp.println('   ★ CORTESÍA');
+    tp.bold(false);
+  }
+
+  for (const mod of item.modifiers) {
+    if (opts.showPrices && mod.priceDelta !== 0) {
+      // Si showPrices y el modifier tiene delta, mostrar el delta
+      const fmt = formatCLP(mod.priceDelta).replace('$ ', '');
+      tp.println(`   - ${mod.name} (${mod.priceDelta > 0 ? '+' : ''}${fmt})`);
+    } else {
+      tp.println(`   - ${mod.name}`);
+    }
+  }
+
+  if (item.note && item.note.trim().length > 0) {
+    if (opts.showHighlightedNotes) {
+      tp.bold(true);
+      tp.invert(true);
+      tp.println(`   [${item.note.trim()}]`);
+      tp.invert(false);
+      tp.bold(false);
+    } else {
+      tp.println(`   [${item.note.trim()}]`);
+    }
+  }
 }
 
 /**
