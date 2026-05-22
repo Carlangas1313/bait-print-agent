@@ -102,6 +102,21 @@ export type KitchenJobPayload = {
   items: KitchenJobItem[];
   area_name: string | null;
   /**
+   * Nombre de la impresora física destino (mig 050+056 lo setea en
+   * el payload). El header del ticket usa este valor con preferencia
+   * sobre area_name cuando esta presente — en areas con multiples
+   * estaciones (ej. "Cocina" con Caliente/Fria/Pasta), el operador
+   * necesita saber QUE estación específica recibió la copia.
+   * Backwards compat: payloads viejos pre-mig 050 no traen este campo.
+   */
+  printer_name?: string | null;
+  /**
+   * Flag emitido por la RPC cuando el job es el consolidado del primary
+   * del area (merge de todos los items del area). UI puede mostrar un
+   * sello visual "COORDINACION" o similar.
+   */
+  is_consolidated?: boolean;
+  /**
    * Slice del jsonb `restaurants.print_options.kitchen_order` (o kitchen_cancel
    * cuando el job_type=='kitchen_cancel'). Opcional para backwards compat: si
    * llega undefined, el renderer aplica defaults (style='classic', toggles

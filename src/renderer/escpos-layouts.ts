@@ -136,6 +136,51 @@ function printAmountRow(
  *
  * Usa `tp.leftRight` pero con qty embebido en el lado izquierdo para que el
  * monto quede pegado a la derecha (mas legible que columnas separadas).
+ *
+ * --------------------------------------------------------------------
+ * BUG REPORTADO (Carlos, 2026-05-22): "items aparecen cargados a la
+ * izquierda en la pre-cuenta y boleta — el monto no se ve a la derecha".
+ *
+ * Estado del diagnostico: PENDIENTE (sin termica fisica disponible en
+ * sesion Phase 4). El renderer YA usa tp.leftRight(), asi que el bug
+ * no es "se olvidaron de alinear a la derecha". Hipotesis a verificar
+ * con tickets reales en Phase 5 (QA con Carlos en La Cocina):
+ *
+ *   - Hipotesis A: formatCLP(...).replace('$ ', '') quita el signo peso
+ *     y el separador de miles. El monto formatted termina mas corto de
+ *     lo esperado ("8000" sale "8.000" pero sin "$ " son 5 chars; con
+ *     "$ " serian 7). leftRight padea con espacios entre left y right;
+ *     si el right es muy corto, el padding crece y visualmente queda
+ *     "el numero pegado a la derecha pero la sensacion es de mucho
+ *     whitespace en el medio". Fix candidato: NO quitar el '$ ' del
+ *     monto (mantener "$ 8.000" como right).
+ *
+ *   - Hipotesis B: items con `note` se imprimen aparte con
+ *     `tp.println(`   [${note}]`)` (ver printKitchenItem, no aplica a
+ *     bill_*, pero si la cocina lo replica en bill, romperia). En el
+ *     renderer actual de bill_*, los items NO tienen note — pero si
+ *     en algun momento se sumara (kitchen + bill comparten KitchenJobItem
+ *     vs BillItem son tipos distintos), revisar este path.
+ *
+ *   - Hipotesis C: tp.leftRight() en double-width no aplica para items
+ *     (estan en width normal), pero el calculo de RIGHT_RESERVE no
+ *     considera bien el caso "monto chico" — si amount="1.000" son 5
+ *     chars + qtyPart="x1" son 2 + 2 espacios = 9 chars reservados a
+ *     la derecha. nameMax = 32 - 9 - 2 = 21. Para "Cazuela" (7 chars)
+ *     queda  "Cazuela x1                1.000" — visualmente OK pero
+ *     muchos espacios en medio. NO es bug funcional.
+ *
+ * TODO Phase 5 (Carlos + termica fisica):
+ *   1. Imprimir 4 items con distintas combinaciones de nombre/monto.
+ *   2. Tomar foto del papel.
+ *   3. Si confirma Hipotesis A: cambiar `replace('$ ', '')` por dejar
+ *      el "$ " intacto. La columna se vera "$ 8.000" en vez de "8.000"
+ *      pero queda mas pegada a la derecha del leftRight.
+ *   4. Si confirma Hipotesis B: poner notas con leftRight tambien o
+ *      como segunda linea indentada uniforme.
+ *   5. Si es solo estetica (Hipotesis C): no aplicar fix, agregar nota
+ *      en docs/PRINTING.md.
+ * --------------------------------------------------------------------
  */
 function printBillItem(tp: Printer, item: BillItem): void {
   const amount = formatCLP(item.subtotal).replace('$ ', '');
