@@ -5,6 +5,14 @@
  * Si esos cambian, hay que mantener este archivo sincronizado.
  */
 
+import type {
+  BillPreviewOptions,
+  BillProformaOptions,
+  KitchenOrderOptions,
+  KitchenCancelOptions,
+  CashCloseOptions,
+} from './types/print-options.js';
+
 export type JobType =
   | 'kitchen_order'
   | 'bar_order'
@@ -73,6 +81,12 @@ export type KitchenJobItem = {
   quantity: number;
   note: string | null;
   modifiers: Array<{ name: string; priceDelta: number }>;
+  /**
+   * Cortesia marcada en POS. Opcional para backwards compat con RPCs pre-mig 058.
+   * Cuando true, el renderer imprime "★ CORTESÍA" en una linea aparte (si el
+   * toggle `showGiftMark` de print_options.kitchen_order esta activo).
+   */
+  is_gift?: boolean | null;
 };
 
 export type KitchenJobPayload = {
@@ -87,6 +101,21 @@ export type KitchenJobPayload = {
   waiter_name?: string | null;
   items: KitchenJobItem[];
   area_name: string | null;
+  /**
+   * Slice del jsonb `restaurants.print_options.kitchen_order` (o kitchen_cancel
+   * cuando el job_type=='kitchen_cancel'). Opcional para backwards compat: si
+   * llega undefined, el renderer aplica defaults (style='classic', toggles
+   * con sus defaults rich del Anexo C del spec).
+   */
+  print_options?: KitchenOrderOptions | KitchenCancelOptions;
+  /**
+   * Datos del local. Phase 1 (mig 058) lo agrego al payload de kitchen_order
+   * para que el agente pueda renderizar logo/vineta/slogan en comandas (toggles
+   * permitidos via print_options.kitchen_order.showLogo, etc en versiones futuras).
+   *
+   * Pre-mig 058: NULL/undefined. El renderer skipa header con local en ese caso.
+   */
+  restaurant?: RestaurantPrintInfo;
 };
 
 /**
@@ -114,6 +143,17 @@ export type BillPaymentInfo = {
  * Datos del local (header + footer de boletas/precuentas). Los 3 campos
  * print_* vienen de mig 051 y son opcionales — si el restaurante no los
  * configuro, los renderers caen al default ("Gracias por su preferencia").
+ *
+ * Campos agregados en mig 058 (Phase 1 del feature "Editor de Imprimibles"):
+ *  - print_logo_path: path interno en Storage (bucket privado restaurant-logos),
+ *    ej '{restaurant_id}/{sha256_first12}-thermal.png'. NULL = sin logo.
+ *  - print_logo_hash: sha256 truncado (12 chars) extraido del path, usado por
+ *    el cache local del agente (~/.bait-print-agent/cache/logos/{hash}.png).
+ *  - print_ornament_char: 1 caracter CP437-safe para vinetas en separadores
+ *    (♥ ♦ ● ○ ■ ▲ ►). NULL = separadores planos sin vineta.
+ *  - slogan: max 40 chars, usado por el style 'brand' bajo el nombre del local.
+ *
+ * Todos opcionales para mantener backwards compat con RPCs pre-mig 058.
  */
 export type RestaurantPrintInfo = {
   name: string;
@@ -123,6 +163,10 @@ export type RestaurantPrintInfo = {
   print_qr_url?: string | null;
   print_qr_label?: string | null;
   print_footer_phrase?: string | null;
+  print_logo_path?: string | null;
+  print_logo_hash?: string | null;
+  print_ornament_char?: string | null;
+  slogan?: string | null;
 };
 
 /**
@@ -158,6 +202,11 @@ export type BillPreviewPayload = {
   suggested_tip_amount: number;
   total_with_suggested_tip: number;
   restaurant: RestaurantPrintInfo;
+  /**
+   * Slice del jsonb `restaurants.print_options.bill_preview` (mig 058).
+   * Opcional para backwards compat. Defaults aplicados en el renderer.
+   */
+  print_options?: BillPreviewOptions;
 };
 
 /**
@@ -185,6 +234,11 @@ export type BillProformaPayload = {
    */
   payment?: BillPaymentInfo | null;
   restaurant: RestaurantPrintInfo;
+  /**
+   * Slice del jsonb `restaurants.print_options.bill_proforma` (mig 058).
+   * Opcional para backwards compat. Defaults aplicados en el renderer.
+   */
+  print_options?: BillProformaOptions;
 };
 
 export type CashClosePayload = {
@@ -206,6 +260,19 @@ export type CashClosePayload = {
   order_count: number;
   notes?: string | null;
   location_name?: string | null;
+  /**
+   * Datos del local. Phase 1 (mig 058) lo agrego al payload de cash_close para
+   * unificar el header con bill_preview/proforma (logo, vineta, slogan).
+   *
+   * Opcional para backwards compat con cash_close pre-mig 058 (mig 050 no lo
+   * tenia). Si viene undefined el renderer construye un header generico.
+   */
+  restaurant?: RestaurantPrintInfo;
+  /**
+   * Slice del jsonb `restaurants.print_options.cash_close` (mig 058).
+   * Opcional para backwards compat. Defaults aplicados en el renderer.
+   */
+  print_options?: CashCloseOptions;
 };
 
 // ====================================================================
