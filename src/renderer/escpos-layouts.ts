@@ -589,8 +589,15 @@ function renderKitchenCancelClassic(
   payload: KitchenJobPayload
 ): void {
   const destination = resolveDestination(payload);
-  const waiter = payload.waiter_name?.trim() || '-';
   const time = formatTime(payload.opened_at);
+
+  // Toggles del KitchenCancelOptions con defaults rich.
+  const opts = (payload.print_options ?? {}) as {
+    showReason?: boolean;
+    showWaiter?: boolean;
+  };
+  const showReason = opts.showReason ?? true;
+  const showWaiter = opts.showWaiter ?? true;
 
   // Header: badge invertido "ANULACION" + destino en doble altura
   tp.alignCenter();
@@ -603,7 +610,13 @@ function renderKitchenCancelClassic(
   tp.setTextNormal();
   tp.bold(false);
 
-  tp.println(`Mesero: ${waiter} · ${time}`);
+  // Subtitle: mesero (opcional) + hora
+  if (showWaiter) {
+    const waiter = payload.waiter_name?.trim() || '-';
+    tp.println(`Mesero: ${waiter} · ${time}`);
+  } else {
+    tp.println(time);
+  }
   tp.alignLeft();
   tp.drawLine();
   tp.newLine();
@@ -620,7 +633,8 @@ function renderKitchenCancelClassic(
     }
   }
 
-  if (payload.customer_note && payload.customer_note.trim().length > 0) {
+  // Motivo (customer_note) — solo si showReason
+  if (showReason && payload.customer_note && payload.customer_note.trim().length > 0) {
     tp.drawLine();
     tp.println(`Motivo: ${payload.customer_note.trim()}`);
   }
@@ -871,7 +885,35 @@ function renderCashCloseClassic(
   tp: Printer,
   payload: CashClosePayload
 ): void {
-  // Header XL
+  // Toggles de CashCloseOptions con defaults rich.
+  const opts = (payload.print_options ?? {}) as {
+    showHighlightedDiff?: boolean;
+    showMethodBreakdown?: boolean;
+  };
+  const showHighlightedDiff = opts.showHighlightedDiff ?? true;
+  const showMethodBreakdown = opts.showMethodBreakdown ?? true;
+
+  // Header: usa restaurant (mig 058+) si esta disponible para incluir logo
+  // y ornament. Si no, fallback al header generico de cash close.
+  if (payload.restaurant) {
+    // Phase 1 (mig 058) suma restaurant al payload de cash_close. Si esta,
+    // usamos el header rich del local (nombre + direccion + slogan + ornament).
+    // Logo: no llamamos a printLogoIfEnabled porque cash_close hoy no tiene
+    // showLogo en sus toggles — si en el futuro se agrega, sumar la llamada
+    // aca con un toggle especifico.
+    printRestaurantHeader(tp, payload.restaurant);
+
+    const slogan = payload.restaurant.slogan?.trim();
+    if (slogan && slogan.length > 0) {
+      tp.alignCenter();
+      tp.println(`"${slogan}"`);
+      tp.alignLeft();
+    }
+
+    ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
+  }
+
+  // Header XL del cierre
   tp.alignCenter();
   tp.bold(true);
   tp.setTextDoubleHeight();
@@ -893,36 +935,55 @@ function renderCashCloseClassic(
   tp.drawLine();
   tp.newLine();
 
-  // Ventas totales + desglose
+  // Ventas totales (siempre)
   tp.bold(true);
   printAmountRow(tp, 'Ventas totales', payload.total_sales);
   tp.bold(false);
-  printAmountRow(tp, 'Efectivo', payload.total_cash, true);
-  printAmountRow(tp, 'Tarjeta MP', payload.total_card_mp, true);
-  printAmountRow(tp, 'Otras tarjetas', payload.total_card_other, true);
-  printAmountRow(tp, 'Transferencia', payload.total_transfer, true);
-  tp.newLine();
 
-  // Propinas + devoluciones + comandas
+  // Desglose por metodo (toggle showMethodBreakdown)
+  if (showMethodBreakdown) {
+    printAmountRow(tp, 'Efectivo', payload.total_cash, true);
+    printAmountRow(tp, 'Tarjeta MP', payload.total_card_mp, true);
+    printAmountRow(tp, 'Otras tarjetas', payload.total_card_other, true);
+    printAmountRow(tp, 'Transferencia', payload.total_transfer, true);
+    tp.newLine();
+  }
+
+  // Propinas + devoluciones + comandas (siempre)
   printAmountRow(tp, 'Propinas', payload.total_tips);
   printAmountRow(tp, 'Devoluciones', payload.total_refunds);
   tp.leftRight('Comandas totales:', String(payload.order_count));
   tp.newLine();
 
-  // Caja esperada vs declarada
+  // Caja esperada vs declarada (siempre)
   tp.drawLine();
   printAmountRow(tp, 'Efectivo esperado', payload.expected_cash);
   printAmountRow(tp, 'Efectivo declarado', payload.closing_cash);
 
-  // Diferencia destacada
-  tp.bold(true);
-  printAmountRow(tp, 'DIFERENCIA', payload.difference);
-  tp.bold(false);
+  // Diferencia: si showHighlightedDiff, en bold + invert (sello visual fuerte).
+  // Si OFF, solo bold (suave).
+  if (showHighlightedDiff) {
+    tp.bold(true);
+    tp.invert(true);
+    printAmountRow(tp, ' DIFERENCIA ', payload.difference);
+    tp.invert(false);
+    tp.bold(false);
+  } else {
+    tp.bold(true);
+    printAmountRow(tp, 'DIFERENCIA', payload.difference);
+    tp.bold(false);
+  }
 
   // Notas
   if (payload.notes && payload.notes.trim().length > 0) {
     tp.drawLine();
     tp.println(`Notas: ${payload.notes.trim()}`);
+  }
+
+  // Si tenemos restaurant, cerrar con ornament + frase del footer.
+  if (payload.restaurant) {
+    ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
+    printBillFooter(tp, payload.restaurant);
   }
 
   tp.drawLine();
