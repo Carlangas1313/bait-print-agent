@@ -25,6 +25,7 @@
 import {
   printer as ThermalPrinter,
 } from 'node-thermal-printer';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   type KitchenJobPayload,
   type KitchenJobItem,
@@ -35,7 +36,9 @@ import {
   type BillPaymentInfo,
   type RestaurantPrintInfo,
 } from '../types.js';
+import type { Logger } from '../logger.js';
 import { formatCLP, formatTime, formatDateTime } from './format.js';
+import { getLogoPath } from './logo-cache.js';
 
 /**
  * Tipo del printer ya instanciado por el transport. Usamos el tipo runtime
@@ -236,6 +239,114 @@ function printXLTotal(tp: Printer, label: string, amount: number): void {
   tp.alignLeft();
 }
 
+/**
+ * Set de chars CP437-safe permitidos para `print_ornament_char`. La mayoria
+ * de termicas Rongta 58mm renderizan estos sin reemplazar por '?'. Ver D6
+ * del spec (`docs/superpowers/specs/2026-05-22-print-templates-editor-design.md`).
+ *
+ * Si el dueño elige un char fuera de este set (UI debe filtrarlo, pero
+ * defensivo aca tambien), `ornamentSep` reemplaza por '*' silenciosamente.
+ */
+const CP437_SAFE_ORNAMENTS = ['♥', '♦', '●', '○', '■', '▲', '►'] as const;
+type Cp437Ornament = (typeof CP437_SAFE_ORNAMENTS)[number];
+
+function isCp437SafeOrnament(char: string): char is Cp437Ornament {
+  return (CP437_SAFE_ORNAMENTS as readonly string[]).includes(char);
+}
+
+/**
+ * Imprime un separador horizontal de exactamente 32 chars. Si `char` es
+ * truthy y CP437-safe, lo embebe centrado: `'='.repeat(14) + ' ' + char + ' '
+ * + '='.repeat(15)` = 32 chars. Si `char` no es CP437-safe, reemplaza por '*'
+ * (fallback defensivo, D6). Si `char` es null/undefined/'', imprime un linea
+ * plana de 32 '='.
+ *
+ * Por que `ESCPOS_WIDTH = 32` constante: el ancho del papel del agente es
+ * fijo (58mm). Si en el futuro se soporta 80mm, esta funcion necesita conocer
+ * el width — pasarlo como parametro o leer de tp.getWidth().
+ */
+function ornamentSep(tp: Printer, char: string | null | undefined): void {
+  if (!char || char.length === 0) {
+    tp.println('='.repeat(ESCPOS_WIDTH));
+    return;
+  }
+
+  // Fallback CP437: si no esta en el set permitido, usar '*'. No tiramos
+  // error para no romper el ticket completo por un char malo.
+  const safe = isCp437SafeOrnament(char) ? char : '*';
+  // 14 + ' ' + 1 (char) + ' ' + 15 = 32 chars. La asimetria (14 vs 15) es
+  // para que el char quede en la posicion 15-16 visualmente centrado.
+  tp.println('='.repeat(14) + ' ' + safe + ' ' + '='.repeat(15));
+}
+
+/**
+ * Si el restaurant tiene logo configurado Y el print_options activo lo
+ * pide (`showLogo: true`), descarga (cache + signed URL) y lo imprime
+ * centrado. Si algo falla (signed URL expirada, fetch fail, printer no
+ * soporta printImage), loguea warning y skipa — el ticket sigue saliendo
+ * sin logo.
+ *
+ * `print_options` con `showLogo` opcional: cubre BillPreviewOptions,
+ * BillProformaOptions y casos futuros donde sumemos `showLogo` a comanda.
+ * Si el `print_options` viene undefined o el toggle es false, retorna
+ * sin hacer nada.
+ *
+ * NOTE: la firma del helper es async. El caller (renderBillPreviewEscPos,
+ * etc) debe awaitearlo. PopulatePrinter desde v0.9.0 acepta retorno
+ * Promise<void>.
+ */
+async function printLogoIfEnabled(
+  tp: Printer,
+  payload: {
+    restaurant: RestaurantPrintInfo;
+    print_options?: { showLogo?: boolean };
+  },
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
+  // Toggle del usuario: solo imprimimos si explicitamente esta on. Si
+  // viene undefined (RPC pre-mig 058), aplica un default razonable que
+  // es: imprimir SI hay logo configurado. Decision: respetar el toggle
+  // estricto — si el dueño no eligio activarlo, no imprimir.
+  if (payload.print_options?.showLogo !== true) return;
+
+  const { print_logo_path, print_logo_hash } = payload.restaurant;
+  if (!print_logo_path || !print_logo_hash) return;
+
+  if (!supabase) {
+    logger.warn(
+      { restaurantName: payload.restaurant.name },
+      'printLogoIfEnabled: sin supabase client, skipando logo'
+    );
+    return;
+  }
+
+  try {
+    const localPath = await getLogoPath(print_logo_path, print_logo_hash, supabase);
+    if (!localPath) return; // path/hash nulos en runtime (no deberia llegar aca)
+
+    tp.alignCenter();
+    // node-thermal-printer printImage es async. La firma del runtime acepta
+    // path local a un PNG (idealmente 1-bit dithered 384px ancho como guarda
+    // el pipeline de bait-pos).
+    await tp.printImage(localPath);
+    tp.alignLeft();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.warn(
+      { restaurantName: payload.restaurant.name, error: msg },
+      `printLogoIfEnabled fallo: ${msg} — sigo sin logo`
+    );
+    // Intentar alinear de nuevo a izquierda por si la falla dejo el estado
+    // ambiguo (defensive).
+    try {
+      tp.alignLeft();
+    } catch {
+      // ignorar
+    }
+  }
+}
+
 // ====================================================================
 // Resolvers compartidos
 // ====================================================================
@@ -422,12 +533,28 @@ function renderKitchenCancelClassic(
  * Dispatcher publico abajo elige entre 4 styles (classic/minimal/brand/thermal_pro)
  * segun `payload.print_options?.style`. Si no viene, default 'classic'.
  */
-function renderBillPreviewClassic(
+async function renderBillPreviewClassic(
   tp: Printer,
-  payload: BillPreviewPayload
-): void {
-  // Header del local
+  payload: BillPreviewPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
+  // Logo si esta activo (D4 + D5 del spec). Si falla, sigue sin logo.
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  // Header del local (nombre + direccion + comuna/fono).
   printRestaurantHeader(tp, payload.restaurant);
+
+  // Slogan si esta seteado (mig 058).
+  const slogan = payload.restaurant.slogan?.trim();
+  if (slogan && slogan.length > 0) {
+    tp.alignCenter();
+    tp.println(`"${slogan}"`);
+    tp.alignLeft();
+  }
+
+  // Separador con vineta CP437 (sobreescribe el drawLine() del header).
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
 
   // Badge PRE-CUENTA + numero de orden
   printBadge(tp, `PRE-CUENTA #${payload.order_number}`);
@@ -484,6 +611,9 @@ function renderBillPreviewClassic(
   tp.alignLeft();
   tp.newLine();
 
+  // Separador con vineta antes del footer
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
+
   // Footer (QR opcional + frase custom)
   printBillFooter(tp, payload.restaurant);
   tp.newLine();
@@ -497,12 +627,28 @@ function renderBillPreviewClassic(
  * NOTE (Task 4.4 refactor v0.9.0): renombrada a `renderBillProformaClassic`.
  * Dispatcher publico abajo.
  */
-function renderBillProformaClassic(
+async function renderBillProformaClassic(
   tp: Printer,
-  payload: BillProformaPayload
-): void {
-  // Header del local
+  payload: BillProformaPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
+  // Logo si esta activo (D4 + D5 del spec). Si falla, sigue sin logo.
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  // Header del local (nombre + direccion + comuna/fono).
   printRestaurantHeader(tp, payload.restaurant);
+
+  // Slogan si esta seteado (mig 058).
+  const slogan = payload.restaurant.slogan?.trim();
+  if (slogan && slogan.length > 0) {
+    tp.alignCenter();
+    tp.println(`"${slogan}"`);
+    tp.alignLeft();
+  }
+
+  // Separador con vineta CP437.
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
 
   // Badge BOLETA + numero
   printBadge(tp, `BOLETA #${payload.order_number}`);
@@ -565,6 +711,9 @@ function renderBillProformaClassic(
   tp.println('aparte si corresponde.');
   tp.alignLeft();
   tp.newLine();
+
+  // Separador con vineta antes del footer.
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
 
   // Footer (QR opcional + frase custom)
   printBillFooter(tp, payload.restaurant);
@@ -694,43 +843,51 @@ function renderCashCloseClassic(
  *
  * Defaults: si payload.print_options o payload.print_options.style vienen
  * undefined (RPC pre-mig 058), aplica style='classic'.
+ *
+ * Async porque el style 'brand' (y eventualmente otros) descarga el logo
+ * via printLogoIfEnabled. PopulatePrinter desde v0.9.0 acepta retorno
+ * Promise<void> — el transport awaitea.
  */
-export function renderBillPreviewEscPos(
+export async function renderBillPreviewEscPos(
   tp: Printer,
-  payload: BillPreviewPayload
-): void {
+  payload: BillPreviewPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
   const style = payload.print_options?.style ?? 'classic';
   switch (style) {
     case 'minimal':
-      return renderBillPreviewMinimal(tp, payload);
+      return renderBillPreviewMinimal(tp, payload, supabase, logger);
     case 'brand':
-      return renderBillPreviewBrand(tp, payload);
+      return renderBillPreviewBrand(tp, payload, supabase, logger);
     case 'thermal_pro':
-      return renderBillPreviewThermalPro(tp, payload);
+      return renderBillPreviewThermalPro(tp, payload, supabase, logger);
     case 'classic':
     default:
-      return renderBillPreviewClassic(tp, payload);
+      return renderBillPreviewClassic(tp, payload, supabase, logger);
   }
 }
 
 /**
  * Dispatcher publico para bill_proforma. Misma logica que bill_preview.
  */
-export function renderBillProformaEscPos(
+export async function renderBillProformaEscPos(
   tp: Printer,
-  payload: BillProformaPayload
-): void {
+  payload: BillProformaPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
   const style = payload.print_options?.style ?? 'classic';
   switch (style) {
     case 'minimal':
-      return renderBillProformaMinimal(tp, payload);
+      return renderBillProformaMinimal(tp, payload, supabase, logger);
     case 'brand':
-      return renderBillProformaBrand(tp, payload);
+      return renderBillProformaBrand(tp, payload, supabase, logger);
     case 'thermal_pro':
-      return renderBillProformaThermalPro(tp, payload);
+      return renderBillProformaThermalPro(tp, payload, supabase, logger);
     case 'classic':
     default:
-      return renderBillProformaClassic(tp, payload);
+      return renderBillProformaClassic(tp, payload, supabase, logger);
   }
 }
 
@@ -739,12 +896,18 @@ export function renderBillProformaEscPos(
  * el switch por style esta presente pero por ahora todos los styles caen
  * al mismo render. Los toggles del payload.print_options se aplican DENTRO
  * de renderKitchenOrderClassic (Task 4.8).
+ *
+ * Recibe supabase + logger por consistencia con bill_*. Hoy no se usan
+ * (kitchen no imprime logo) pero permite enchufarlo en el futuro sin
+ * tocar la firma de buildPopulate.
  */
-export function renderKitchenOrderEscPos(
+export async function renderKitchenOrderEscPos(
   tp: Printer,
   payload: KitchenJobPayload,
-  jobType: 'kitchen_order' | 'bar_order' = 'kitchen_order'
-): void {
+  jobType: 'kitchen_order' | 'bar_order' = 'kitchen_order',
+  _supabase?: SupabaseClient | undefined,
+  _logger?: Logger
+): Promise<void> {
   // Por disenio: kitchen_order no tiene styles alternativos (los tickets
   // operacionales son siempre classic). Si en el futuro se quieren styles,
   // sumar aca el switch.
@@ -752,13 +915,14 @@ export function renderKitchenOrderEscPos(
 }
 
 /**
- * Dispatcher publico para kitchen_cancel. Mismo argumento que kitchen_order:
- * un solo style por ahora.
+ * Dispatcher publico para kitchen_cancel.
  */
-export function renderKitchenCancelEscPos(
+export async function renderKitchenCancelEscPos(
   tp: Printer,
-  payload: KitchenJobPayload
-): void {
+  payload: KitchenJobPayload,
+  _supabase?: SupabaseClient | undefined,
+  _logger?: Logger
+): Promise<void> {
   return renderKitchenCancelClassic(tp, payload);
 }
 
@@ -767,10 +931,12 @@ export function renderKitchenCancelEscPos(
  * (showHighlightedDiff, showMethodBreakdown) se aplican dentro del Classic
  * (Task 4.9).
  */
-export function renderCashCloseEscPos(
+export async function renderCashCloseEscPos(
   tp: Printer,
-  payload: CashClosePayload
-): void {
+  payload: CashClosePayload,
+  _supabase?: SupabaseClient | undefined,
+  _logger?: Logger
+): Promise<void> {
   return renderCashCloseClassic(tp, payload);
 }
 
@@ -784,32 +950,62 @@ export function renderCashCloseEscPos(
 // son indistinguibles de "classic" hasta que sus implementaciones lleguen.
 // ====================================================================
 
-function renderBillPreviewMinimal(tp: Printer, payload: BillPreviewPayload): void {
+async function renderBillPreviewMinimal(
+  tp: Printer,
+  payload: BillPreviewPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
   // STUB: fallback a classic hasta Task 4.6.
-  return renderBillPreviewClassic(tp, payload);
+  return renderBillPreviewClassic(tp, payload, supabase, logger);
 }
 
-function renderBillPreviewBrand(tp: Printer, payload: BillPreviewPayload): void {
+async function renderBillPreviewBrand(
+  tp: Printer,
+  payload: BillPreviewPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
   // STUB: fallback a classic hasta Task 4.6.
-  return renderBillPreviewClassic(tp, payload);
+  return renderBillPreviewClassic(tp, payload, supabase, logger);
 }
 
-function renderBillPreviewThermalPro(tp: Printer, payload: BillPreviewPayload): void {
+async function renderBillPreviewThermalPro(
+  tp: Printer,
+  payload: BillPreviewPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
   // STUB: fallback a classic hasta Task 4.6.
-  return renderBillPreviewClassic(tp, payload);
+  return renderBillPreviewClassic(tp, payload, supabase, logger);
 }
 
-function renderBillProformaMinimal(tp: Printer, payload: BillProformaPayload): void {
+async function renderBillProformaMinimal(
+  tp: Printer,
+  payload: BillProformaPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
   // STUB: fallback a classic hasta Task 4.7.
-  return renderBillProformaClassic(tp, payload);
+  return renderBillProformaClassic(tp, payload, supabase, logger);
 }
 
-function renderBillProformaBrand(tp: Printer, payload: BillProformaPayload): void {
+async function renderBillProformaBrand(
+  tp: Printer,
+  payload: BillProformaPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
   // STUB: fallback a classic hasta Task 4.7.
-  return renderBillProformaClassic(tp, payload);
+  return renderBillProformaClassic(tp, payload, supabase, logger);
 }
 
-function renderBillProformaThermalPro(tp: Printer, payload: BillProformaPayload): void {
+async function renderBillProformaThermalPro(
+  tp: Printer,
+  payload: BillProformaPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
   // STUB: fallback a classic hasta Task 4.7.
-  return renderBillProformaClassic(tp, payload);
+  return renderBillProformaClassic(tp, payload, supabase, logger);
 }

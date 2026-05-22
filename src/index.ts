@@ -543,7 +543,8 @@ async function runAgent(): Promise<void> {
       job,
       config.debug_renderer,
       printersCache,
-      logger
+      logger,
+      supabase
     );
     runtimeState.last_job_at = new Date().toISOString();
     return result;

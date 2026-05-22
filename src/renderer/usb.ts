@@ -24,6 +24,7 @@
  */
 
 import type { Logger } from '../logger.js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   type PrintJobRow,
   isKitchenJobPayload,
@@ -87,44 +88,45 @@ function isBoldLine(rawLine: string): boolean {
 function buildPopulate(
   job: PrintJobRow,
   printer: PrinterRow,
-  logger: Logger
+  logger: Logger,
+  supabase: SupabaseClient | undefined
 ): PopulatePrinter {
-  return (tp) => {
+  return async (tp) => {
     let usedEscPosLayout = false;
 
     switch (job.job_type) {
       case 'kitchen_order':
       case 'bar_order': {
         if (isKitchenJobPayload(job.payload)) {
-          renderKitchenOrderEscPos(tp, job.payload, job.job_type);
+          await renderKitchenOrderEscPos(tp, job.payload, job.job_type, supabase, logger);
           usedEscPosLayout = true;
         }
         break;
       }
       case 'kitchen_cancel': {
         if (isKitchenJobPayload(job.payload)) {
-          renderKitchenCancelEscPos(tp, job.payload);
+          await renderKitchenCancelEscPos(tp, job.payload, supabase, logger);
           usedEscPosLayout = true;
         }
         break;
       }
       case 'bill_preview': {
         if (isBillPreviewPayload(job.payload)) {
-          renderBillPreviewEscPos(tp, job.payload);
+          await renderBillPreviewEscPos(tp, job.payload, supabase, logger);
           usedEscPosLayout = true;
         }
         break;
       }
       case 'bill_proforma': {
         if (isBillProformaPayload(job.payload)) {
-          renderBillProformaEscPos(tp, job.payload);
+          await renderBillProformaEscPos(tp, job.payload, supabase, logger);
           usedEscPosLayout = true;
         }
         break;
       }
       case 'cash_close': {
         if (isCashClosePayload(job.payload)) {
-          renderCashCloseEscPos(tp, job.payload);
+          await renderCashCloseEscPos(tp, job.payload, supabase, logger);
           usedEscPosLayout = true;
         }
         break;
@@ -180,7 +182,13 @@ function buildPopulate(
 export async function renderJobToPrinter(
   job: PrintJobRow,
   printer: PrinterRow,
-  logger: Logger
+  logger: Logger,
+  /**
+   * Cliente Supabase autenticado. Threaded down from `dispatchJob`. Si no
+   * viene (caso debug renderer u otros futuros sin sesion), el helper
+   * `printLogoIfEnabled` skipa el logo silenciosamente.
+   */
+  supabase?: SupabaseClient
 ): Promise<void> {
   logger.info(
     {
@@ -196,7 +204,7 @@ export async function renderJobToPrinter(
   const copies = Math.max(1, printer.copies ?? 1);
 
   for (let copy = 1; copy <= copies; copy++) {
-    const populate = buildPopulate(job, printer, logger);
+    const populate = buildPopulate(job, printer, logger, supabase);
     try {
       await sendEscPos(printer, populate, logger);
     } catch (err) {

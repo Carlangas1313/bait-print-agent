@@ -66,11 +66,17 @@ const CONNECT_TIMEOUT_MS = 5_000;
  * contenido del ticket (lineas, bold, beep, cut). El helper ya hizo
  * `tp.clear()` antes de llamarte, asi que arrancas con buffer limpio.
  *
+ * Puede ser sync o async — desde v0.9.0 el callback de bill_preview/proforma
+ * descarga el logo via getLogoPath() (I/O cuando hay cache miss). El helper
+ * awaitea el retorno antes de mandar el buffer.
+ *
  * Tipamos el `tp` como `unknown` y casteamos al consumer para no propagar
  * los typings de node-thermal-printer fuera de transport.ts. En la practica
  * el caller hace `tp as ThermalPrinter` y usa la API completa.
  */
-export type PopulatePrinter = (tp: InstanceType<typeof ThermalPrinter>) => void;
+export type PopulatePrinter = (
+  tp: InstanceType<typeof ThermalPrinter>
+) => void | Promise<void>;
 
 /**
  * Manda un ticket ESC/POS a la impresora segun su `connection_type`.
@@ -131,7 +137,7 @@ async function sendUsbViaSpooler(
     removeSpecialCharacters: false
   });
   tp.clear();
-  populate(tp);
+  await populate(tp);
   const buffer = tp.getBuffer();
 
   // Resolver el QUEUE NAME que Win32 OpenPrinter espera.
@@ -242,7 +248,7 @@ async function sendViaThermalPrinter(
   }
 
   tp.clear();
-  populate(tp);
+  await populate(tp);
 
   try {
     await tp.execute();

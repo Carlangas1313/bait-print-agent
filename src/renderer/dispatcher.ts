@@ -31,6 +31,7 @@ import type { Logger } from '../logger.js';
 import type { DebugRenderer } from '../config.js';
 import type { PrintJobRow, ErrorKind } from '../types.js';
 import type { PrinterRow } from '../printers/registry.js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { pickPrinterForJob } from '../printers/registry.js';
 import { renderJob } from './console.js';
 import { renderJobToVirtual } from './virtual.js';
@@ -135,7 +136,14 @@ export async function dispatchJob(
   job: PrintJobRow,
   debugRenderer: DebugRenderer,
   printers: PrinterRow[],
-  logger: Logger
+  logger: Logger,
+  /**
+   * Cliente Supabase autenticado del agente. Se thread por el flow para que
+   * los renderers v0.9.0+ puedan resolver el logo del restaurant via
+   * `getLogoPath` (signed URL + cache). Opcional: si no viene, el helper
+   * `printLogoIfEnabled` skipa silencionasmente el logo (no rompe).
+   */
+  supabase?: SupabaseClient
 ): Promise<DispatchResult> {
   try {
     // Caso debug: bypass del renderer productivo. Util en dev y para
@@ -175,7 +183,7 @@ export async function dispatchJob(
         }
       };
     }
-    await renderJobToPrinter(job, printer, logger);
+    await renderJobToPrinter(job, printer, logger, supabase);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: classifyError(err) };
