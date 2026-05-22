@@ -247,25 +247,31 @@ function printXLTotal(tp: Printer, label: string, amount: number): void {
 }
 
 /**
- * Set de chars CP437-safe permitidos para `print_ornament_char`. La mayoria
- * de termicas Rongta 58mm renderizan estos sin reemplazar por '?'. Ver D6
- * del spec (`docs/superpowers/specs/2026-05-22-print-templates-editor-design.md`).
+ * Set ASCII 7-bit puro de chars permitidos para `print_ornament_char` (mig 063).
+ * Cualquier termica imprime estos chars fielmente sin necesitar tablas de
+ * caracteres adicionales (CP437/Latin1).
+ *
+ * Historia: hasta v0.9.0 el set era CP437 (♥ ♦ ● ○ ■ ▲ ►). Aunque CP437 los
+ * define, `node-thermal-printer` envia UTF-8 a la termica y esta NO los mapea
+ * a sus bytes CP437 → resultado: `?` o garbage en el papel. Fix pragmatico:
+ * ASCII puro (bytes 0x20-0x7E) que cualquier impresora renderiza.
  *
  * Si el dueño elige un char fuera de este set (UI debe filtrarlo, pero
  * defensivo aca tambien), `ornamentSep` reemplaza por '*' silenciosamente.
  */
-const CP437_SAFE_ORNAMENTS = ['♥', '♦', '●', '○', '■', '▲', '►'] as const;
-type Cp437Ornament = (typeof CP437_SAFE_ORNAMENTS)[number];
+const SAFE_ORNAMENTS = ['*', '+', '-', '=', '#', 'o', 'x', '~', '.', ':'] as const;
+type SafeOrnament = (typeof SAFE_ORNAMENTS)[number];
 
-function isCp437SafeOrnament(char: string): char is Cp437Ornament {
-  return (CP437_SAFE_ORNAMENTS as readonly string[]).includes(char);
+function isSafeOrnament(char: string): char is SafeOrnament {
+  return (SAFE_ORNAMENTS as readonly string[]).includes(char);
 }
 
 /**
  * Imprime un separador horizontal de exactamente `width` chars. Si `char` es
- * truthy y CP437-safe, lo embebe centrado con `=` a ambos lados. Si `char` no
- * es CP437-safe, reemplaza por '*' (fallback defensivo, D6). Si `char` es
- * null/undefined/'', imprime una linea plana de `width` chars `=`.
+ * truthy y ASCII-safe (set definido arriba), lo embebe centrado con `=` a
+ * ambos lados. Si `char` no esta en el set permitido, reemplaza por '*'
+ * (fallback defensivo, D6). Si `char` es null/undefined/'', imprime una linea
+ * plana de `width` chars `=`.
  *
  * Mig 060: width pasado por parametro (32/42/48). Default ESCPOS_WIDTH=32
  * conserva el comportamiento legacy.
@@ -280,9 +286,9 @@ function ornamentSep(
     return;
   }
 
-  // Fallback CP437: si no esta en el set permitido, usar '*'. No tiramos
+  // Fallback ASCII: si no esta en el set permitido, usar '*'. No tiramos
   // error para no romper el ticket completo por un char malo.
-  const safe = isCp437SafeOrnament(char) ? char : '*';
+  const safe = isSafeOrnament(char) ? char : '*';
   // Embebe char centrado: ' char ' (3 chars). El resto se divide en ambos
   // lados con asimetria de 1 char si width es impar (extra `=` a la derecha
   // por convencion, replica el comportamiento legacy 14/15 con width=32).
@@ -688,7 +694,7 @@ async function renderBillPreviewClassic(
     tp.alignLeft();
   }
 
-  // Separador con vineta CP437 (sobreescribe el drawLine() del header).
+  // Separador con vineta ASCII (sobreescribe el drawLine() del header).
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
   // Badge PRE-CUENTA + numero de orden
@@ -785,7 +791,7 @@ async function renderBillProformaClassic(
     tp.alignLeft();
   }
 
-  // Separador con vineta CP437.
+  // Separador con vineta ASCII.
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
   // Badge BOLETA + numero
@@ -1296,11 +1302,13 @@ async function renderBillPreviewBrand(
   // Footer: QR + frase con vinetas
   printBillFooter(tp, payload.restaurant);
 
-  // Frase final destacada con ornament a los lados (si hay ornament).
+  // Frase final destacada con ornament a los lados (si hay ornament safe-ASCII).
+  // Si llega un char legacy CP437 (♥, ♦, etc), fallback a `*` igual que ornamentSep.
   if (ornament) {
+    const safeOrn = isSafeOrnament(ornament) ? ornament : '*';
     tp.alignCenter();
     tp.bold(true);
-    tp.println(`${ornament} ¡Gracias por elegirnos! ${ornament}`);
+    tp.println(`${safeOrn} ¡Gracias por elegirnos! ${safeOrn}`);
     tp.bold(false);
     tp.alignLeft();
   }
@@ -1584,10 +1592,12 @@ async function renderBillProformaBrand(
   ornamentSep(tp, ornament, width);
   printBillFooter(tp, payload.restaurant);
 
+  // Frase final destacada con ornament safe-ASCII (fallback `*` si llega CP437).
   if (ornament) {
+    const safeOrn = isSafeOrnament(ornament) ? ornament : '*';
     tp.alignCenter();
     tp.bold(true);
-    tp.println(`${ornament} ¡Gracias por elegirnos! ${ornament}`);
+    tp.println(`${safeOrn} ¡Gracias por elegirnos! ${safeOrn}`);
     tp.bold(false);
     tp.alignLeft();
   }

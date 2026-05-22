@@ -190,8 +190,10 @@ export type PrinterPayloadInfo = {
  *    ej '{restaurant_id}/{sha256_first12}-thermal.png'. NULL = sin logo.
  *  - print_logo_hash: sha256 truncado (12 chars) extraido del path, usado por
  *    el cache local del agente (~/.bait-print-agent/cache/logos/{hash}.png).
- *  - print_ornament_char: 1 caracter CP437-safe para vinetas en separadores
- *    (♥ ♦ ● ○ ■ ▲ ►). NULL = separadores planos sin vineta.
+ *  - print_ornament_char: 1 caracter ASCII 7-bit para vinetas en separadores
+ *    (* + - = # o x ~ . :). NULL = separadores planos sin vineta. Pre-mig 063
+ *    eran chars CP437 (♥ ♦ ●) pero `node-thermal-printer` los enviaba como
+ *    UTF-8 a la termica y salian como `?`. Fix: ASCII puro siempre imprime.
  *  - slogan: max 40 chars, usado por el style 'brand' bajo el nombre del local.
  *
  * Todos opcionales para mantener backwards compat con RPCs pre-mig 058.
