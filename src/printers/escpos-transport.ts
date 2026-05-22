@@ -48,11 +48,15 @@ import type { PrinterRow } from './registry.js';
 import { sendRawToWindowsPrinter } from './win-raw-print.js';
 
 /**
- * Ancho del papel en chars. Misma constante que console.ts/format.ts.
- * Hoy fijo en 32 (58mm). Cuando sumemos 80mm, leer del `printer_type` o
- * agregar columna `width` a la tabla `printers`.
+ * Default del ancho del papel en chars. Se usa como fallback cuando el caller
+ * no especifica width (ej. test page sin payload, jobs viejos sin
+ * payload.printer en el schema).
+ *
+ * Mig 060 bait-pos: la columna `printers.width_chars` permite 32/42/48. El
+ * caller productivo resuelve el width desde el payload o el PrinterRow y lo
+ * pasa explicitamente; este default solo aplica si no se especifica nada.
  */
-const PRINTER_WIDTH = 32;
+const PRINTER_WIDTH_DEFAULT = 32;
 
 /**
  * Timeout para socket TCP (network) o file (bluetooth) en ms. Misma logica
@@ -84,6 +88,12 @@ export type PopulatePrinter = (
  * El renderer (caller) NO necesita saber si la impresora es USB queue,
  * TCP raw 9100 o COM virtual — solo arma el contenido en el callback.
  *
+ * El `width` (mig 060) es el ancho del papel en chars que se le pasa al
+ * constructor de ThermalPrinter. El caller lo resuelve desde:
+ *   payload.printer.width_chars ?? printer.width_chars ?? 32
+ * Si no se especifica, default 32 (compat con Rongta 58mm que era el
+ * comportamiento previo a mig 060).
+ *
  * Lanza si falla en cualquier paso (connect, send, write). El caller decide
  * el retry path (productivo: el claimAndRun de realtime.ts; test: el handler
  * de /v1/printers/:id/test).
@@ -91,19 +101,20 @@ export type PopulatePrinter = (
 export async function sendEscPos(
   printer: PrinterRow,
   populate: PopulatePrinter,
-  logger: Logger
+  logger: Logger,
+  width: number = PRINTER_WIDTH_DEFAULT
 ): Promise<void> {
   switch (printer.connection_type) {
     case 'usb':
-      await sendUsbViaSpooler(printer, populate, logger);
+      await sendUsbViaSpooler(printer, populate, logger, width);
       return;
 
     case 'network':
-      await sendViaThermalPrinter(printer, populate, logger);
+      await sendViaThermalPrinter(printer, populate, logger, width);
       return;
 
     case 'bluetooth':
-      await sendViaThermalPrinter(printer, populate, logger);
+      await sendViaThermalPrinter(printer, populate, logger, width);
       return;
 
     default:
@@ -127,13 +138,14 @@ export async function sendEscPos(
 async function sendUsbViaSpooler(
   printer: PrinterRow,
   populate: PopulatePrinter,
-  logger: Logger
+  logger: Logger,
+  width: number
 ): Promise<void> {
   const tp = new ThermalPrinter({
     type: PrinterTypes.EPSON,
     interface: '\\\\.\\__bait_buffer_only__',
     characterSet: CharacterSet.PC858_EURO,
-    width: PRINTER_WIDTH,
+    width,
     removeSpecialCharacters: false
   });
   tp.clear();
@@ -219,7 +231,8 @@ function resolveWindowsQueueName(printer: PrinterRow): string | null {
 async function sendViaThermalPrinter(
   printer: PrinterRow,
   populate: PopulatePrinter,
-  logger: Logger
+  logger: Logger,
+  width: number
 ): Promise<void> {
   const interfaceUri = buildInterfaceUri(printer);
 
@@ -227,7 +240,7 @@ async function sendViaThermalPrinter(
     type: PrinterTypes.EPSON,
     interface: interfaceUri,
     characterSet: CharacterSet.PC858_EURO,
-    width: PRINTER_WIDTH,
+    width,
     removeSpecialCharacters: false,
     options: { timeout: CONNECT_TIMEOUT_MS }
   });

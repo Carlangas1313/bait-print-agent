@@ -46,11 +46,42 @@ import {
 } from './escpos-layouts.js';
 
 /**
- * Ancho del papel en chars. Misma constante que console.ts/format.ts.
- * Hoy fijo en 32 (58mm). Si en el futuro hay impresoras 80mm, leerlo del
- * `printer_type` o agregar columna `width` a la tabla `printers`.
+ * Default del ancho del papel en chars cuando NO hay info en el payload
+ * ni en el PrinterRow (ej. test page sintetico). Mig 060 bait-pos suma
+ * `printers.width_chars` y el payload `printer.width_chars` — el resolver
+ * abajo prioriza esos sobre este default.
  */
-const PRINTER_WIDTH = 32;
+const PRINTER_WIDTH_DEFAULT = 32;
+
+/**
+ * Resuelve el ancho del papel en chars en este orden:
+ *   1. `payload.printer.width_chars` (mig 060 RPC enqueue_*)
+ *   2. `printerRow.width_chars` (mig 060 SELECT del registry)
+ *   3. PRINTER_WIDTH_DEFAULT (32)
+ *
+ * Esto es lo que se usa para:
+ *   - Construir ThermalPrinter con `width` correcto (afecta leftRight padding).
+ *   - Pasarlo a los layouts ESC/POS para que los separadores `'='.repeat(W)`
+ *     ocupen el ancho real del papel.
+ */
+function resolvePaperWidth(payload: unknown, printer: PrinterRow): number {
+  const fromPayload =
+    payload &&
+    typeof payload === 'object' &&
+    'printer' in payload &&
+    payload.printer &&
+    typeof payload.printer === 'object' &&
+    'width_chars' in payload.printer
+      ? (payload.printer as { width_chars?: number }).width_chars
+      : undefined;
+  if (typeof fromPayload === 'number' && fromPayload > 0) {
+    return fromPayload;
+  }
+  if (typeof printer.width_chars === 'number' && printer.width_chars > 0) {
+    return printer.width_chars;
+  }
+  return PRINTER_WIDTH_DEFAULT;
+}
 
 /**
  * Lineas que destacamos en negrita: cabeceras tipo "COCINA - MESA 4",
@@ -202,11 +233,15 @@ export async function renderJobToPrinter(
   );
 
   const copies = Math.max(1, printer.copies ?? 1);
+  // Mig 060: resolver el width real del papel para construir ThermalPrinter
+  // con el `width` correcto. Prioridad: payload.printer.width_chars >
+  // printer.width_chars > 32.
+  const width = resolvePaperWidth(job.payload, printer);
 
   for (let copy = 1; copy <= copies; copy++) {
     const populate = buildPopulate(job, printer, logger, supabase);
     try {
-      await sendEscPos(printer, populate, logger);
+      await sendEscPos(printer, populate, logger, width);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(
@@ -221,7 +256,8 @@ export async function renderJobToPrinter(
       printerName: printer.name,
       connectionType: printer.connection_type,
       target: printer.target,
-      copies
+      copies,
+      width
     },
     `Job impreso en ${printer.name} (${printer.connection_type}:${printer.target ?? ''})`
   );
@@ -275,7 +311,11 @@ function discoveredToSyntheticPrinter(
     is_primary: false,
     copies: 1,
     cut_paper: true,
-    beep: false
+    beep: false,
+    // Test page: 32 por default (no sabemos el ancho real del descubrimiento).
+    // Si en el futuro el descubrimiento expone el ancho fisico de la printer,
+    // setearlo aca.
+    width_chars: 32
   };
 }
 
@@ -289,7 +329,7 @@ function buildTestPageLines(
   agentName: string,
   locationName: string | null
 ): string[] {
-  const width = PRINTER_WIDTH;
+  const width = PRINTER_WIDTH_DEFAULT;
   const sep = '='.repeat(width);
   const dash = '-'.repeat(width);
   const now = new Date();

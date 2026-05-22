@@ -47,13 +47,43 @@ import { getLogoPath } from './logo-cache.js';
 type Printer = InstanceType<typeof ThermalPrinter>;
 
 /**
- * Ancho del papel en chars. Mismo valor que el resto del agente (58mm).
- * `tp.leftRight` lee `tp.getWidth()` internamente, asi que mientras el
- * transport instancie el printer con `width: 32`, los layouts funcionan sin
- * pasarle el ancho. Lo dejamos exportado por si un layout quiere paddear
- * a mano (ej: separadores con `=`).
+ * Default del ancho del papel en chars cuando el payload no trae
+ * `printer.width_chars`. `tp.leftRight` lee `tp.getWidth()` internamente, asi
+ * que mientras el transport instancie el printer con el `width` correcto
+ * (mig 060 + payload.printer.width_chars), los layouts funcionan.
+ *
+ * Mig 060 bait-pos: las RPCs enqueue_* suman `payload.printer.width_chars`
+ * (32/42/48). Los renderers leen ese valor con `getPayloadWidth()` y lo usan
+ * para separadores `'='.repeat(W)` y otros sites que padean a mano.
+ *
+ * Si llega un payload pre-mig 060 (sin printer.width_chars), cae a 32 ->
+ * comportamiento legacy (Rongta 58mm).
  */
 export const ESCPOS_WIDTH = 32;
+
+/**
+ * Lee `payload.printer.width_chars` con fallback a ESCPOS_WIDTH (32). Se
+ * usa en TODOS los render*Classic/Minimal/Brand/ThermalPro al inicio para
+ * resolver el ancho real del papel (32 Rongta 58mm, 42 font B, 48 Epson 80mm).
+ *
+ * Acepta payload tipado como union de los 4 payloads concretos. La proyeccion
+ * `as { printer?: { width_chars?: number } }` es defensiva: si llega un
+ * payload pre-mig 060 sin el field, fall back limpio a 32.
+ */
+function getPayloadWidth(payload: unknown): number {
+  if (
+    payload &&
+    typeof payload === 'object' &&
+    'printer' in payload &&
+    payload.printer &&
+    typeof payload.printer === 'object' &&
+    'width_chars' in payload.printer
+  ) {
+    const w = (payload.printer as { width_chars?: number }).width_chars;
+    if (typeof w === 'number' && w > 0) return w;
+  }
+  return ESCPOS_WIDTH;
+}
 
 // ====================================================================
 // Helpers comunes
@@ -185,13 +215,13 @@ function printAmountRow(
  *      en docs/PRINTING.md.
  * --------------------------------------------------------------------
  */
-function printBillItem(tp: Printer, item: BillItem): void {
+function printBillItem(tp: Printer, item: BillItem, width: number = ESCPOS_WIDTH): void {
   const amount = formatCLP(item.subtotal).replace('$ ', '');
   const qtyPart = `x${item.quantity}`;
   // Reserva derecha aproximada: "x99   $999.999" ~ 14 chars. Nombre ocupa
-  // el resto. Truncamos defensivamente para 32 chars (58mm).
+  // el resto. Truncamos defensivamente al width del papel (32/42/48).
   const RIGHT_RESERVE = qtyPart.length + amount.length + 2; // 2 espacios entre nombre y qty
-  const nameMax = Math.max(8, ESCPOS_WIDTH - RIGHT_RESERVE - 2);
+  const nameMax = Math.max(8, width - RIGHT_RESERVE - 2);
   const safeName =
     item.name.length > nameMax ? item.name.slice(0, nameMax - 1) + '.' : item.name;
   tp.leftRight(`${safeName} ${qtyPart}`, amount);
@@ -255,28 +285,34 @@ function isCp437SafeOrnament(char: string): char is Cp437Ornament {
 }
 
 /**
- * Imprime un separador horizontal de exactamente 32 chars. Si `char` es
- * truthy y CP437-safe, lo embebe centrado: `'='.repeat(14) + ' ' + char + ' '
- * + '='.repeat(15)` = 32 chars. Si `char` no es CP437-safe, reemplaza por '*'
- * (fallback defensivo, D6). Si `char` es null/undefined/'', imprime un linea
- * plana de 32 '='.
+ * Imprime un separador horizontal de exactamente `width` chars. Si `char` es
+ * truthy y CP437-safe, lo embebe centrado con `=` a ambos lados. Si `char` no
+ * es CP437-safe, reemplaza por '*' (fallback defensivo, D6). Si `char` es
+ * null/undefined/'', imprime una linea plana de `width` chars `=`.
  *
- * Por que `ESCPOS_WIDTH = 32` constante: el ancho del papel del agente es
- * fijo (58mm). Si en el futuro se soporta 80mm, esta funcion necesita conocer
- * el width — pasarlo como parametro o leer de tp.getWidth().
+ * Mig 060: width pasado por parametro (32/42/48). Default ESCPOS_WIDTH=32
+ * conserva el comportamiento legacy.
  */
-function ornamentSep(tp: Printer, char: string | null | undefined): void {
+function ornamentSep(
+  tp: Printer,
+  char: string | null | undefined,
+  width: number = ESCPOS_WIDTH
+): void {
   if (!char || char.length === 0) {
-    tp.println('='.repeat(ESCPOS_WIDTH));
+    tp.println('='.repeat(width));
     return;
   }
 
   // Fallback CP437: si no esta en el set permitido, usar '*'. No tiramos
   // error para no romper el ticket completo por un char malo.
   const safe = isCp437SafeOrnament(char) ? char : '*';
-  // 14 + ' ' + 1 (char) + ' ' + 15 = 32 chars. La asimetria (14 vs 15) es
-  // para que el char quede en la posicion 15-16 visualmente centrado.
-  tp.println('='.repeat(14) + ' ' + safe + ' ' + '='.repeat(15));
+  // Embebe char centrado: ' char ' (3 chars). El resto se divide en ambos
+  // lados con asimetria de 1 char si width es impar (extra `=` a la derecha
+  // por convencion, replica el comportamiento legacy 14/15 con width=32).
+  const remaining = width - 3; // -1 char, -2 espacios
+  const leftLen = Math.floor(remaining / 2);
+  const rightLen = remaining - leftLen;
+  tp.println('='.repeat(leftLen) + ' ' + safe + ' ' + '='.repeat(rightLen));
 }
 
 /**
@@ -658,6 +694,9 @@ async function renderBillPreviewClassic(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // Mig 060: width real del papel (32/42/48) desde payload.printer.width_chars.
+  const width = getPayloadWidth(payload);
+
   // Logo si esta activo (D4 + D5 del spec). Si falla, sigue sin logo.
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
@@ -673,7 +712,7 @@ async function renderBillPreviewClassic(
   }
 
   // Separador con vineta CP437 (sobreescribe el drawLine() del header).
-  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
   // Badge PRE-CUENTA + numero de orden
   printBadge(tp, `PRE-CUENTA #${payload.order_number}`);
@@ -695,7 +734,7 @@ async function renderBillPreviewClassic(
 
   // Items
   for (const item of payload.items) {
-    printBillItem(tp, item);
+    printBillItem(tp, item, width);
   }
 
   tp.newLine();
@@ -731,7 +770,7 @@ async function renderBillPreviewClassic(
   tp.newLine();
 
   // Separador con vineta antes del footer
-  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
   // Footer (QR opcional + frase custom)
   printBillFooter(tp, payload.restaurant);
@@ -752,6 +791,9 @@ async function renderBillProformaClassic(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // Mig 060: width real del papel.
+  const width = getPayloadWidth(payload);
+
   // Logo si esta activo (D4 + D5 del spec). Si falla, sigue sin logo.
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
@@ -767,7 +809,7 @@ async function renderBillProformaClassic(
   }
 
   // Separador con vineta CP437.
-  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
   // Badge BOLETA + numero
   printBadge(tp, `BOLETA #${payload.order_number}`);
@@ -789,7 +831,7 @@ async function renderBillProformaClassic(
 
   // Items
   for (const item of payload.items) {
-    printBillItem(tp, item);
+    printBillItem(tp, item, width);
   }
 
   tp.newLine();
@@ -832,7 +874,7 @@ async function renderBillProformaClassic(
   tp.newLine();
 
   // Separador con vineta antes del footer.
-  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
   // Footer (QR opcional + frase custom)
   printBillFooter(tp, payload.restaurant);
@@ -885,6 +927,9 @@ function renderCashCloseClassic(
   tp: Printer,
   payload: CashClosePayload
 ): void {
+  // Mig 060: width real del papel.
+  const width = getPayloadWidth(payload);
+
   // Toggles de CashCloseOptions con defaults rich.
   const opts = (payload.print_options ?? {}) as {
     showHighlightedDiff?: boolean;
@@ -910,7 +955,7 @@ function renderCashCloseClassic(
       tp.alignLeft();
     }
 
-    ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
+    ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
   }
 
   // Header XL del cierre
@@ -982,7 +1027,7 @@ function renderCashCloseClassic(
 
   // Si tenemos restaurant, cerrar con ornament + frase del footer.
   if (payload.restaurant) {
-    ornamentSep(tp, payload.restaurant.print_ornament_char ?? null);
+    ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
     printBillFooter(tp, payload.restaurant);
   }
 
@@ -1131,6 +1176,9 @@ async function renderBillPreviewMinimal(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // Mig 060: width real del papel.
+  const width = getPayloadWidth(payload);
+
   // Logo respetando el toggle (en minimal generalmente OFF, pero respetamos
   // la config del dueño).
   await printLogoIfEnabled(tp, payload, supabase, logger);
@@ -1161,7 +1209,7 @@ async function renderBillPreviewMinimal(
 
   // Items con formato "qty  nombre  monto" sin doble altura
   for (const item of payload.items) {
-    printBillItem(tp, item);
+    printBillItem(tp, item, width);
   }
   tp.newLine();
 
@@ -1197,6 +1245,9 @@ async function renderBillPreviewBrand(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // Mig 060: width real del papel.
+  const width = getPayloadWidth(payload);
+
   const ornament = payload.restaurant.print_ornament_char ?? null;
 
   // Logo grande arriba (toggle del usuario).
@@ -1218,7 +1269,7 @@ async function renderBillPreviewBrand(
   tp.alignLeft();
 
   // Ornament separator
-  ornamentSep(tp, ornament);
+  ornamentSep(tp, ornament, width);
 
   // Titulo PRE-CUENTA centrado en bold
   tp.alignCenter();
@@ -1226,7 +1277,7 @@ async function renderBillPreviewBrand(
   tp.println(`PRE-CUENTA #${payload.order_number}`);
   tp.bold(false);
   tp.alignLeft();
-  ornamentSep(tp, ornament);
+  ornamentSep(tp, ornament, width);
 
   // Meta data
   const time = formatTime(payload.opened_at);
@@ -1242,7 +1293,7 @@ async function renderBillPreviewBrand(
 
   // Items
   for (const item of payload.items) {
-    printBillItem(tp, item);
+    printBillItem(tp, item, width);
   }
   tp.newLine();
 
@@ -1263,7 +1314,7 @@ async function renderBillPreviewBrand(
   tp.bold(false);
   tp.newLine();
 
-  ornamentSep(tp, ornament);
+  ornamentSep(tp, ornament, width);
 
   // Footer: QR + frase con vinetas
   printBillFooter(tp, payload.restaurant);
@@ -1277,7 +1328,7 @@ async function renderBillPreviewBrand(
     tp.alignLeft();
   }
 
-  ornamentSep(tp, ornament);
+  ornamentSep(tp, ornament, width);
   tp.newLine();
 }
 
@@ -1296,12 +1347,15 @@ async function renderBillPreviewThermalPro(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // Mig 060: width real del papel.
+  const width = getPayloadWidth(payload);
+
   // Logo respetando el toggle (en thermal_pro generalmente OFF para
   // priorizar densidad de info).
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   // Header denso: nombre + direccion en una linea
-  tp.println('='.repeat(ESCPOS_WIDTH));
+  tp.println('='.repeat(width));
   const name = payload.restaurant.name;
   const addr = payload.restaurant.address?.trim();
   if (addr && addr.length > 0) {
@@ -1320,7 +1374,7 @@ async function renderBillPreviewThermalPro(
   } else if (phone) {
     tp.println(`Tel ${phone}`);
   }
-  tp.println('='.repeat(ESCPOS_WIDTH));
+  tp.println('='.repeat(width));
 
   // Titulo + numero
   tp.bold(true);
@@ -1355,7 +1409,7 @@ async function renderBillPreviewThermalPro(
   tp.bold(true);
   printAmountRow(tp, 'TOTAL', payload.total);
   tp.bold(false);
-  tp.println('='.repeat(ESCPOS_WIDTH));
+  tp.println('='.repeat(width));
 
   // 3 sugerencias de propina
   tp.bold(true);
@@ -1371,7 +1425,7 @@ async function renderBillPreviewThermalPro(
     const totalWithTip = formatCLP(payload.total + t.amount).replace('$ ', '');
     tp.println(`  ${String(t.pct).padStart(2)}%  ${tipFmt} -> total ${totalWithTip}`);
   }
-  tp.println('='.repeat(ESCPOS_WIDTH));
+  tp.println('='.repeat(width));
 
   // Footer (sin ornament, mantener look pro)
   printBillFooter(tp, payload.restaurant);
@@ -1390,6 +1444,9 @@ async function renderBillProformaMinimal(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // Mig 060: width real del papel.
+  const width = getPayloadWidth(payload);
+
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   tp.alignLeft();
@@ -1415,7 +1472,7 @@ async function renderBillProformaMinimal(
 
   // Items
   for (const item of payload.items) {
-    printBillItem(tp, item);
+    printBillItem(tp, item, width);
   }
   tp.newLine();
 
@@ -1462,6 +1519,9 @@ async function renderBillProformaBrand(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // Mig 060: width real del papel.
+  const width = getPayloadWidth(payload);
+
   const ornament = payload.restaurant.print_ornament_char ?? null;
 
   await printLogoIfEnabled(tp, payload, supabase, logger);
@@ -1479,14 +1539,14 @@ async function renderBillProformaBrand(
   }
   tp.alignLeft();
 
-  ornamentSep(tp, ornament);
+  ornamentSep(tp, ornament, width);
 
   tp.alignCenter();
   tp.bold(true);
   tp.println(`BOLETA #${payload.order_number}`);
   tp.bold(false);
   tp.alignLeft();
-  ornamentSep(tp, ornament);
+  ornamentSep(tp, ornament, width);
 
   const time = formatTime(payload.opened_at);
   if (payload.table_number) {
@@ -1501,7 +1561,7 @@ async function renderBillProformaBrand(
 
   // Items
   for (const item of payload.items) {
-    printBillItem(tp, item);
+    printBillItem(tp, item, width);
   }
   tp.newLine();
 
@@ -1518,7 +1578,7 @@ async function renderBillProformaBrand(
 
   // Payment destacado (centrado + bold)
   if (payload.payment) {
-    ornamentSep(tp, ornament);
+    ornamentSep(tp, ornament, width);
     tp.alignCenter();
     tp.bold(true);
     tp.println(`Pago: ${payload.payment.method_label}`);
@@ -1544,7 +1604,7 @@ async function renderBillProformaBrand(
     tp.newLine();
   }
 
-  ornamentSep(tp, ornament);
+  ornamentSep(tp, ornament, width);
   printBillFooter(tp, payload.restaurant);
 
   if (ornament) {
@@ -1555,7 +1615,7 @@ async function renderBillProformaBrand(
     tp.alignLeft();
   }
 
-  ornamentSep(tp, ornament);
+  ornamentSep(tp, ornament, width);
   tp.newLine();
 }
 
@@ -1572,9 +1632,12 @@ async function renderBillProformaThermalPro(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // Mig 060: width real del papel.
+  const width = getPayloadWidth(payload);
+
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
-  tp.println('='.repeat(ESCPOS_WIDTH));
+  tp.println('='.repeat(width));
   const name = payload.restaurant.name;
   const addr = payload.restaurant.address?.trim();
   if (addr && addr.length > 0) {
@@ -1591,7 +1654,7 @@ async function renderBillProformaThermalPro(
   } else if (phone) {
     tp.println(`Tel ${phone}`);
   }
-  tp.println('='.repeat(ESCPOS_WIDTH));
+  tp.println('='.repeat(width));
 
   tp.bold(true);
   tp.println(`BOLETA #${payload.order_number}`);
@@ -1626,7 +1689,7 @@ async function renderBillProformaThermalPro(
   tp.bold(true);
   printAmountRow(tp, 'TOTAL', payload.total + tip);
   tp.bold(false);
-  tp.println('='.repeat(ESCPOS_WIDTH));
+  tp.println('='.repeat(width));
 
   // Payment compacto
   if (payload.payment) {
@@ -1646,7 +1709,7 @@ async function renderBillProformaThermalPro(
       const auth = payload.payment.mp_authorization_code?.trim();
       if (auth) tp.println(`  Auth: ${auth}`);
     }
-    tp.println('='.repeat(ESCPOS_WIDTH));
+    tp.println('='.repeat(width));
   }
 
   printBillFooter(tp, payload.restaurant);

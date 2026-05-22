@@ -46,6 +46,12 @@ export type PrinterRow = {
   copies: number;
   cut_paper: boolean;
   beep: boolean;
+  /**
+   * Mig 060 bait-pos: ancho del papel en chars font A. 32/42/48.
+   * Default 32 cuando la columna no existe todavia (compat con agentes
+   * que arrancan contra DBs viejas).
+   */
+  width_chars: number;
 };
 
 /**
@@ -70,7 +76,7 @@ export async function loadPrintersForLocation(
   const { data, error } = await supabase
     .from('printers')
     .select(
-      'id, name, printer_type, connection_type, target, print_area_id, is_primary, copies, cut_paper, beep'
+      'id, name, printer_type, connection_type, target, print_area_id, is_primary, copies, cut_paper, beep, width_chars'
     )
     .eq('location_id', locationId)
     .eq('active', true)
@@ -85,7 +91,11 @@ export async function loadPrintersForLocation(
     throw new Error(`No pude cargar impresoras: ${error.message}`);
   }
 
-  const all = (data ?? []) as PrinterRow[];
+  // Defensa: si la DB es vieja (sin mig 060) o la columna llega NULL,
+  // forzamos width_chars=32 para conservar comportamiento legacy.
+  const all = ((data ?? []) as Array<PrinterRow & { width_chars?: number | null }>).map(
+    (p) => ({ ...p, width_chars: p.width_chars ?? 32 })
+  ) as PrinterRow[];
 
   // Filtramos los connection_type que el driver real no sabe manejar.
   // 'virtual' es legit en la DB (lo usa la UI antes de configurar hardware),

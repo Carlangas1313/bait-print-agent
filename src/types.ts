@@ -131,6 +131,12 @@ export type KitchenJobPayload = {
    * Pre-mig 058: NULL/undefined. El renderer skipa header con local en ese caso.
    */
   restaurant?: RestaurantPrintInfo;
+  /**
+   * Mig 060: ancho del papel + identidad de la impresora destino. El renderer
+   * lo lee para construir ThermalPrinter con el `width` correcto (32/42/48).
+   * NULL/undefined en jobs pre-mig 060 -> fallback a 32 chars.
+   */
+  printer?: PrinterPayloadInfo;
 };
 
 /**
@@ -152,6 +158,26 @@ export type BillPaymentInfo = {
   mp_authorization_code?: string | null;
   received_cash?: number | null;
   change?: number | null;
+};
+
+/**
+ * Datos de la impresora destino que el agente usa para configurar el
+ * ThermalPrinter (width) y para los layouts (separadores que dependen del
+ * ancho del papel).
+ *
+ * Suma mig 060 (bait-pos). Las RPCs enqueue_* incluyen este objeto en el
+ * payload top-level cuando hay target_printer_id resuelto. Si NULL (compat
+ * con jobs pre-mig 060), el renderer cae al fallback ESCPOS_WIDTH=32.
+ *
+ *  - id: uuid de printers.id (informativo).
+ *  - name: alias humano (informativo en logs).
+ *  - width_chars: 32 (Rongta 58mm), 42 (58mm font B), 48 (Epson/Star 80mm).
+ *    Default 32 si la RPC no lo trae.
+ */
+export type PrinterPayloadInfo = {
+  id: string;
+  name: string;
+  width_chars: number;
 };
 
 /**
@@ -222,6 +248,10 @@ export type BillPreviewPayload = {
    * Opcional para backwards compat. Defaults aplicados en el renderer.
    */
   print_options?: BillPreviewOptions;
+  /**
+   * Mig 060: ver KitchenJobPayload.printer.
+   */
+  printer?: PrinterPayloadInfo;
 };
 
 /**
@@ -254,6 +284,10 @@ export type BillProformaPayload = {
    * Opcional para backwards compat. Defaults aplicados en el renderer.
    */
   print_options?: BillProformaOptions;
+  /**
+   * Mig 060: ver KitchenJobPayload.printer.
+   */
+  printer?: PrinterPayloadInfo;
 };
 
 export type CashClosePayload = {
@@ -288,6 +322,10 @@ export type CashClosePayload = {
    * Opcional para backwards compat. Defaults aplicados en el renderer.
    */
   print_options?: CashCloseOptions;
+  /**
+   * Mig 060: ver KitchenJobPayload.printer.
+   */
+  printer?: PrinterPayloadInfo;
 };
 
 // ====================================================================
