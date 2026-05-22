@@ -172,7 +172,7 @@ function resolveExePath(custom: string | undefined): string {
   if (!candidate.toLowerCase().endsWith('.exe')) {
     throw new Error(
       `El path al ejecutable debe ser un .exe. Recibido: ${candidate}\n` +
-        'Si estas en dev (tsx) y queres probar igual, empaqueta el agente con `npm run package:win` y usa el .exe resultante.'
+        'Si estas en dev (tsx) y quieres probar igual, empaqueta el agente con `npm run package:win` y usa el .exe resultante.'
     );
   }
 
@@ -297,7 +297,7 @@ function cleanupBrokenScService(serviceName: string, logger: Logger): boolean {
       e.message;
     throw new Error(
       `No pude borrar el servicio previo "${serviceName}" con sc.exe delete: ${detail}.\n` +
-        `Probablemente algun proceso lo tiene abierto. Cerra services.msc si lo tenes abierto y reintenta.`
+        `Probablemente algun proceso lo tiene abierto. Cierra services.msc si lo tienes abierto y reintenta.`
     );
   }
 }
@@ -406,7 +406,7 @@ export async function installService(opts: InstallServiceOptions): Promise<void>
     if (serviceExists(nssm, serviceName)) {
       logger.error(
         `El servicio legacy "${serviceName}" sigue existiendo despues del cleanup. ` +
-          `Cerra services.msc si lo tenes abierto y reintenta, o desinstala manualmente con:\n` +
+          `Cierra services.msc si lo tienes abierto y reintenta, o desinstala manualmente con:\n` +
           `   bait-print-agent uninstall-service --name ${serviceName}`
       );
       process.exit(1);

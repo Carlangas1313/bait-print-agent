@@ -130,6 +130,6 @@ export async function setupAgent(
   );
 
   logger.info(
-    'Ahora podes cerrar este setup y arrancar el agente normal con `bait-print-agent`.'
+    'Ahora puedes cerrar este setup y arrancar el agente normal con `bait-print-agent`.'
   );
 }

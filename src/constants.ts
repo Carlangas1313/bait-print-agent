@@ -5,7 +5,7 @@
  * del proyecto Supabase productivo de bait-pos hardcodeadas. Esto permite
  * que el flujo `setup --code XXXX-XXXX` funcione sin pedir nada mas al user.
  *
- * Para dev local podes overridear via env vars: si `process.env.SUPABASE_URL`
+ * Para dev local puedes overridear via env vars: si `process.env.SUPABASE_URL`
  * o `process.env.SUPABASE_ANON_KEY` estan seteadas, ganan sobre estos defaults.
  */
 
@@ -14,7 +14,7 @@ export const DEFAULT_SUPABASE_URL = 'https://ladhxyybqvaevtbhelil.supabase.co';
 export const DEFAULT_SUPABASE_ANON_KEY =
   'sb_publishable_tQQbRXmLpgqpwx4jdBG2OA_b0uS8tE1';
 
-export const AGENT_VERSION = '0.9.1';
+export const AGENT_VERSION = '0.9.2';
 
 /**
  * Resuelve la URL de Supabase: env var > default hardcodeado.

@@ -9,10 +9,11 @@
  *    opcion `cacheDirOverride`). Cada test usa un dir temporal bajo
  *    `os.tmpdir()` que limpia en `after()`.
  *  - Supabase client es un mock minimo con la forma `{ storage: { from() } }`
- *    que retorna un objeto con `createSignedUrl()`. El test controla si
- *    retorna error/data, y cuenta llamadas con un counter.
- *  - Para el fetch del signed URL usamos `globalThis.fetch` interceptado
- *    via stub (guardamos el original en setup() y restauramos en teardown()).
+ *    que retorna un objeto con `getPublicUrl()`. Desde mig 064 el bucket
+ *    es publico, asi que el agente arma la URL determinista y baja directo
+ *    (no mas signed URLs).
+ *  - Para el fetch usamos `globalThis.fetch` interceptado via stub
+ *    (guardamos el original en setup() y restauramos en teardown()).
  */
 
 import { describe, it, before, after, beforeEach } from 'node:test';
@@ -27,8 +28,8 @@ import { getLogoPath } from './logo-cache.js';
 // ============================================================
 
 type MockSupabaseState = {
-  createSignedUrlCalls: number;
-  createSignedUrlResponse: { data: { signedUrl: string } | null; error: { message: string } | null };
+  getPublicUrlCalls: number;
+  publicUrl: string;
 };
 
 function makeMockSupabase(state: MockSupabaseState) {
@@ -36,9 +37,9 @@ function makeMockSupabase(state: MockSupabaseState) {
     storage: {
       from(_bucket: string) {
         return {
-          async createSignedUrl(_path: string, _ttl: number) {
-            state.createSignedUrlCalls++;
-            return state.createSignedUrlResponse;
+          getPublicUrl(_path: string) {
+            state.getPublicUrlCalls++;
+            return { data: { publicUrl: state.publicUrl } };
           },
         };
       },
@@ -104,20 +105,20 @@ describe('getLogoPath', () => {
 
   it('retorna null si storagePath es null', async () => {
     const state: MockSupabaseState = {
-      createSignedUrlCalls: 0,
-      createSignedUrlResponse: { data: null, error: null },
+      getPublicUrlCalls: 0,
+      publicUrl: 'https://unused/public.png',
     };
     const result = await getLogoPath(null, 'abc123', makeMockSupabase(state), {
       cacheDirOverride: tmpDir,
     });
     assert.equal(result, null);
-    assert.equal(state.createSignedUrlCalls, 0, 'no debe llamar a Supabase si path es null');
+    assert.equal(state.getPublicUrlCalls, 0, 'no debe llamar a Supabase si path es null');
   });
 
   it('retorna null si hash es null aunque path exista', async () => {
     const state: MockSupabaseState = {
-      createSignedUrlCalls: 0,
-      createSignedUrlResponse: { data: null, error: null },
+      getPublicUrlCalls: 0,
+      publicUrl: 'https://unused/public.png',
     };
     const result = await getLogoPath(
       'rid/abc123-thermal.png',
@@ -126,7 +127,7 @@ describe('getLogoPath', () => {
       { cacheDirOverride: tmpDir },
     );
     assert.equal(result, null);
-    assert.equal(state.createSignedUrlCalls, 0);
+    assert.equal(state.getPublicUrlCalls, 0);
   });
 
   it('cache hit: si el archivo existe local, no llama a Supabase', async () => {
@@ -136,8 +137,8 @@ describe('getLogoPath', () => {
     fs.writeFileSync(cachedFile, Buffer.from([0xff]));
 
     const state: MockSupabaseState = {
-      createSignedUrlCalls: 0,
-      createSignedUrlResponse: { data: null, error: null },
+      getPublicUrlCalls: 0,
+      publicUrl: 'https://unused/public.png',
     };
 
     const result = await getLogoPath(
@@ -148,21 +149,19 @@ describe('getLogoPath', () => {
     );
 
     assert.equal(result, cachedFile);
-    assert.equal(state.createSignedUrlCalls, 0, 'cache hit no debe pegarle a Supabase');
+    assert.equal(state.getPublicUrlCalls, 0, 'cache hit no debe pegarle a Supabase');
     assert.equal(fetchCalls.length, 0, 'cache hit no debe hacer fetch');
   });
 
-  it('cache miss: genera signed URL + baja + escribe', async () => {
+  it('cache miss: arma public URL + baja + escribe', async () => {
     const hash = 'newhash12345';
     const cachedFile = path.join(tmpDir, `${hash}.png`);
     assert.equal(fs.existsSync(cachedFile), false, 'precondicion: el cache no existe');
 
+    const publicUrl = 'https://supabase.example/storage/v1/object/public/restaurant-logos/rid/newhash12345-thermal.png';
     const state: MockSupabaseState = {
-      createSignedUrlCalls: 0,
-      createSignedUrlResponse: {
-        data: { signedUrl: 'https://supabase.example/signed/url' },
-        error: null,
-      },
+      getPublicUrlCalls: 0,
+      publicUrl,
     };
 
     const result = await getLogoPath(
@@ -173,39 +172,18 @@ describe('getLogoPath', () => {
     );
 
     assert.equal(result, cachedFile);
-    assert.equal(state.createSignedUrlCalls, 1);
+    assert.equal(state.getPublicUrlCalls, 1);
     assert.equal(fetchCalls.length, 1);
-    assert.equal(fetchCalls[0]?.url, 'https://supabase.example/signed/url');
+    assert.equal(fetchCalls[0]?.url, publicUrl);
     assert.equal(fs.existsSync(cachedFile), true, 'el archivo deberia haberse escrito');
   });
 
-  it('si createSignedUrl falla, tira error', async () => {
-    const state: MockSupabaseState = {
-      createSignedUrlCalls: 0,
-      createSignedUrlResponse: {
-        data: null,
-        error: { message: 'object not found' },
-      },
-    };
-
-    await assert.rejects(
-      async () =>
-        getLogoPath('rid/missing-thermal.png', 'missing00000', makeMockSupabase(state), {
-          cacheDirOverride: tmpDir,
-        }),
-      /signed url failed/i,
-    );
-  });
-
-  it('si fetch del signed URL falla con !ok, tira error', async () => {
+  it('si fetch de la public URL responde !ok, tira error', async () => {
     nextFetchResponse = { ok: false, status: 404, body: Buffer.alloc(0) };
 
     const state: MockSupabaseState = {
-      createSignedUrlCalls: 0,
-      createSignedUrlResponse: {
-        data: { signedUrl: 'https://supabase.example/dead' },
-        error: null,
-      },
+      getPublicUrlCalls: 0,
+      publicUrl: 'https://supabase.example/storage/v1/object/public/restaurant-logos/rid/dead-thermal.png',
     };
 
     await assert.rejects(
