@@ -59,7 +59,6 @@ export type KitchenOrderOptions = {
   showOpenTime?: boolean;        // default true — "Hace X min" en el header
   showHighlightedNotes?: boolean; // default true — notas en invertido + bold
   showGiftMark?: boolean;        // default true — items is_gift con "★ CORTESÍA"
-  showPrices?: boolean;          // default false — generalmente OFF para cocina
   showWaiter?: boolean;          // default true — nombre del mesero en header
   showGuests?: boolean;          // default true — N comensales en header
   density?: PrintDensity;        // default 'normal'

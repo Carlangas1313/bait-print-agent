@@ -677,7 +677,6 @@ function renderKitchenOrderClassic(
     showOpenTime?: boolean;
     showHighlightedNotes?: boolean;
     showGiftMark?: boolean;
-    showPrices?: boolean;
     showWaiter?: boolean;
     showGuests?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
@@ -686,7 +685,6 @@ function renderKitchenOrderClassic(
   const showOpenTime = opts.showOpenTime ?? true;
   const showHighlightedNotes = opts.showHighlightedNotes ?? true;
   const showGiftMark = opts.showGiftMark ?? true;
-  const showPrices = opts.showPrices ?? false; // default off para cocina
   const showWaiter = opts.showWaiter ?? true;
   const showGuests = opts.showGuests ?? true;
   const fontSize = getFontSize(opts);
@@ -746,7 +744,6 @@ function renderKitchenOrderClassic(
     printKitchenItemWithToggles(tp, item, {
       showHighlightedNotes,
       showGiftMark,
-      showPrices,
     });
     if (itemGap > 0 && idx < payload.items.length - 1) {
       newLines(tp, itemGap);
@@ -801,6 +798,10 @@ function minutesSinceOpened(isoString: string): number | null {
  * Variante de `printKitchenItem` que aplica los toggles del print_options.
  * El original (sin toggles) queda como compat para callers internos —
  * aunque hoy solo lo usa kitchen_cancel.
+ *
+ * Nota v0.9.11: el toggle `showPrices` fue eliminado. La comanda de cocina
+ * nunca muestra precios — el payload no los incluye y operacionalmente
+ * cocinas no los necesitan (decisión Carlos 2026-05-23).
  */
 function printKitchenItemWithToggles(
   tp: Printer,
@@ -808,14 +809,9 @@ function printKitchenItemWithToggles(
   opts: {
     showHighlightedNotes: boolean;
     showGiftMark: boolean;
-    showPrices: boolean;
   }
 ): void {
   tp.bold(true);
-  // Si showPrices, embeber el precio (subtotal seria modifier sum + base —
-  // no esta en KitchenJobItem). Por ahora KitchenJobItem solo trae name +
-  // qty + modifiers (priceDelta). Skipping showPrices implementation full
-  // hasta que la RPC mande el subtotal del item al payload de cocina.
   tp.println(`${item.quantity}x ${item.name}`);
   tp.bold(false);
 
@@ -827,13 +823,7 @@ function printKitchenItemWithToggles(
   }
 
   for (const mod of item.modifiers) {
-    if (opts.showPrices && mod.priceDelta !== 0) {
-      // Si showPrices y el modifier tiene delta, mostrar el delta
-      const fmt = formatCLP(mod.priceDelta);
-      tp.println(`   - ${mod.name} (${mod.priceDelta > 0 ? '+' : ''}${fmt})`);
-    } else {
-      tp.println(`   - ${mod.name}`);
-    }
+    tp.println(`   - ${mod.name}`);
   }
 
   if (item.note && item.note.trim().length > 0) {
@@ -2436,7 +2426,6 @@ function renderKitchenOrderMinimal(
     showOpenTime?: boolean;
     showHighlightedNotes?: boolean;
     showGiftMark?: boolean;
-    showPrices?: boolean;
     showWaiter?: boolean;
     showGuests?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
@@ -2445,7 +2434,6 @@ function renderKitchenOrderMinimal(
   const showOpenTime = opts.showOpenTime ?? true;
   const showHighlightedNotes = opts.showHighlightedNotes ?? true;
   const showGiftMark = opts.showGiftMark ?? true;
-  const showPrices = opts.showPrices ?? false;
   const showWaiter = opts.showWaiter ?? true;
   const showGuests = opts.showGuests ?? true;
   const fontSize = getFontSize(opts);
@@ -2494,12 +2482,7 @@ function renderKitchenOrderMinimal(
       tp.println('   * cortesia');
     }
     for (const mod of item.modifiers) {
-      if (showPrices && mod.priceDelta !== 0) {
-        const fmt = formatCLP(mod.priceDelta);
-        tp.println(`   - ${mod.name} (${mod.priceDelta > 0 ? '+' : ''}${fmt})`);
-      } else {
-        tp.println(`   - ${mod.name}`);
-      }
+      tp.println(`   - ${mod.name}`);
     }
     if (item.note && item.note.trim().length > 0) {
       // En minimal, las notas van en corchetes sin invertir (queda menos
@@ -2548,7 +2531,6 @@ function renderKitchenOrderBrand(
     showOpenTime?: boolean;
     showHighlightedNotes?: boolean;
     showGiftMark?: boolean;
-    showPrices?: boolean;
     showWaiter?: boolean;
     showGuests?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
@@ -2557,7 +2539,6 @@ function renderKitchenOrderBrand(
   const showOpenTime = opts.showOpenTime ?? true;
   const showHighlightedNotes = opts.showHighlightedNotes ?? true;
   const showGiftMark = opts.showGiftMark ?? true;
-  const showPrices = opts.showPrices ?? false;
   const showWaiter = opts.showWaiter ?? true;
   const showGuests = opts.showGuests ?? true;
   const fontSize = getFontSize(opts);
@@ -2608,7 +2589,6 @@ function renderKitchenOrderBrand(
     printKitchenItemWithToggles(tp, item, {
       showHighlightedNotes,
       showGiftMark,
-      showPrices,
     });
     if (itemGap > 0 && idx < payload.items.length - 1) {
       newLines(tp, itemGap);
@@ -2664,7 +2644,6 @@ function renderKitchenOrderThermalPro(
     showOpenTime?: boolean;
     showHighlightedNotes?: boolean;
     showGiftMark?: boolean;
-    showPrices?: boolean;
     showWaiter?: boolean;
     showGuests?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
@@ -2673,7 +2652,6 @@ function renderKitchenOrderThermalPro(
   const showOpenTime = opts.showOpenTime ?? true;
   const showHighlightedNotes = opts.showHighlightedNotes ?? true;
   const showGiftMark = opts.showGiftMark ?? true;
-  const showPrices = opts.showPrices ?? false;
   const showWaiter = opts.showWaiter ?? true;
   const showGuests = opts.showGuests ?? true;
   const fontSize = getFontSize(opts);
@@ -2710,19 +2688,14 @@ function renderKitchenOrderThermalPro(
   tp.drawLine();
   newLines(tp, sectionGap);
 
-  // Items con prices/notes en compact (sin bold, sin newlines extra)
+  // Items con notes en compact (sin bold, sin newlines extra)
   payload.items.forEach((item, idx) => {
     tp.println(`${item.quantity}x ${item.name}`);
     if (showGiftMark && item.is_gift) {
       tp.println('   * CORTESIA');
     }
     for (const mod of item.modifiers) {
-      if (showPrices && mod.priceDelta !== 0) {
-        const fmt = formatCLP(mod.priceDelta);
-        tp.println(`   - ${mod.name} (${mod.priceDelta > 0 ? '+' : ''}${fmt})`);
-      } else {
-        tp.println(`   - ${mod.name}`);
-      }
+      tp.println(`   - ${mod.name}`);
     }
     if (item.note && item.note.trim().length > 0) {
       if (showHighlightedNotes) {
