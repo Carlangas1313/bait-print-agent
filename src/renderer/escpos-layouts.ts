@@ -35,6 +35,9 @@ import {
   type CashClosePayload,
   type BillPaymentInfo,
   type RestaurantPrintInfo,
+  type FacturaFinalPayload,
+  type NotaCreditoFinalPayload,
+  type DteReceiverInfo,
 } from '../types.js';
 import type { Logger } from '../logger.js';
 import { formatCLP, formatTime, formatDateTime } from './format.js';
@@ -3030,4 +3033,434 @@ function renderCashCloseThermalPro(
     tp.println(phrase);
   }
   tp.newLine();
+}
+
+// ====================================================================
+// factura_final · marca legal "FACTURA ELECTRONICA" + RECEPTOR
+// ====================================================================
+//
+// Mig 082 bait-pos (2026-05-23). Bug fix: facturas electronicas (DTE 33
+// y 34) salian como bill_proforma — el papel era identico al de una
+// boleta nominativa, sin la marca legal ni el bloque RECEPTOR exigido
+// por SII para que el receptor pueda usarla como respaldo tributario.
+//
+// Diferencias vs bill_proforma:
+//   1. Marca legal en el header: "FACTURA ELECTRONICA Nº<folio>" (33)
+//      o "FACTURA EXENTA ELECTRONICA Nº<folio>" (34). Si folio=null
+//      (provider aun no respondio), pone "FOLIO PENDIENTE" en su lugar.
+//   2. Bloque RECEPTOR debajo del header del emisor: RUT, Razon social,
+//      Giro, Direccion + Comuna (si vinieron).
+//   3. Footer: aviso legal "Documento tributario electronico" en vez de
+//      "Documento NO tributario".
+//
+// V1 simple: solo classic style. Los 4 styles llegan despues (Carlos no
+// los necesita en el primer fix — la marca legal es lo critico).
+
+/**
+ * Devuelve la marca legal del documento segun el tipo de DTE.
+ *
+ * Si dte_type es null (defensa contra payload mal armado), retorna
+ * "FACTURA ELECTRONICA" como fallback prudente (la mayoria de las facturas
+ * que el sistema emite son 33).
+ */
+function getFacturaLegalMark(dteType: string | null): string {
+  switch (dteType) {
+    case 'factura_33':
+      return 'FACTURA ELECTRONICA';
+    case 'factura_exenta_34':
+      return 'FACTURA EXENTA ELECTRONICA';
+    default:
+      return 'FACTURA ELECTRONICA';
+  }
+}
+
+/**
+ * Imprime el bloque RECEPTOR (bajo el emisor, antes de los items). Cada
+ * subcampo es opcional — si no viene, omitimos esa linea (no "—" o "N/A"
+ * que abultan papel innecesariamente).
+ *
+ * El renderer no falla si todo el bloque viene vacio: imprime un mensaje
+ * defensivo "Receptor: sin datos" para que el operador vea que la factura
+ * sale sin receptor (caso de bug en el cobro o data corrupta).
+ */
+function printReceiverBlock(
+  tp: Printer,
+  receiver: DteReceiverInfo,
+  width: number
+): void {
+  tp.alignLeft();
+  tp.bold(true);
+  tp.println('RECEPTOR');
+  tp.bold(false);
+
+  const rut = receiver.rut?.trim() ?? '';
+  const name = receiver.name?.trim() ?? '';
+  const giro = receiver.giro?.trim() ?? '';
+  const address = receiver.address?.trim() ?? '';
+  const comuna = receiver.comuna?.trim() ?? '';
+
+  if (rut.length === 0 && name.length === 0) {
+    tp.println('Sin datos del receptor');
+    tp.drawLine();
+    return;
+  }
+
+  if (rut.length > 0) tp.println(`RUT: ${rut}`);
+  if (name.length > 0) tp.println(`Razon social: ${name}`);
+  if (giro.length > 0) tp.println(`Giro: ${giro}`);
+
+  // Direccion + comuna en una linea cuando ambos caben. Si no, en lineas
+  // separadas. El width del papel ayuda a decidir.
+  if (address.length > 0 && comuna.length > 0) {
+    const combined = `${address}, ${comuna}`;
+    if (combined.length <= width) {
+      tp.println(combined);
+    } else {
+      tp.println(address);
+      tp.println(comuna);
+    }
+  } else if (address.length > 0) {
+    tp.println(address);
+  } else if (comuna.length > 0) {
+    tp.println(comuna);
+  }
+
+  tp.drawLine();
+}
+
+/**
+ * FACTURA FINAL classic style. Mismo flow visual que renderBillProformaClassic
+ * (header emisor → items → totales → pago) PERO con marca legal "FACTURA"
+ * en lugar de "BOLETA" + bloque RECEPTOR + footer ajustado.
+ */
+async function renderFacturaFinalClassic(
+  tp: Printer,
+  payload: FacturaFinalPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
+  const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
+
+  const opts = (payload.print_options ?? {}) as {
+    showAddress?: boolean;
+    showRut?: boolean;
+    showQr?: boolean;
+  };
+  const showAddress = opts.showAddress !== false;
+  const showRut = opts.showRut !== false;
+  const showQr = opts.showQr !== false;
+
+  // Logo si esta activo
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  // Header EMISOR (idem bill_proforma — el local que emite la factura)
+  applyHeaderFontSize(tp, fontSize);
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println(payload.restaurant.name);
+  tp.bold(false);
+  if (showAddress) {
+    const address = payload.restaurant.address?.trim();
+    if (address && address.length > 0) tp.println(address);
+    const comuna = payload.restaurant.comuna?.trim() ?? '';
+    const phone = payload.restaurant.phone?.trim() ?? '';
+    if (comuna.length > 0 || phone.length > 0) {
+      const parts: string[] = [];
+      if (comuna.length > 0) parts.push(comuna);
+      if (phone.length > 0) parts.push(`Fono ${phone}`);
+      tp.println(parts.join(' · '));
+    }
+  }
+  if (showRut && payload.restaurant.rut) {
+    tp.println(`RUT: ${payload.restaurant.rut}`);
+  }
+  tp.alignLeft();
+  tp.drawLine();
+  resetHeaderFontSize(tp);
+
+  const slogan = payload.restaurant.slogan?.trim();
+  if (slogan && slogan.length > 0) {
+    tp.alignCenter();
+    tp.println(`"${slogan}"`);
+    tp.alignLeft();
+  }
+
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
+
+  // MARCA LEGAL: "FACTURA ELECTRONICA Nº<folio>" — la diferencia critica
+  // vs bill_proforma. Usamos badge invertido + doble altura para que sea
+  // imposible confundirla con boleta.
+  const legalMark = getFacturaLegalMark(payload.dte.type);
+  const folioStr =
+    payload.dte.folio != null ? `Nº ${payload.dte.folio}` : 'FOLIO PENDIENTE';
+
+  tp.alignCenter();
+  tp.bold(true);
+  tp.invert(true);
+  tp.println(` ${legalMark} `);
+  tp.invert(false);
+  tp.setTextDoubleHeight();
+  tp.println(folioStr);
+  tp.setTextNormal();
+  restoreFontSize(tp, fontSize);
+  tp.bold(false);
+  tp.alignLeft();
+  tp.newLine();
+
+  // Bloque RECEPTOR — el otro elemento critico vs bill_proforma.
+  printReceiverBlock(tp, payload.receiver, width);
+  tp.newLine();
+
+  // Linea de mesa/comensales/hora/mozo (similar a boleta)
+  const time = formatTime(payload.opened_at);
+  if (payload.table_number) {
+    tp.println(`Mesa ${payload.table_number} · Comensales: ${payload.guests}`);
+  } else {
+    tp.println(`Para llevar · Comensales: ${payload.guests}`);
+  }
+  tp.println(`Hora: ${time}`);
+  if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
+    tp.println(`Mesero: ${payload.waiter_name.trim()}`);
+  }
+  tp.drawLine();
+  tp.newLine();
+
+  // Items
+  for (const item of payload.items) {
+    printBillItem(tp, item, width);
+  }
+
+  tp.newLine();
+  tp.drawLine();
+
+  // Subtotal + IVA
+  printAmountRow(tp, 'Subtotal', payload.subtotal);
+  // Factura exenta no tiene IVA — si dte_type es factura_exenta_34, omitir
+  // la linea IVA. El subtotal=total en ese caso.
+  if (payload.dte.type !== 'factura_exenta_34') {
+    printAmountRow(tp, 'IVA (19%)', payload.iva);
+  }
+
+  const tip = payload.tip_amount ?? 0;
+  if (tip > 0) {
+    printAmountRow(tp, 'Propina', tip);
+  }
+
+  tp.drawLine();
+  printXLTotal(tp, 'TOTAL', payload.total + tip, fontSize);
+  tp.drawLine();
+  tp.newLine();
+
+  // Pago
+  if (payload.payment) {
+    printPaymentSection(tp, payload.payment, payload.total + tip);
+    tp.drawLine();
+    tp.newLine();
+  }
+
+  // Aviso legal correcto para factura tributaria
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println('Documento Tributario Electronico');
+  tp.bold(false);
+  tp.println('Verifique en www.sii.cl');
+  tp.alignLeft();
+  tp.newLine();
+
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
+
+  printBillFooter(tp, payload.restaurant, { showQr });
+  tp.newLine();
+}
+
+/**
+ * Dispatcher publico para factura_final. V1 solo classic. Si en el futuro
+ * se necesitan los 4 styles, agregar render*Style aqui y rutear.
+ */
+export async function renderFacturaFinalEscPos(
+  tp: Printer,
+  payload: FacturaFinalPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
+  const fontSize = getFontSize(payload.print_options);
+  applyFontSize(tp, fontSize);
+  try {
+    // Por ahora solo classic. Los style toggles se agregan en una segunda
+    // fase si Carlos lo pide; el ticket fiscal es funcional, no estilo de
+    // marca.
+    await renderFacturaFinalClassic(tp, payload, supabase, logger);
+  } finally {
+    resetFontSize(tp);
+  }
+}
+
+// ====================================================================
+// nota_credito_final · marca legal "NOTA DE CRÉDITO" + REF al original
+// ====================================================================
+//
+// Mig 082 bait-pos. Igual flow que factura_final pero con:
+//   - Marca legal "NOTA DE CREDITO Nº<folio>"
+//   - Bloque RECEPTOR (el mismo del DTE original anulado)
+//   - Bloque REFERENCIA con folio + tipo del DTE anulado + motivo
+//   - Sin sección de pago (la NC no es un cobro, es un reverso contable)
+
+/**
+ * Bloque de REFERENCIA al folio anulado. Va debajo del receptor.
+ */
+function printNCReferenceBlock(
+  tp: Printer,
+  reference: NotaCreditoFinalPayload['reference']
+): void {
+  tp.alignLeft();
+  tp.bold(true);
+  tp.println('REFERENCIA');
+  tp.bold(false);
+
+  const folio = reference.original_folio;
+  const type = reference.original_dte_type;
+  const reason = reference.reason?.trim() ?? '';
+
+  // Mapeo legible del tipo de documento referido
+  const typeLabel = (() => {
+    switch (type) {
+      case 'boleta_39': return 'Boleta electronica';
+      case 'boleta_exenta_41': return 'Boleta exenta';
+      case 'factura_33': return 'Factura electronica';
+      case 'factura_exenta_34': return 'Factura exenta';
+      default: return type ?? 'Documento';
+    }
+  })();
+
+  if (folio != null) {
+    tp.println(`Anula: ${typeLabel} Nº ${folio}`);
+  } else {
+    tp.println(`Anula: ${typeLabel} (folio sin datos)`);
+  }
+  if (reason.length > 0) {
+    tp.println(`Motivo: ${reason}`);
+  }
+
+  tp.drawLine();
+}
+
+async function renderNotaCreditoFinalClassic(
+  tp: Printer,
+  payload: NotaCreditoFinalPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
+  const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
+
+  const opts = (payload.print_options ?? {}) as {
+    showAddress?: boolean;
+    showRut?: boolean;
+    showQr?: boolean;
+  };
+  const showAddress = opts.showAddress !== false;
+  const showRut = opts.showRut !== false;
+  const showQr = opts.showQr !== false;
+
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  // Header emisor (idem factura)
+  applyHeaderFontSize(tp, fontSize);
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println(payload.restaurant.name);
+  tp.bold(false);
+  if (showAddress) {
+    const address = payload.restaurant.address?.trim();
+    if (address && address.length > 0) tp.println(address);
+    const comuna = payload.restaurant.comuna?.trim() ?? '';
+    const phone = payload.restaurant.phone?.trim() ?? '';
+    if (comuna.length > 0 || phone.length > 0) {
+      const parts: string[] = [];
+      if (comuna.length > 0) parts.push(comuna);
+      if (phone.length > 0) parts.push(`Fono ${phone}`);
+      tp.println(parts.join(' · '));
+    }
+  }
+  if (showRut && payload.restaurant.rut) {
+    tp.println(`RUT: ${payload.restaurant.rut}`);
+  }
+  tp.alignLeft();
+  tp.drawLine();
+  resetHeaderFontSize(tp);
+
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
+
+  // MARCA LEGAL
+  const folioStr =
+    payload.dte.folio != null ? `Nº ${payload.dte.folio}` : 'FOLIO PENDIENTE';
+
+  tp.alignCenter();
+  tp.bold(true);
+  tp.invert(true);
+  tp.println(' NOTA DE CREDITO ELECTRONICA ');
+  tp.invert(false);
+  tp.setTextDoubleHeight();
+  tp.println(folioStr);
+  tp.setTextNormal();
+  restoreFontSize(tp, fontSize);
+  tp.bold(false);
+  tp.alignLeft();
+  tp.newLine();
+
+  printReceiverBlock(tp, payload.receiver, width);
+  tp.newLine();
+
+  printNCReferenceBlock(tp, payload.reference);
+  tp.newLine();
+
+  // Items (los items anulados — los mismos del DTE original)
+  for (const item of payload.items) {
+    printBillItem(tp, item, width);
+  }
+  tp.newLine();
+  tp.drawLine();
+
+  // Total a anular. El monto puede ser parcial (nc_amount), en cuyo caso
+  // sale como "MONTO A ANULAR" en vez de "TOTAL".
+  const ncAmount = payload.dte.nc_amount ?? payload.total;
+  const totalLabel =
+    payload.dte.nc_amount != null && payload.dte.nc_amount < payload.total
+      ? 'MONTO ANULADO'
+      : 'TOTAL ANULADO';
+  printXLTotal(tp, totalLabel, ncAmount, fontSize);
+  tp.drawLine();
+  tp.newLine();
+
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println('Documento Tributario Electronico');
+  tp.bold(false);
+  tp.println('Verifique en www.sii.cl');
+  tp.alignLeft();
+  tp.newLine();
+
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
+
+  printBillFooter(tp, payload.restaurant, { showQr });
+  tp.newLine();
+}
+
+/**
+ * Dispatcher publico para nota_credito_final.
+ */
+export async function renderNotaCreditoFinalEscPos(
+  tp: Printer,
+  payload: NotaCreditoFinalPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
+  const fontSize = getFontSize(payload.print_options);
+  applyFontSize(tp, fontSize);
+  try {
+    await renderNotaCreditoFinalClassic(tp, payload, supabase, logger);
+  } finally {
+    resetFontSize(tp);
+  }
 }

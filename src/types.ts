@@ -20,7 +20,12 @@ export type JobType =
   | 'bill_proforma'
   | 'sii_receipt'
   | 'cash_close'
-  | 'kitchen_cancel';
+  | 'kitchen_cancel'
+  // mig 082 bait-pos: facturas electronicas tributarias (33 / 34) y
+  // notas de credito (61) con bloque RECEPTOR y marca legal correcta.
+  // Antes salian como bill_proforma -> ticket identico a boleta -> invalido.
+  | 'factura_final'
+  | 'nota_credito_final';
 
 export type JobStatus =
   | 'pending'
@@ -298,6 +303,69 @@ export type BillProformaPayload = {
   printer?: PrinterPayloadInfo;
 };
 
+/**
+ * Datos del receptor de un DTE tributario (factura o NC). Espejo del
+ * bloque `receiver` que arman las RPCs enqueue_factura_final /
+ * enqueue_nota_credito_final (mig 082 bait-pos).
+ *
+ * - rut + name son los critic os para la marca legal "FACTURA ELECTRONICA"
+ *   con identificacion del receptor. Si solo viene rut, el renderer pone
+ *   "Razon social: -" (defensivo).
+ * - giro / address / comuna son embellecimiento; si vienen null, se omiten.
+ */
+export type DteReceiverInfo = {
+  rut: string | null;
+  name: string | null;
+  giro: string | null;
+  address: string | null;
+  comuna: string | null;
+};
+
+/**
+ * Snapshot del DTE emitido en el payload del print_job. `folio` puede ser
+ * null si la mig RPC armo el payload antes que el provider respondiera —
+ * el renderer imprime "FOLIO PENDIENTE" en ese caso (el agente re-leera
+ * el job cuando el folio llegue async via /api/internal/dte-retry).
+ */
+export type DtePrintInfo = {
+  type: string | null;
+  folio: number | null;
+  emitted_at: string | null;
+};
+
+/**
+ * FACTURA ELECTRÓNICA (33 o 34). Mismo shape que BillProformaPayload + bloque
+ * `receiver` + bloque `dte`. La marca legal en el papel es "FACTURA
+ * ELECTRÓNICA Nº<folio>" en vez de "BOLETA #<order_number>".
+ *
+ * El renderer lee `dte.type` para distinguir 33 (factura afecta) vs 34
+ * (factura exenta) y ajusta la marca legal correspondiente.
+ *
+ * Sumado en mig 082 bait-pos (2026-05-23). Antes Carlos cobraba con factura
+ * y el ticket salia identico a boleta — invalido como respaldo tributario.
+ */
+export type FacturaFinalPayload = BillProformaPayload & {
+  receiver: DteReceiverInfo;
+  dte: DtePrintInfo;
+};
+
+/**
+ * NOTA DE CRÉDITO (61) post-anulacion de orden ya cobrada con DTE. La marca
+ * legal es "NOTA DE CRÉDITO Nº<folio>" + bloque `reference` indicando que
+ * folio original anula (boleta o factura).
+ *
+ * `dte.nc_amount` es el monto efectivamente anulado (puede ser parcial).
+ */
+export type NotaCreditoFinalPayload = BillProformaPayload & {
+  receiver: DteReceiverInfo;
+  dte: DtePrintInfo & { nc_amount: number | null };
+  reference: {
+    original_folio: number | null;
+    original_dte_type: string | null;
+    reason: string | null;
+  };
+};
+
 export type CashClosePayload = {
   session_id: string;
   opened_at: string;
@@ -376,7 +444,58 @@ export function isBillProformaPayload(p: unknown): p is BillProformaPayload {
     // igual cae al render — el guard es laxo a proposito (`in` con number=0
     // o undefined ambos satisfacen). Defensa: el renderer trata tip_amount
     // como `?? 0`.
-    !('suggested_tip_amount' in p)
+    !('suggested_tip_amount' in p) &&
+    // mig 082: factura_final / nota_credito_final tambien comparten shape
+    // base con BillProformaPayload + 'receiver' + 'dte'. El dispatcher
+    // ya rutea por job_type, pero este guard lo hacemos exclusivo para
+    // evitar que un payload de factura caiga a renderBillProforma si
+    // alguna vez el routing falla.
+    !('receiver' in p) &&
+    !('dte' in p)
+  );
+}
+
+/**
+ * Discriminante exclusivo para factura_final. Requiere los bloques
+ * `receiver` y `dte` (mig 082 bait-pos). El renderer toma el shape
+ * BillProformaPayload + bloques + marca legal.
+ *
+ * Si alguno de los dos bloques no viene, cae al fallback ASCII.
+ */
+export function isFacturaFinalPayload(p: unknown): p is FacturaFinalPayload {
+  return (
+    !!p &&
+    typeof p === 'object' &&
+    'items' in p &&
+    Array.isArray((p as FacturaFinalPayload).items) &&
+    'total' in p &&
+    'restaurant' in p &&
+    'receiver' in p &&
+    'dte' in p &&
+    // El receptor puede tener rut=null si el cobro no lo capturo bien,
+    // pero el bloque `receiver` igual tiene que estar presente como objeto.
+    typeof (p as FacturaFinalPayload).receiver === 'object'
+  );
+}
+
+/**
+ * Discriminante para nota_credito_final. Igual que factura + bloque
+ * `reference` al folio anulado.
+ */
+export function isNotaCreditoFinalPayload(
+  p: unknown
+): p is NotaCreditoFinalPayload {
+  return (
+    !!p &&
+    typeof p === 'object' &&
+    'items' in p &&
+    Array.isArray((p as NotaCreditoFinalPayload).items) &&
+    'total' in p &&
+    'restaurant' in p &&
+    'receiver' in p &&
+    'dte' in p &&
+    'reference' in p &&
+    typeof (p as NotaCreditoFinalPayload).reference === 'object'
   );
 }
 
