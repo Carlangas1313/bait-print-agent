@@ -79,6 +79,119 @@ const CONNECT_TIMEOUT_MS = 5_000;
 const MIN_USEFUL_BUFFER_BYTES = 16;
 
 /**
+ * Delay POST-write entre jobs concurrentes que apuntan al mismo queue Windows
+ * (v0.9.4). Override via env var `BAIT_PRINT_INTER_JOB_DELAY_MS`.
+ *
+ * Por que existe (bug v0.9.3):
+ * ----------------------------
+ * Cuando bait-pos genera varios kitchen_orders simultaneos que terminan en el
+ * mismo queue fisico (ej: setup donde 5 printers DB apuntan a target='PrintCaja'),
+ * el agente los renderiza en paralelo y los manda al spooler en burst de <230ms.
+ * El driver "Generic / Text Only" + la termica USB no aguanta el ritmo:
+ *  - El job N entra cuando el N-1 todavia esta procesandose.
+ *  - El spooler los acepta a los 4, marca printed los 4.
+ *  - Fisicamente solo sale 1 papel (los demas descartados internamente).
+ *
+ * El fix es serializar jobs por target queue: un job a la vez por queue, con
+ * un delay corto post-write para que la termica termine de procesar el buffer
+ * anterior antes que el siguiente se mande.
+ *
+ * Default 500ms:
+ *  - Suficiente para que una termica USB tipica termine de imprimir un ticket
+ *    de comanda corta (4-8 lineas + cut, lo mas comun).
+ *  - No tan largo como para hacer notable la espera en uso normal (el operador
+ *    no nota un retraso de 500ms entre comandas).
+ *  - Para tickets largos (cierre de caja con 50+ items) el agente igual hace
+ *    la espera completa y se vuelve a serializar, lo cual esta bien porque
+ *    cierres no son concurrentes en la practica.
+ *
+ * Override:
+ *  - BAIT_PRINT_INTER_JOB_DELAY_MS=0  → sin delay (debugging local).
+ *  - BAIT_PRINT_INTER_JOB_DELAY_MS=1500 → termica MUY lenta o cierre con logo
+ *    grande que demora en procesar.
+ */
+const DEFAULT_INTER_JOB_DELAY_MS = 500;
+
+function resolveInterJobDelayMs(): number {
+  const raw = process.env.BAIT_PRINT_INTER_JOB_DELAY_MS;
+  if (raw === undefined || raw.trim().length === 0) {
+    return DEFAULT_INTER_JOB_DELAY_MS;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    return DEFAULT_INTER_JOB_DELAY_MS;
+  }
+  return parsed;
+}
+
+/**
+ * Lock por target Windows queue (v0.9.4).
+ *
+ * Key = queue name resuelto (ej: "PrintCaja", "HP4000"). NO printer.id ni
+ * printer.name: lo que importa es a que queue FISICA del spooler estamos
+ * mandando bytes. Multiples filas `printers` en DB pueden apuntar al mismo
+ * queue (caso del bug original), y todas ellas tienen que serializarse contra
+ * el mismo lock.
+ *
+ * Value = promesa que representa el job en vuelo (write + post-write delay).
+ * Cuando termina, el siguiente job al mismo target arranca recien ahi.
+ *
+ * Por que un Map global y no por instancia:
+ *  - sendUsbViaSpooler se llama desde N callsites (renderJobToPrinter del flow
+ *    productivo, renderTestPage del companion, futuros). Todos comparten el
+ *    mismo spooler de Windows — el lock tiene que ser proceso-global, no por
+ *    callsite.
+ *  - El proceso del agente es single-instance (servicio Windows), asi que
+ *    "global del proceso" == "global del agente".
+ *
+ * Limpieza:
+ *  - Cuando termina el job, si el lock todavia apunta a la misma promesa que
+ *    teniamos, lo removemos. Si alguien ya seteo una nueva promesa encima
+ *    (jobs encolados), la dejamos para no perder esa cadena.
+ *  - Si la promesa rechaza, el catch tambien limpia (no queremos que un error
+ *    deje el lock vivo para siempre bloqueando el target).
+ */
+const targetLocks = new Map<string, Promise<void>>();
+
+/**
+ * Contador de jobs en vuelo + en cola por target. Solo para logging
+ * informativo ("hay 3 jobs esperando este queue"). NO se usa para logica de
+ * scheduling — el ordenamiento real lo da la cadena de promesas en
+ * targetLocks.
+ *
+ * Incrementamos antes de empezar la espera, decrementamos cuando entramos
+ * al critical section (write + sleep). Asi `queueDepth` en el log refleja
+ * "cuantos jobs hay haciendo cola este target", incluido el que se va a
+ * loggear.
+ */
+const targetQueueDepth = new Map<string, number>();
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Hook para sobrescribir la funcion de envio al spooler RAW. Default es la
+ * real (`sendRawToWindowsPrinter` que spawnea PowerShell). Los tests la
+ * cambian por un mock que no toca Windows.
+ *
+ * No es API publica — el `_` prefix marca el contrato. Cualquier uso fuera
+ * del archivo de test es un bug.
+ */
+type RawSendFn = (
+  printerName: string,
+  buffer: Buffer,
+  logger: Logger
+) => Promise<void>;
+
+let rawSendImpl: RawSendFn = sendRawToWindowsPrinter;
+
+export function _setRawSendImplForTests(fn: RawSendFn | null): void {
+  rawSendImpl = fn ?? sendRawToWindowsPrinter;
+}
+
+/**
  * Callback que el renderer usa para poblar el ThermalPrinter con el
  * contenido del ticket (lineas, bold, beep, cut). El helper ya hizo
  * `tp.clear()` antes de llamarte, asi que arrancas con buffer limpio.
@@ -147,6 +260,13 @@ export async function sendEscPos(
  * NO abre hasta que llamamos `execute()` o `isPrinterConnected()`. Como
  * solo usamos `getBuffer()`, nunca se intenta abrir el handle. Workaround
  * para que la API de node-thermal-printer nos sirva como builder de buffer.
+ *
+ * Serializacion por target (v0.9.4):
+ * ----------------------------------
+ * Las llamadas concurrentes al MISMO queue Windows se serializan via
+ * `targetLocks`. El rendering del buffer corre en paralelo (cheap, en RAM),
+ * pero la escritura al spooler + el delay post-write se hacen una a la vez.
+ * Ver comentario sobre el bug original arriba en `DEFAULT_INTER_JOB_DELAY_MS`.
  */
 async function sendUsbViaSpooler(
   printer: PrinterRow,
@@ -154,6 +274,32 @@ async function sendUsbViaSpooler(
   logger: Logger,
   width: number
 ): Promise<void> {
+  // Resolver el QUEUE NAME que Win32 OpenPrinter espera.
+  //
+  // Historicamente la app guardaba `target` como UNC share (\\localhost\<name>)
+  // porque la version vieja del agente usaba el `file` backend. Con el spooler
+  // RAW de Win32 (v0.6.4+), `target` debe ser el queue name plano. Como hay
+  // configs viejas en produccion con UNC, soportamos ambos:
+  //
+  //   target='\\localhost\PrintCaja' → extraemos 'PrintCaja'
+  //   target='\\OFFICE-PC\HP'        → extraemos 'HP' (UNC remoto, OpenPrinter
+  //                                      lo resuelve via spooler de OFFICE-PC)
+  //   target='PrintCaja'             → tal cual (caso optimo)
+  //   target=NULL o vacio            → fallback a printer.name (alias humano)
+  //
+  // Lo resolvemos PRIMERO (antes del rendering) porque es el key del lock por
+  // target. Si falla, fallamos rapido sin gastar CPU rindiendo un buffer que
+  // no podemos mandar a ningun lado.
+  const queueName = resolveWindowsQueueName(printer);
+  if (!queueName) {
+    throw new Error(
+      `No pude resolver el queue name de la impresora "${printer.name}". ` +
+        `Configura el campo "Destino" en bait-app.cl -> Impresoras con el ` +
+        `nombre exacto de la cola de Windows (ej: "PrintCaja"). ` +
+        `Verifica con: Get-Printer | Select Name`
+    );
+  }
+
   const tp = new ThermalPrinter({
     type: PrinterTypes.EPSON,
     interface: '\\\\.\\__bait_buffer_only__',
@@ -194,39 +340,146 @@ async function sendUsbViaSpooler(
     );
   }
 
-  // Resolver el QUEUE NAME que Win32 OpenPrinter espera.
-  //
-  // Historicamente la app guardaba `target` como UNC share (\\localhost\<name>)
-  // porque la version vieja del agente usaba el `file` backend. Con el spooler
-  // RAW de Win32 (v0.6.4+), `target` debe ser el queue name plano. Como hay
-  // configs viejas en produccion con UNC, soportamos ambos:
-  //
-  //   target='\\localhost\PrintCaja' → extraemos 'PrintCaja'
-  //   target='\\OFFICE-PC\HP'        → extraemos 'HP' (UNC remoto, OpenPrinter
-  //                                      lo resuelve via spooler de OFFICE-PC)
-  //   target='PrintCaja'             → tal cual (caso optimo)
-  //   target=NULL o vacio            → fallback a printer.name (alias humano)
-  const queueName = resolveWindowsQueueName(printer);
-  if (!queueName) {
-    throw new Error(
-      `No pude resolver el queue name de la impresora "${printer.name}". ` +
-        `Configura el campo "Destino" en bait-app.cl -> Impresoras con el ` +
-        `nombre exacto de la cola de Windows (ej: "PrintCaja"). ` +
-        `Verifica con: Get-Printer | Select Name`
-    );
-  }
-
   logger.debug(
     { printerName: printer.name, queueName, rawTarget: printer.target },
     'USB spooler: resolved queue name from printer config'
   );
 
-  await sendRawToWindowsPrinter(queueName, buffer, logger);
+  // Serializacion por target queue (v0.9.4): si hay un job en vuelo o
+  // encolado para este queue, esperamos a que termine antes de empezar el
+  // nuestro. La cadena de promesas en targetLocks garantiza orden FIFO entre
+  // los jobs que llegaron a este punto del codigo.
+  //
+  // OJO: la espera incluye el delay post-write del job anterior. Asi le damos
+  // tiempo a la termica fisica de procesar el buffer ya enviado antes de que
+  // el spooler reciba el siguiente. Ese delay es lo que evita que el driver
+  // "Generic / Text Only" descarte jobs en burst.
+  await acquireTargetLockAndSend(
+    queueName,
+    printer,
+    buffer,
+    logger
+  );
+
   logger.debug(
     { printer: printer.name, queueName, bytes: buffer.length },
     'sendEscPos USB via spooler RAW completado'
   );
 }
+
+/**
+ * Toma el lock del target queue, ejecuta el write RAW + sleep post-write,
+ * y libera el lock al final. Si hay un job previo en vuelo, espera a que
+ * termine (incluido su delay) antes de arrancar.
+ *
+ * Diseño de la cadena:
+ *  1. Leemos el lock actual del target (puede ser undefined).
+ *  2. Construimos NUESTRA promesa `p` que espera al previo y despues hace
+ *     write + sleep. La encadenamos en una sola promesa async.
+ *  3. La seteamos en el Map ANTES de await (sincronicamente). Asi el
+ *     proximo caller que entre ve nuestra `p` como lock y se encadena
+ *     atras nuestro, no atras del previo.
+ *  4. Awaiteamos nuestra propia `p` y, al final, limpiamos solo si seguimos
+ *     siendo el lock (no romper la cadena de los que se encolaron).
+ *
+ * Errores:
+ *  - Si el write falla, lo propagamos pero igual liberamos el lock para no
+ *    bloquear futuros jobs en este target.
+ *  - El sleep post-write SOLO corre si el write tuvo exito. Si el write fallo
+ *    no tiene sentido esperar.
+ */
+async function acquireTargetLockAndSend(
+  queueName: string,
+  printer: PrinterRow,
+  buffer: Buffer,
+  logger: Logger
+): Promise<void> {
+  const previousLock = targetLocks.get(queueName);
+  const interJobDelayMs = resolveInterJobDelayMs();
+
+  // Snapshot del depth ANTES de incrementar, para que el log refleje cuantos
+  // habia antes del nuestro. El que va a empezar inmediato (sin previousLock)
+  // ve queueDepth=0; el primero en esperar ve 1; el segundo en esperar ve 2.
+  const depthBefore = targetQueueDepth.get(queueName) ?? 0;
+  targetQueueDepth.set(queueName, depthBefore + 1);
+
+  if (previousLock) {
+    logger.info(
+      {
+        target: queueName,
+        printerName: printer.name,
+        queueDepth: depthBefore + 1
+      },
+      `Esperando lock del target "${queueName}" (otro job en proceso)`
+    );
+  }
+
+  const ownPromise: Promise<void> = (async () => {
+    // Esperar al previo. Si tira, lo capturamos para no propagar el error
+    // del job anterior al nuestro: ese error ya lo recibio su propio caller.
+    if (previousLock) {
+      try {
+        await previousLock;
+      } catch {
+        // Ignorado a proposito: el error del job previo es del job previo.
+        // Nosotros seguimos para no bloquear el target a perpetuidad si uno
+        // falla.
+      }
+    }
+
+    try {
+      await rawSendImpl(queueName, buffer, logger);
+
+      // Delay post-write SOLO si el write fue exitoso. Le damos tiempo a la
+      // termica fisica de procesar el buffer antes que el siguiente job en
+      // la cadena le mande mas bytes. Sin este sleep, el driver descarta
+      // jobs en burst (root cause del bug v0.9.3).
+      if (interJobDelayMs > 0) {
+        logger.debug(
+          { target: queueName, delayMs: interJobDelayMs },
+          'Delay post-write para que la termica procese el buffer'
+        );
+        await sleep(interJobDelayMs);
+      }
+    } finally {
+      // Decrementar depth siempre (exito o fallo). El cleanup del Map de
+      // locks se hace despues, basado en si seguimos siendo el lock activo.
+      const current = targetQueueDepth.get(queueName) ?? 1;
+      if (current <= 1) {
+        targetQueueDepth.delete(queueName);
+      } else {
+        targetQueueDepth.set(queueName, current - 1);
+      }
+    }
+  })();
+
+  // Setear el lock SINCRONO antes del await, para que cualquier caller que
+  // llegue mientras nosotros esperamos se encadene atras nuestro.
+  targetLocks.set(queueName, ownPromise);
+
+  try {
+    await ownPromise;
+  } finally {
+    // Solo limpiamos si seguimos siendo el lock. Si alguien ya seteo una
+    // promesa nueva encima (jobs encolados detras nuestro), no la tocamos.
+    if (targetLocks.get(queueName) === ownPromise) {
+      targetLocks.delete(queueName);
+    }
+  }
+}
+
+/**
+ * Helper interno expuesto SOLO para tests. NO usar en codigo productivo —
+ * el flow normal pasa por sendEscPos que llama internamente al lock.
+ *
+ * Se exporta el Map y el contador asi un test puede:
+ *  - Resetear estado entre casos.
+ *  - Inspeccionar queueDepth durante una corrida concurrente.
+ *
+ * El _ prefix marca el contrato "no public, no semver guarantee".
+ */
+export const _targetLocksForTests = targetLocks;
+export const _targetQueueDepthForTests = targetQueueDepth;
 
 /**
  * Extrae el queue name de Windows desde el target de la printer. Maneja UNC
