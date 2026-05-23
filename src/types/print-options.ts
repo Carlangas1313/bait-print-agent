@@ -15,9 +15,27 @@ export type PrintStyle = 'classic' | 'minimal' | 'brand' | 'thermal_pro';
 export type PrintDensity = 'compact' | 'normal' | 'spacious';
 
 /**
+ * Tamano de letra del ticket. Aplicado solo a header (nombre del restaurant
+ * + titulo del ticket) — items, totales y payment quedan en normal para no
+ * partir el layout cuando 'large' divide el ancho efectivo por 2.
+ *
+ *  - 'small':  setTextSize(0,0) -> font B en algunas termicas (~6x10px). Util
+ *              para rollos al limite o cuando el dueno quiere mas info por
+ *              cm de papel.
+ *  - 'normal': setTextSize(1,1) -> default 12x24px estandar.
+ *  - 'large':  setTextSize(2,2) -> doble alto/ancho. SOLO se aplica al header
+ *              para que el cliente vea el nombre del local desde lejos. Items
+ *              siguen en normal.
+ *
+ * El renderer lee esto en cada render*Style y aplica los setTextSize al
+ * inicio + restaura a normal antes de imprimir items.
+ */
+export type FontSize = 'small' | 'normal' | 'large';
+
+/**
  * Toggles compartidos por bill_preview y bill_proforma. Ambos heredan style +
- * showLogo + showAddress + showRut + showQr + density. La proforma agrega
- * cosas especificas del payment en el renderer (no en options).
+ * showLogo + showAddress + showRut + showQr + density + fontSize. La proforma
+ * agrega cosas especificas del payment en el renderer (no en options).
  */
 export type BillSharedOptions = {
   style?: PrintStyle;          // default 'classic'
@@ -26,6 +44,7 @@ export type BillSharedOptions = {
   showRut?: boolean;           // default false en bill_preview, true en bill_proforma
   showQr?: boolean;            // default true (si print_qr_url seteado)
   density?: PrintDensity;      // default 'normal'
+  fontSize?: FontSize;         // default 'normal'
 };
 
 export type BillPreviewOptions = BillSharedOptions;
@@ -44,6 +63,7 @@ export type KitchenOrderOptions = {
   showWaiter?: boolean;          // default true — nombre del mesero en header
   showGuests?: boolean;          // default true — N comensales en header
   density?: PrintDensity;        // default 'normal'
+  fontSize?: FontSize;           // default 'normal'
 };
 
 export type KitchenCancelOptions = {
@@ -51,6 +71,7 @@ export type KitchenCancelOptions = {
   showReason?: boolean;          // default true — motivo de anulacion (customer_note)
   showWaiter?: boolean;          // default true
   density?: PrintDensity;        // default 'compact'
+  fontSize?: FontSize;           // default 'normal'
 };
 
 export type CashCloseOptions = {
@@ -58,6 +79,7 @@ export type CashCloseOptions = {
   showHighlightedDiff?: boolean;     // default true — DIFERENCIA en bold/destacada
   showMethodBreakdown?: boolean;     // default true — desglose efectivo/tarjeta/transfer
   density?: PrintDensity;            // default 'normal'
+  fontSize?: FontSize;               // default 'normal'
 };
 
 /**

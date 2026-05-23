@@ -356,6 +356,11 @@ async function printLogoIfEnabled(
     // el pipeline de bait-pos).
     await tp.printImage(localPath);
     tp.alignLeft();
+    // Aire después del logo: el header del ticket queda pegado al PNG si no
+    // dejamos espacio. 2 newlines = ~3mm en termica estandar — suficiente
+    // separacion para que el nombre del restaurant respire.
+    tp.newLine();
+    tp.newLine();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     logger.warn(
@@ -370,6 +375,66 @@ async function printLogoIfEnabled(
       // ignorar
     }
   }
+}
+
+/**
+ * Aplica el tamano de letra "large" del header. SOLO afecta nombre del
+ * restaurant + titulo del ticket. Items, totales y payment siempre quedan
+ * en normal — si aplicaramos (2,2) a items el width efectivo se divide por
+ * 2 (32 cols pasan a 16) y los montos quedan en otra linea.
+ *
+ * Llamadores: usarlo asi al inicio del bloque de header:
+ *   applyHeaderFontSize(tp, fontSize);   // empieza a imprimir en grande
+ *   tp.println(name);
+ *   tp.println(title);
+ *   resetHeaderFontSize(tp);             // vuelve a normal antes de items
+ *
+ * fontSize='small' tambien se aplica al header (encoge nombre + titulo).
+ * fontSize='normal' es noop.
+ *
+ * NOTE: node-thermal-printer `setTextSize(h, w)` espera valores 0..7, donde
+ * 0=1x y 1=2x (es un multiplier indice, no factor). 0=font B (~6x10px),
+ * 1=2x doble alto/ancho. Mantener acotado para no romper el papel.
+ */
+function applyHeaderFontSize(
+  tp: Printer,
+  fontSize: 'small' | 'normal' | 'large' | undefined
+): void {
+  if (fontSize === 'small') {
+    // setTextSize(0, 0) -> font B / small. En termicas Rongta sin font B
+    // efectivamente queda en normal (no rompe nada).
+    tp.setTextSize(0, 0);
+  } else if (fontSize === 'large') {
+    // setTextSize(1, 1) -> doble alto y ancho.
+    tp.setTextSize(1, 1);
+  }
+  // 'normal' o undefined: noop.
+}
+
+/**
+ * Resetea el tamano de letra a normal. Llamar SIEMPRE despues del bloque
+ * de header en grande/chico para que items/totales no hereden el size.
+ *
+ * Equivalente a setTextSize(0, 0) en node-thermal-printer (rara API:
+ * setTextNormal() resetea pero ademas saca el bold). Usamos setTextSize
+ * explicito para no tocar bold/invert que el caller pudo haber prendido.
+ */
+function resetHeaderFontSize(tp: Printer): void {
+  // setTextNormal() resetea size + bold + double height. Es lo que usan
+  // otros helpers del file. Para no interferir con bold/invert lo dejamos
+  // en setTextNormal pero el caller debe re-aplicar bold/invert si los
+  // necesita despues.
+  tp.setTextNormal();
+}
+
+/**
+ * Lee el fontSize de un print_options de cualquier ticket. Defensa: si el
+ * payload viene de una RPC pre-fontSize, devuelve 'normal'.
+ */
+function getFontSize(
+  print_options?: { fontSize?: 'small' | 'normal' | 'large' }
+): 'small' | 'normal' | 'large' {
+  return print_options?.fontSize ?? 'normal';
 }
 
 // ====================================================================
@@ -455,6 +520,7 @@ function renderKitchenOrderClassic(
     showPrices?: boolean;
     showWaiter?: boolean;
     showGuests?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
   };
   const showOpenTime = opts.showOpenTime ?? true;
   const showHighlightedNotes = opts.showHighlightedNotes ?? true;
@@ -462,14 +528,19 @@ function renderKitchenOrderClassic(
   const showPrices = opts.showPrices ?? false; // default off para cocina
   const showWaiter = opts.showWaiter ?? true;
   const showGuests = opts.showGuests ?? true;
+  const fontSize = getFontSize(opts);
 
   // Header XL en 2 lineas: estacion arriba, destino abajo.
+  // fontSize=large encima del setTextDoubleHeight: en termicas con soporte
+  // ESC/POS estandar, las dos se combinan dando 4x alto. La mayoria de
+  // termicas chinas (Rongta) cap a 2x — no rompe, solo se ve como large.
   tp.alignCenter();
   tp.bold(true);
+  applyHeaderFontSize(tp, fontSize);
   tp.setTextDoubleHeight();
   tp.println(station);
   tp.println(destination);
-  tp.setTextNormal();
+  resetHeaderFontSize(tp);
   tp.bold(false);
 
   // Subtitle line 1: hora (siempre) + "Hace X min" si showOpenTime
@@ -620,19 +691,23 @@ function renderKitchenCancelClassic(
   const opts = (payload.print_options ?? {}) as {
     showReason?: boolean;
     showWaiter?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
   };
   const showReason = opts.showReason ?? true;
   const showWaiter = opts.showWaiter ?? true;
+  const fontSize = getFontSize(opts);
 
-  // Header: badge invertido "ANULACION" + destino en doble altura
+  // Header: badge invertido "ANULACION" + destino en doble altura.
+  // fontSize='large' suma a doubleHeight (ver renderKitchenOrderClassic).
   tp.alignCenter();
   tp.bold(true);
   tp.invert(true);
+  applyHeaderFontSize(tp, fontSize);
   tp.setTextDoubleHeight();
   tp.println(' ANULACION ');
   tp.invert(false);
   tp.println(destination);
-  tp.setTextNormal();
+  resetHeaderFontSize(tp);
   tp.bold(false);
 
   // Subtitle: mesero (opcional) + hora
@@ -685,12 +760,17 @@ async function renderBillPreviewClassic(
 ): Promise<void> {
   // Mig 060: width real del papel (32/42/48) desde payload.printer.width_chars.
   const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
 
   // Logo si esta activo (D4 + D5 del spec). Si falla, sigue sin logo.
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   // Header del local (nombre + direccion + comuna/fono).
+  // fontSize='large': nombre/direccion en grande. resetHeaderFontSize antes
+  // de los items para que los montos no se descuadren.
+  applyHeaderFontSize(tp, fontSize);
   printRestaurantHeader(tp, payload.restaurant);
+  resetHeaderFontSize(tp);
 
   // Slogan si esta seteado (mig 058).
   const slogan = payload.restaurant.slogan?.trim();
@@ -782,12 +862,17 @@ async function renderBillProformaClassic(
 ): Promise<void> {
   // Mig 060: width real del papel.
   const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
 
   // Logo si esta activo (D4 + D5 del spec). Si falla, sigue sin logo.
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   // Header del local (nombre + direccion + comuna/fono).
+  // fontSize='large' agranda nombre+direccion. resetHeaderFontSize antes de
+  // items para no romper el layout 32/42/48.
+  applyHeaderFontSize(tp, fontSize);
   printRestaurantHeader(tp, payload.restaurant);
+  resetHeaderFontSize(tp);
 
   // Slogan si esta seteado (mig 058).
   const slogan = payload.restaurant.slogan?.trim();
@@ -923,9 +1008,11 @@ function renderCashCloseClassic(
   const opts = (payload.print_options ?? {}) as {
     showHighlightedDiff?: boolean;
     showMethodBreakdown?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
   };
   const showHighlightedDiff = opts.showHighlightedDiff ?? true;
   const showMethodBreakdown = opts.showMethodBreakdown ?? true;
+  const fontSize = getFontSize(opts);
 
   // Header: usa restaurant (mig 058+) si esta disponible para incluir logo
   // y ornament. Si no, fallback al header generico de cash close.
@@ -935,7 +1022,9 @@ function renderCashCloseClassic(
     // Logo: no llamamos a printLogoIfEnabled porque cash_close hoy no tiene
     // showLogo en sus toggles — si en el futuro se agrega, sumar la llamada
     // aca con un toggle especifico.
+    applyHeaderFontSize(tp, fontSize);
     printRestaurantHeader(tp, payload.restaurant);
+    resetHeaderFontSize(tp);
 
     const slogan = payload.restaurant.slogan?.trim();
     if (slogan && slogan.length > 0) {
@@ -947,9 +1036,11 @@ function renderCashCloseClassic(
     ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
   }
 
-  // Header XL del cierre
+  // Header XL del cierre. fontSize='large' suma a doubleHeight (mayoria de
+  // termicas chinas cap a 2x).
   tp.alignCenter();
   tp.bold(true);
+  applyHeaderFontSize(tp, fontSize);
   tp.setTextDoubleHeight();
   tp.println('CIERRE DE CAJA');
   tp.setTextNormal();
@@ -1092,10 +1183,10 @@ export async function renderBillProformaEscPos(
 }
 
 /**
- * Dispatcher publico para kitchen_order. Carlos prefiere classic, asi que
- * el switch por style esta presente pero por ahora todos los styles caen
- * al mismo render. Los toggles del payload.print_options se aplican DENTRO
- * de renderKitchenOrderClassic (Task 4.8).
+ * Dispatcher publico para kitchen_order. v0.9.5 suma styles minimal/brand/
+ * thermal_pro (antes ignoraba el style y siempre llamaba a Classic). El
+ * default sigue siendo classic — RPCs pre-mig 058 que no traen
+ * print_options.style caen ahi.
  *
  * Recibe supabase + logger por consistencia con bill_*. Hoy no se usan
  * (kitchen no imprime logo) pero permite enchufarlo en el futuro sin
@@ -1108,14 +1199,22 @@ export async function renderKitchenOrderEscPos(
   _supabase?: SupabaseClient | undefined,
   _logger?: Logger
 ): Promise<void> {
-  // Por disenio: kitchen_order no tiene styles alternativos (los tickets
-  // operacionales son siempre classic). Si en el futuro se quieren styles,
-  // sumar aca el switch.
-  return renderKitchenOrderClassic(tp, payload, jobType);
+  const style = payload.print_options?.style ?? 'classic';
+  switch (style) {
+    case 'minimal':
+      return renderKitchenOrderMinimal(tp, payload, jobType);
+    case 'brand':
+      return renderKitchenOrderBrand(tp, payload, jobType);
+    case 'thermal_pro':
+      return renderKitchenOrderThermalPro(tp, payload, jobType);
+    case 'classic':
+    default:
+      return renderKitchenOrderClassic(tp, payload, jobType);
+  }
 }
 
 /**
- * Dispatcher publico para kitchen_cancel.
+ * Dispatcher publico para kitchen_cancel. v0.9.5 suma styles alternativos.
  */
 export async function renderKitchenCancelEscPos(
   tp: Printer,
@@ -1123,13 +1222,24 @@ export async function renderKitchenCancelEscPos(
   _supabase?: SupabaseClient | undefined,
   _logger?: Logger
 ): Promise<void> {
-  return renderKitchenCancelClassic(tp, payload);
+  const style = payload.print_options?.style ?? 'classic';
+  switch (style) {
+    case 'minimal':
+      return renderKitchenCancelMinimal(tp, payload);
+    case 'brand':
+      return renderKitchenCancelBrand(tp, payload);
+    case 'thermal_pro':
+      return renderKitchenCancelThermalPro(tp, payload);
+    case 'classic':
+    default:
+      return renderKitchenCancelClassic(tp, payload);
+  }
 }
 
 /**
- * Dispatcher publico para cash_close. Un solo style por ahora; los toggles
- * (showHighlightedDiff, showMethodBreakdown) se aplican dentro del Classic
- * (Task 4.9).
+ * Dispatcher publico para cash_close. v0.9.5 suma styles alternativos. Los
+ * toggles (showHighlightedDiff, showMethodBreakdown) y el fontSize del
+ * payload se aplican dentro de cada render*Style.
  */
 export async function renderCashCloseEscPos(
   tp: Printer,
@@ -1137,7 +1247,18 @@ export async function renderCashCloseEscPos(
   _supabase?: SupabaseClient | undefined,
   _logger?: Logger
 ): Promise<void> {
-  return renderCashCloseClassic(tp, payload);
+  const style = payload.print_options?.style ?? 'classic';
+  switch (style) {
+    case 'minimal':
+      return renderCashCloseMinimal(tp, payload);
+    case 'brand':
+      return renderCashCloseBrand(tp, payload);
+    case 'thermal_pro':
+      return renderCashCloseThermalPro(tp, payload);
+    case 'classic':
+    default:
+      return renderCashCloseClassic(tp, payload);
+  }
 }
 
 // ====================================================================
@@ -1167,13 +1288,17 @@ async function renderBillPreviewMinimal(
 ): Promise<void> {
   // Mig 060: width real del papel.
   const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
 
   // Logo respetando el toggle (en minimal generalmente OFF, pero respetamos
   // la config del dueño).
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   // Nombre del local: simple, sin centrado bold gigante.
+  // fontSize='large' encima del rendering minimal: el dueno eligio minimal
+  // explicitamente, asi que respetamos su tamano elegido tambien.
   tp.alignLeft();
+  applyHeaderFontSize(tp, fontSize);
   tp.println(payload.restaurant.name);
   const address = payload.restaurant.address?.trim();
   if (address && address.length > 0) {
@@ -1183,6 +1308,7 @@ async function renderBillPreviewMinimal(
 
   // Titulo simple "PRE-CUENTA"
   tp.println('PRE-CUENTA');
+  resetHeaderFontSize(tp);
 
   // Datos de mesa en linea simple
   const time = formatTime(payload.opened_at);
@@ -1236,6 +1362,7 @@ async function renderBillPreviewBrand(
 ): Promise<void> {
   // Mig 060: width real del papel.
   const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
 
   const ornament = payload.restaurant.print_ornament_char ?? null;
 
@@ -1243,8 +1370,10 @@ async function renderBillPreviewBrand(
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   // Nombre del local centrado + bold + doble altura.
+  // fontSize='large' suma a doubleHeight (mayoria de termicas cap a 2x).
   tp.alignCenter();
   tp.bold(true);
+  applyHeaderFontSize(tp, fontSize);
   tp.setTextDoubleHeight();
   tp.println(payload.restaurant.name);
   tp.setTextNormal();
@@ -1340,13 +1469,16 @@ async function renderBillPreviewThermalPro(
 ): Promise<void> {
   // Mig 060: width real del papel.
   const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
 
   // Logo respetando el toggle (en thermal_pro generalmente OFF para
   // priorizar densidad de info).
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
-  // Header denso: nombre + direccion en una linea
+  // Header denso: nombre + direccion en una linea.
+  // fontSize='large' agranda el header (rompe densidad pero respeta opcion).
   tp.println('='.repeat(width));
+  applyHeaderFontSize(tp, fontSize);
   const name = payload.restaurant.name;
   const addr = payload.restaurant.address?.trim();
   if (addr && addr.length > 0) {
@@ -1365,6 +1497,7 @@ async function renderBillPreviewThermalPro(
   } else if (phone) {
     tp.println(`Tel ${phone}`);
   }
+  resetHeaderFontSize(tp);
   tp.println('='.repeat(width));
 
   // Titulo + numero
@@ -1437,10 +1570,12 @@ async function renderBillProformaMinimal(
 ): Promise<void> {
   // Mig 060: width real del papel.
   const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
 
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   tp.alignLeft();
+  applyHeaderFontSize(tp, fontSize);
   tp.println(payload.restaurant.name);
   const address = payload.restaurant.address?.trim();
   if (address && address.length > 0) {
@@ -1449,6 +1584,7 @@ async function renderBillProformaMinimal(
   tp.newLine();
 
   tp.println(`BOLETA #${payload.order_number}`);
+  resetHeaderFontSize(tp);
 
   const time = formatTime(payload.opened_at);
   const meta: string[] = [];
@@ -1512,6 +1648,7 @@ async function renderBillProformaBrand(
 ): Promise<void> {
   // Mig 060: width real del papel.
   const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
 
   const ornament = payload.restaurant.print_ornament_char ?? null;
 
@@ -1519,6 +1656,7 @@ async function renderBillProformaBrand(
 
   tp.alignCenter();
   tp.bold(true);
+  applyHeaderFontSize(tp, fontSize);
   tp.setTextDoubleHeight();
   tp.println(payload.restaurant.name);
   tp.setTextNormal();
@@ -1627,10 +1765,12 @@ async function renderBillProformaThermalPro(
 ): Promise<void> {
   // Mig 060: width real del papel.
   const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
 
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   tp.println('='.repeat(width));
+  applyHeaderFontSize(tp, fontSize);
   const name = payload.restaurant.name;
   const addr = payload.restaurant.address?.trim();
   if (addr && addr.length > 0) {
@@ -1647,6 +1787,7 @@ async function renderBillProformaThermalPro(
   } else if (phone) {
     tp.println(`Tel ${phone}`);
   }
+  resetHeaderFontSize(tp);
   tp.println('='.repeat(width));
 
   tp.bold(true);
@@ -1706,5 +1847,782 @@ async function renderBillProformaThermalPro(
   }
 
   printBillFooter(tp, payload.restaurant);
+  tp.newLine();
+}
+
+// ====================================================================
+// Style variants para kitchen_order / kitchen_cancel / cash_close
+// ====================================================================
+//
+// Hasta v0.9.4 estos 3 tipos solo tenian Classic implementado y los
+// dispatchers siempre llamaban a Classic — los styles minimal/brand/
+// thermal_pro elegidos en /settings/print-templates eran ignorados
+// por el agente (engano al usuario).
+//
+// v0.9.5 suma las 9 variantes para que el style elegido por el dueno
+// se respete. Replican la estructura del Classic con variaciones
+// esteticas (minimal: aire/sin badges, brand: ornament/bold,
+// thermal_pro: denso/igual ancho).
+//
+// Patron general (igual que bill_preview/bill_proforma):
+//  - applyHeaderFontSize/resetHeaderFontSize en el header.
+//  - fontSize='large' SOLO en header (nombre/titulo). Items quedan en
+//    normal para no romper el layout 32/42/48.
+// ====================================================================
+
+/**
+ * MINIMAL style para kitchen_order: header sobrio (sin doble altura),
+ * items pelados sin badges invertidos, sin TOTAL ITEMS gigante al final.
+ * Util para cocinas donde la comanda se lee de a 30cm — la jerarquia la
+ * dan el espacio en blanco y el nombre claro de items.
+ */
+function renderKitchenOrderMinimal(
+  tp: Printer,
+  payload: KitchenJobPayload,
+  jobType: 'kitchen_order' | 'bar_order' = 'kitchen_order'
+): void {
+  const station = resolveStationLabel(jobType, payload.printer_name, payload.area_name);
+  const destination = resolveDestination(payload);
+  const time = formatTime(payload.opened_at);
+
+  const opts = (payload.print_options ?? {}) as {
+    showOpenTime?: boolean;
+    showHighlightedNotes?: boolean;
+    showGiftMark?: boolean;
+    showPrices?: boolean;
+    showWaiter?: boolean;
+    showGuests?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
+  };
+  const showOpenTime = opts.showOpenTime ?? true;
+  const showHighlightedNotes = opts.showHighlightedNotes ?? true;
+  const showGiftMark = opts.showGiftMark ?? true;
+  const showPrices = opts.showPrices ?? false;
+  const showWaiter = opts.showWaiter ?? true;
+  const showGuests = opts.showGuests ?? true;
+  const fontSize = getFontSize(opts);
+
+  // Header simple: nombre estacion + destino, sin doble altura. fontSize
+  // sigue aplicandose si el dueno explicitamente eligio 'large'.
+  tp.alignLeft();
+  applyHeaderFontSize(tp, fontSize);
+  tp.println(station);
+  tp.println(destination);
+  resetHeaderFontSize(tp);
+
+  // Subtitle en linea unica: mesero . hora . "Hace X min".
+  const subtitleParts: string[] = [];
+  if (showWaiter) {
+    const waiter = payload.waiter_name?.trim() || '-';
+    subtitleParts.push(waiter);
+  }
+  if (showGuests) {
+    subtitleParts.push(`${payload.guests} pax`);
+  }
+  if (showOpenTime) {
+    const elapsedMin = minutesSinceOpened(payload.opened_at);
+    if (elapsedMin != null) {
+      subtitleParts.push(`Hace ${elapsedMin} min`);
+    }
+  }
+  subtitleParts.push(time);
+  if (subtitleParts.length > 0) {
+    tp.println(subtitleParts.join(' . '));
+  }
+  tp.newLine();
+
+  // Items pelados, sin bold ni invert por defecto.
+  for (const item of payload.items) {
+    tp.println(`${item.quantity}x ${item.name}`);
+    if (showGiftMark && item.is_gift) {
+      tp.println('   * cortesia');
+    }
+    for (const mod of item.modifiers) {
+      if (showPrices && mod.priceDelta !== 0) {
+        const fmt = formatCLP(mod.priceDelta);
+        tp.println(`   - ${mod.name} (${mod.priceDelta > 0 ? '+' : ''}${fmt})`);
+      } else {
+        tp.println(`   - ${mod.name}`);
+      }
+    }
+    if (item.note && item.note.trim().length > 0) {
+      // En minimal, las notas van en corchetes sin invertir (queda menos
+      // chillon, mantiene el toggle de showHighlightedNotes con efecto
+      // visible solo en corchetes vs sin).
+      if (showHighlightedNotes) {
+        tp.println(`   [${item.note.trim()}]`);
+      } else {
+        tp.println(`   ${item.note.trim()}`);
+      }
+    }
+  }
+
+  if (payload.customer_note && payload.customer_note.trim().length > 0) {
+    tp.newLine();
+    tp.println(`Notas mesa: ${payload.customer_note.trim()}`);
+  }
+
+  // Total items al final, en linea normal (sin doble altura).
+  const totalItems = payload.items.reduce((acc, it) => acc + it.quantity, 0);
+  tp.newLine();
+  tp.println(`Total items: ${totalItems}`);
+  tp.newLine();
+}
+
+/**
+ * BRAND style para kitchen_order: header con ornament a los lados, doble
+ * altura + bold como Classic pero sumando vinetas y ornament en los
+ * separadores. Util si el dueno quiere que las comandas se vean con la
+ * misma identidad visual que las boletas.
+ */
+function renderKitchenOrderBrand(
+  tp: Printer,
+  payload: KitchenJobPayload,
+  jobType: 'kitchen_order' | 'bar_order' = 'kitchen_order'
+): void {
+  const width = getPayloadWidth(payload);
+  const station = resolveStationLabel(jobType, payload.printer_name, payload.area_name);
+  const destination = resolveDestination(payload);
+  const time = formatTime(payload.opened_at);
+
+  const opts = (payload.print_options ?? {}) as {
+    showOpenTime?: boolean;
+    showHighlightedNotes?: boolean;
+    showGiftMark?: boolean;
+    showPrices?: boolean;
+    showWaiter?: boolean;
+    showGuests?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
+  };
+  const showOpenTime = opts.showOpenTime ?? true;
+  const showHighlightedNotes = opts.showHighlightedNotes ?? true;
+  const showGiftMark = opts.showGiftMark ?? true;
+  const showPrices = opts.showPrices ?? false;
+  const showWaiter = opts.showWaiter ?? true;
+  const showGuests = opts.showGuests ?? true;
+  const fontSize = getFontSize(opts);
+
+  // Restaurant del payload (mig 058 lo agrego para kitchen_order). Si llega
+  // undefined, el ornament cae a null y el separador queda plano.
+  const ornament = payload.restaurant?.print_ornament_char ?? null;
+
+  // Header con ornament arriba + nombre estacion + destino XL + ornament abajo.
+  ornamentSep(tp, ornament, width);
+  tp.alignCenter();
+  tp.bold(true);
+  applyHeaderFontSize(tp, fontSize);
+  tp.setTextDoubleHeight();
+  tp.println(station);
+  tp.println(destination);
+  resetHeaderFontSize(tp);
+  tp.bold(false);
+  tp.alignLeft();
+  ornamentSep(tp, ornament, width);
+
+  // Subtitle (igual estructura que Classic)
+  const headerLineParts: string[] = [time];
+  if (showOpenTime) {
+    const elapsedMin = minutesSinceOpened(payload.opened_at);
+    if (elapsedMin != null) {
+      headerLineParts.push(`Hace ${elapsedMin} min`);
+    }
+  }
+  if (showWaiter) {
+    const waiter = payload.waiter_name?.trim() || '-';
+    headerLineParts.unshift(`Mesero: ${waiter}`);
+  }
+  if (headerLineParts.length > 0) {
+    tp.println(headerLineParts.join(' . '));
+  }
+  if (showGuests) {
+    tp.println(`Comensales: ${payload.guests}`);
+  }
+  tp.newLine();
+
+  // Items igual que Classic (con toggles)
+  for (const item of payload.items) {
+    printKitchenItemWithToggles(tp, item, {
+      showHighlightedNotes,
+      showGiftMark,
+      showPrices,
+    });
+  }
+
+  if (payload.customer_note && payload.customer_note.trim().length > 0) {
+    ornamentSep(tp, ornament, width);
+    if (showHighlightedNotes) {
+      tp.bold(true);
+      tp.invert(true);
+      tp.println(` Notas mesa: ${payload.customer_note.trim()} `);
+      tp.invert(false);
+      tp.bold(false);
+    } else {
+      tp.println(`Notas mesa: ${payload.customer_note.trim()}`);
+    }
+  }
+
+  // TOTAL ITEMS XL con ornament a los lados del separador previo.
+  const totalItems = payload.items.reduce((acc, it) => acc + it.quantity, 0);
+  ornamentSep(tp, ornament, width);
+  tp.alignCenter();
+  tp.bold(true);
+  tp.setTextDoubleHeight();
+  tp.println(`TOTAL ITEMS: ${totalItems}`);
+  tp.setTextNormal();
+  tp.bold(false);
+  tp.alignLeft();
+  tp.newLine();
+}
+
+/**
+ * THERMAL_PRO style para kitchen_order: header denso (1 linea), items con
+ * detalle inline, sin doble altura. Max info por cm de papel — pensado
+ * para cocinas operativas que valoran densidad sobre estetica.
+ */
+function renderKitchenOrderThermalPro(
+  tp: Printer,
+  payload: KitchenJobPayload,
+  jobType: 'kitchen_order' | 'bar_order' = 'kitchen_order'
+): void {
+  const width = getPayloadWidth(payload);
+  const station = resolveStationLabel(jobType, payload.printer_name, payload.area_name);
+  const destination = resolveDestination(payload);
+  const time = formatTime(payload.opened_at);
+
+  const opts = (payload.print_options ?? {}) as {
+    showOpenTime?: boolean;
+    showHighlightedNotes?: boolean;
+    showGiftMark?: boolean;
+    showPrices?: boolean;
+    showWaiter?: boolean;
+    showGuests?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
+  };
+  const showOpenTime = opts.showOpenTime ?? true;
+  const showHighlightedNotes = opts.showHighlightedNotes ?? true;
+  const showGiftMark = opts.showGiftMark ?? true;
+  const showPrices = opts.showPrices ?? false;
+  const showWaiter = opts.showWaiter ?? true;
+  const showGuests = opts.showGuests ?? true;
+  const fontSize = getFontSize(opts);
+
+  // Header denso: estacion + destino en una sola linea con `.`.
+  tp.println('='.repeat(width));
+  applyHeaderFontSize(tp, fontSize);
+  tp.bold(true);
+  tp.println(`${station} . ${destination}`);
+  tp.bold(false);
+  resetHeaderFontSize(tp);
+  tp.println('='.repeat(width));
+
+  // Meta: mesero, pax, "Hace X min", hora — todo en una linea.
+  const meta: string[] = [];
+  if (showWaiter) {
+    const waiter = payload.waiter_name?.trim() || '-';
+    meta.push(waiter);
+  }
+  if (showGuests) {
+    meta.push(`${payload.guests} pax`);
+  }
+  if (showOpenTime) {
+    const elapsedMin = minutesSinceOpened(payload.opened_at);
+    if (elapsedMin != null) {
+      meta.push(`Hace ${elapsedMin} min`);
+    }
+  }
+  meta.push(time);
+  if (meta.length > 0) tp.println(meta.join(' . '));
+  tp.drawLine();
+
+  // Items con prices/notes en compact (sin bold, sin newlines extra)
+  for (const item of payload.items) {
+    tp.println(`${item.quantity}x ${item.name}`);
+    if (showGiftMark && item.is_gift) {
+      tp.println('   * CORTESIA');
+    }
+    for (const mod of item.modifiers) {
+      if (showPrices && mod.priceDelta !== 0) {
+        const fmt = formatCLP(mod.priceDelta);
+        tp.println(`   - ${mod.name} (${mod.priceDelta > 0 ? '+' : ''}${fmt})`);
+      } else {
+        tp.println(`   - ${mod.name}`);
+      }
+    }
+    if (item.note && item.note.trim().length > 0) {
+      if (showHighlightedNotes) {
+        tp.bold(true);
+        tp.println(`   [${item.note.trim()}]`);
+        tp.bold(false);
+      } else {
+        tp.println(`   [${item.note.trim()}]`);
+      }
+    }
+  }
+
+  if (payload.customer_note && payload.customer_note.trim().length > 0) {
+    tp.drawLine();
+    tp.println(`Notas mesa: ${payload.customer_note.trim()}`);
+  }
+
+  // TOTAL ITEMS sin doble altura, alineado izquierda.
+  const totalItems = payload.items.reduce((acc, it) => acc + it.quantity, 0);
+  tp.println('='.repeat(width));
+  tp.bold(true);
+  tp.println(`TOTAL ITEMS: ${totalItems}`);
+  tp.bold(false);
+  tp.newLine();
+}
+
+/**
+ * MINIMAL style para kitchen_cancel: anulacion plana sin badge invertido.
+ * "ANULACION" en bold solo, items con prefijo "[X]" sin enfasis, motivo
+ * inline simple.
+ */
+function renderKitchenCancelMinimal(
+  tp: Printer,
+  payload: KitchenJobPayload
+): void {
+  const destination = resolveDestination(payload);
+  const time = formatTime(payload.opened_at);
+
+  const opts = (payload.print_options ?? {}) as {
+    showReason?: boolean;
+    showWaiter?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
+  };
+  const showReason = opts.showReason ?? true;
+  const showWaiter = opts.showWaiter ?? true;
+  const fontSize = getFontSize(opts);
+
+  // Header minimal: "ANULACION" en bold + destino debajo. Sin invertido,
+  // sin doble altura.
+  tp.alignLeft();
+  applyHeaderFontSize(tp, fontSize);
+  tp.bold(true);
+  tp.println('ANULACION');
+  tp.bold(false);
+  tp.println(destination);
+  resetHeaderFontSize(tp);
+
+  // Subtitle inline
+  if (showWaiter) {
+    const waiter = payload.waiter_name?.trim() || '-';
+    tp.println(`${waiter} . ${time}`);
+  } else {
+    tp.println(time);
+  }
+  tp.newLine();
+
+  // Items con prefijo [X], sin bold
+  for (const item of payload.items) {
+    tp.println(`[X] ${item.quantity}x ${item.name}`);
+    for (const mod of item.modifiers) {
+      tp.println(`    - ${mod.name}`);
+    }
+    if (item.note && item.note.trim().length > 0) {
+      tp.println(`    ${item.note.trim()}`);
+    }
+  }
+
+  if (showReason && payload.customer_note && payload.customer_note.trim().length > 0) {
+    tp.newLine();
+    tp.println(`Motivo: ${payload.customer_note.trim()}`);
+  }
+  tp.newLine();
+}
+
+/**
+ * BRAND style para kitchen_cancel: badge invertido como Classic + ornament
+ * en separadores para que la anulacion mantenga el lenguaje visual del
+ * resto del ticketing del local.
+ */
+function renderKitchenCancelBrand(
+  tp: Printer,
+  payload: KitchenJobPayload
+): void {
+  const width = getPayloadWidth(payload);
+  const destination = resolveDestination(payload);
+  const time = formatTime(payload.opened_at);
+
+  const opts = (payload.print_options ?? {}) as {
+    showReason?: boolean;
+    showWaiter?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
+  };
+  const showReason = opts.showReason ?? true;
+  const showWaiter = opts.showWaiter ?? true;
+  const fontSize = getFontSize(opts);
+
+  const ornament = payload.restaurant?.print_ornament_char ?? null;
+
+  // Header brand: ornament + badge invertido + destino + ornament
+  ornamentSep(tp, ornament, width);
+  tp.alignCenter();
+  tp.bold(true);
+  tp.invert(true);
+  applyHeaderFontSize(tp, fontSize);
+  tp.setTextDoubleHeight();
+  tp.println(' ANULACION ');
+  tp.invert(false);
+  tp.println(destination);
+  resetHeaderFontSize(tp);
+  tp.bold(false);
+  tp.alignLeft();
+  ornamentSep(tp, ornament, width);
+
+  if (showWaiter) {
+    const waiter = payload.waiter_name?.trim() || '-';
+    tp.println(`Mesero: ${waiter} . ${time}`);
+  } else {
+    tp.println(time);
+  }
+  tp.newLine();
+
+  for (const item of payload.items) {
+    tp.bold(true);
+    tp.println(`[X] ${item.quantity}x ${item.name}`);
+    tp.bold(false);
+    for (const mod of item.modifiers) {
+      tp.println(`    - ${mod.name}`);
+    }
+    if (item.note && item.note.trim().length > 0) {
+      tp.println(`    [${item.note.trim()}]`);
+    }
+  }
+
+  if (showReason && payload.customer_note && payload.customer_note.trim().length > 0) {
+    ornamentSep(tp, ornament, width);
+    tp.println(`Motivo: ${payload.customer_note.trim()}`);
+  }
+  ornamentSep(tp, ornament, width);
+  tp.newLine();
+}
+
+/**
+ * THERMAL_PRO style para kitchen_cancel: header denso, items compactos.
+ * Mismo principio que kitchen_order thermal_pro: max info, min chrome.
+ */
+function renderKitchenCancelThermalPro(
+  tp: Printer,
+  payload: KitchenJobPayload
+): void {
+  const width = getPayloadWidth(payload);
+  const destination = resolveDestination(payload);
+  const time = formatTime(payload.opened_at);
+
+  const opts = (payload.print_options ?? {}) as {
+    showReason?: boolean;
+    showWaiter?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
+  };
+  const showReason = opts.showReason ?? true;
+  const showWaiter = opts.showWaiter ?? true;
+  const fontSize = getFontSize(opts);
+
+  tp.println('='.repeat(width));
+  applyHeaderFontSize(tp, fontSize);
+  tp.bold(true);
+  tp.println(`ANULACION . ${destination}`);
+  tp.bold(false);
+  resetHeaderFontSize(tp);
+  tp.println('='.repeat(width));
+
+  if (showWaiter) {
+    const waiter = payload.waiter_name?.trim() || '-';
+    tp.println(`${waiter} . ${time}`);
+  } else {
+    tp.println(time);
+  }
+  tp.drawLine();
+
+  for (const item of payload.items) {
+    tp.println(`[X] ${item.quantity}x ${item.name}`);
+    for (const mod of item.modifiers) {
+      tp.println(`    - ${mod.name}`);
+    }
+    if (item.note && item.note.trim().length > 0) {
+      tp.println(`    [${item.note.trim()}]`);
+    }
+  }
+
+  if (showReason && payload.customer_note && payload.customer_note.trim().length > 0) {
+    tp.drawLine();
+    tp.println(`Motivo: ${payload.customer_note.trim()}`);
+  }
+  tp.println('='.repeat(width));
+  tp.newLine();
+}
+
+/**
+ * MINIMAL style para cash_close: layout sobrio, sin doble altura, sin
+ * separadores fuertes ni badges. Pensado para cierres que se archivan
+ * mucho — papel limpio y legible cuando se reabra en 6 meses.
+ */
+function renderCashCloseMinimal(
+  tp: Printer,
+  payload: CashClosePayload
+): void {
+  const opts = (payload.print_options ?? {}) as {
+    showHighlightedDiff?: boolean;
+    showMethodBreakdown?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
+  };
+  const showHighlightedDiff = opts.showHighlightedDiff ?? true;
+  const showMethodBreakdown = opts.showMethodBreakdown ?? true;
+  const fontSize = getFontSize(opts);
+
+  // Header simple: nombre del local + direccion si existe.
+  tp.alignLeft();
+  if (payload.restaurant) {
+    applyHeaderFontSize(tp, fontSize);
+    tp.println(payload.restaurant.name);
+    const address = payload.restaurant.address?.trim();
+    if (address && address.length > 0) {
+      tp.println(address);
+    }
+    resetHeaderFontSize(tp);
+  }
+  tp.newLine();
+
+  // Titulo simple
+  tp.println('Cierre de caja diario');
+  if (payload.location_name && payload.location_name.trim().length > 0) {
+    tp.println(payload.location_name.trim());
+  }
+  tp.println(formatDateTime(payload.closed_at));
+  const openedBy = payload.opened_by_name?.trim() || '-';
+  const closedBy = payload.closed_by_name?.trim() || '-';
+  tp.println(`Turno: ${openedBy} -> ${closedBy}`);
+  tp.newLine();
+
+  // Ventas sin bold
+  printAmountRow(tp, 'Ventas totales', payload.total_sales);
+
+  if (showMethodBreakdown) {
+    printAmountRow(tp, 'Efectivo', payload.total_cash, true);
+    printAmountRow(tp, 'Tarjeta MP', payload.total_card_mp, true);
+    printAmountRow(tp, 'Otras tarjetas', payload.total_card_other, true);
+    printAmountRow(tp, 'Transferencia', payload.total_transfer, true);
+    tp.newLine();
+  }
+
+  printAmountRow(tp, 'Propinas', payload.total_tips);
+  printAmountRow(tp, 'Devoluciones', payload.total_refunds);
+  tp.leftRight('Comandas:', String(payload.order_count));
+  tp.newLine();
+
+  printAmountRow(tp, 'Esperado', payload.expected_cash);
+  printAmountRow(tp, 'Declarado', payload.closing_cash);
+  if (showHighlightedDiff) {
+    // En minimal no usamos invert pleno — solo bold para senalar diferencia.
+    tp.bold(true);
+    printAmountRow(tp, 'Diferencia', payload.difference);
+    tp.bold(false);
+  } else {
+    printAmountRow(tp, 'Diferencia', payload.difference);
+  }
+
+  if (payload.notes && payload.notes.trim().length > 0) {
+    tp.newLine();
+    tp.println(`Notas: ${payload.notes.trim()}`);
+  }
+
+  // Footer simple (sin ornament)
+  if (payload.restaurant) {
+    tp.newLine();
+    const phrase =
+      payload.restaurant.print_footer_phrase?.trim() || 'Gracias.';
+    tp.println(phrase);
+  }
+  tp.newLine();
+}
+
+/**
+ * BRAND style para cash_close: ornament en header y al cierre, nombre del
+ * local con doble altura, slogan visible. Mantiene la identidad visual
+ * del local incluso en un documento operativo como el cierre.
+ */
+function renderCashCloseBrand(
+  tp: Printer,
+  payload: CashClosePayload
+): void {
+  const width = getPayloadWidth(payload);
+
+  const opts = (payload.print_options ?? {}) as {
+    showHighlightedDiff?: boolean;
+    showMethodBreakdown?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
+  };
+  const showHighlightedDiff = opts.showHighlightedDiff ?? true;
+  const showMethodBreakdown = opts.showMethodBreakdown ?? true;
+  const fontSize = getFontSize(opts);
+
+  const ornament = payload.restaurant?.print_ornament_char ?? null;
+
+  // Header rich del restaurant con ornament
+  if (payload.restaurant) {
+    ornamentSep(tp, ornament, width);
+    tp.alignCenter();
+    tp.bold(true);
+    applyHeaderFontSize(tp, fontSize);
+    tp.setTextDoubleHeight();
+    tp.println(payload.restaurant.name);
+    tp.setTextNormal();
+    tp.bold(false);
+
+    const slogan = payload.restaurant.slogan?.trim();
+    if (slogan && slogan.length > 0) {
+      tp.println(`"${slogan}"`);
+    }
+    resetHeaderFontSize(tp);
+    tp.alignLeft();
+    ornamentSep(tp, ornament, width);
+  }
+
+  // Titulo "CIERRE DE CAJA" centrado en bold (sin doble altura para no
+  // competir con el nombre del local que ya esta XL).
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println('CIERRE DE CAJA DIARIO');
+  tp.bold(false);
+  tp.alignLeft();
+  ornamentSep(tp, ornament, width);
+
+  // Meta del cierre
+  if (payload.location_name && payload.location_name.trim().length > 0) {
+    tp.println(payload.location_name.trim());
+  }
+  tp.println(formatDateTime(payload.closed_at));
+  const openedBy = payload.opened_by_name?.trim() || '-';
+  const closedBy = payload.closed_by_name?.trim() || '-';
+  tp.println(`Turno: ${openedBy} -> ${closedBy}`);
+  tp.newLine();
+
+  // Ventas
+  tp.bold(true);
+  printAmountRow(tp, 'Ventas totales', payload.total_sales);
+  tp.bold(false);
+
+  if (showMethodBreakdown) {
+    printAmountRow(tp, 'Efectivo', payload.total_cash, true);
+    printAmountRow(tp, 'Tarjeta MP', payload.total_card_mp, true);
+    printAmountRow(tp, 'Otras tarjetas', payload.total_card_other, true);
+    printAmountRow(tp, 'Transferencia', payload.total_transfer, true);
+    tp.newLine();
+  }
+
+  printAmountRow(tp, 'Propinas', payload.total_tips);
+  printAmountRow(tp, 'Devoluciones', payload.total_refunds);
+  tp.leftRight('Comandas totales:', String(payload.order_count));
+  tp.newLine();
+
+  ornamentSep(tp, ornament, width);
+  printAmountRow(tp, 'Efectivo esperado', payload.expected_cash);
+  printAmountRow(tp, 'Efectivo declarado', payload.closing_cash);
+
+  if (showHighlightedDiff) {
+    tp.bold(true);
+    tp.invert(true);
+    printAmountRow(tp, ' DIFERENCIA ', payload.difference);
+    tp.invert(false);
+    tp.bold(false);
+  } else {
+    tp.bold(true);
+    printAmountRow(tp, 'DIFERENCIA', payload.difference);
+    tp.bold(false);
+  }
+
+  if (payload.notes && payload.notes.trim().length > 0) {
+    ornamentSep(tp, ornament, width);
+    tp.println(`Notas: ${payload.notes.trim()}`);
+  }
+
+  if (payload.restaurant) {
+    ornamentSep(tp, ornament, width);
+    printBillFooter(tp, payload.restaurant);
+  }
+  tp.newLine();
+}
+
+/**
+ * THERMAL_PRO style para cash_close: header denso, breakdown compacto, sin
+ * floralera visual. Util para cierres que se archivan en planilla (cabe
+ * mas info por hoja).
+ */
+function renderCashCloseThermalPro(
+  tp: Printer,
+  payload: CashClosePayload
+): void {
+  const width = getPayloadWidth(payload);
+
+  const opts = (payload.print_options ?? {}) as {
+    showHighlightedDiff?: boolean;
+    showMethodBreakdown?: boolean;
+    fontSize?: 'small' | 'normal' | 'large';
+  };
+  const showHighlightedDiff = opts.showHighlightedDiff ?? true;
+  const showMethodBreakdown = opts.showMethodBreakdown ?? true;
+  const fontSize = getFontSize(opts);
+
+  // Header denso del local
+  tp.println('='.repeat(width));
+  if (payload.restaurant) {
+    applyHeaderFontSize(tp, fontSize);
+    const addr = payload.restaurant.address?.trim();
+    if (addr && addr.length > 0) {
+      tp.println(`${payload.restaurant.name} . ${addr}`);
+    } else {
+      tp.println(payload.restaurant.name);
+    }
+    resetHeaderFontSize(tp);
+  }
+  tp.println('='.repeat(width));
+
+  // Titulo
+  tp.bold(true);
+  tp.println('CIERRE DE CAJA DIARIO');
+  tp.bold(false);
+  if (payload.location_name && payload.location_name.trim().length > 0) {
+    tp.println(payload.location_name.trim());
+  }
+  tp.println(formatDateTime(payload.closed_at));
+  const openedBy = payload.opened_by_name?.trim() || '-';
+  const closedBy = payload.closed_by_name?.trim() || '-';
+  tp.println(`Turno: ${openedBy} -> ${closedBy}`);
+  tp.drawLine();
+
+  printAmountRow(tp, 'Ventas totales', payload.total_sales);
+  if (showMethodBreakdown) {
+    printAmountRow(tp, 'Efectivo', payload.total_cash, true);
+    printAmountRow(tp, 'Tarjeta MP', payload.total_card_mp, true);
+    printAmountRow(tp, 'Otras tarjetas', payload.total_card_other, true);
+    printAmountRow(tp, 'Transferencia', payload.total_transfer, true);
+  }
+  printAmountRow(tp, 'Propinas', payload.total_tips);
+  printAmountRow(tp, 'Devoluciones', payload.total_refunds);
+  tp.leftRight('Comandas totales:', String(payload.order_count));
+  tp.println('='.repeat(width));
+
+  printAmountRow(tp, 'Efectivo esperado', payload.expected_cash);
+  printAmountRow(tp, 'Efectivo declarado', payload.closing_cash);
+  if (showHighlightedDiff) {
+    tp.bold(true);
+    printAmountRow(tp, 'DIFERENCIA', payload.difference);
+    tp.bold(false);
+  } else {
+    printAmountRow(tp, 'DIFERENCIA', payload.difference);
+  }
+
+  if (payload.notes && payload.notes.trim().length > 0) {
+    tp.drawLine();
+    tp.println(`Notas: ${payload.notes.trim()}`);
+  }
+  tp.println('='.repeat(width));
+
+  if (payload.restaurant) {
+    const phrase =
+      payload.restaurant.print_footer_phrase?.trim() || 'Gracias por su preferencia!';
+    tp.println(phrase);
+  }
   tp.newLine();
 }
