@@ -12,9 +12,12 @@
  * en el ultimo job kitchen_order" y abrir el .txt sin tener el papel fisico.
  *
  * Toggle:
- *  - `BAIT_PRINT_CAPTURE_ENABLED=false` desactiva. Default: true (siempre
- *    capturamos). El costo es pequeno (un decode + un fs.writeFile por job)
- *    y el beneficio diagnostico vale la pena.
+ *  - `BAIT_PRINT_CAPTURE_ENABLED=true` ACTIVA. Default: false (off en
+ *    produccion). Decision Carlos 2026-05-23: en produccion los archivos
+ *    contienen datos sensibles (nombres clientes, items, totales) y el
+ *    99% del tiempo no aportan. Se activa on-demand para sesiones de
+ *    diagnostico: `nssm set bAItPrintAgent AppEnvironmentExtra BAIT_PRINT_CAPTURE_ENABLED=true`
+ *    + restart del servicio, luego apagar y limpiar.
  *
  * Si la captura falla (disco lleno, permisos), NO interrumpimos el flow del
  * job — el ticket ya se imprimio, no queremos marcar el job como failed por
@@ -55,16 +58,22 @@ export function getCapturesDir(): string {
 }
 
 /**
- * Lee la env var de toggle. Default true (capture ON).
+ * Lee la env var de toggle. Default FALSE (capture OFF en produccion).
  *
- * Acepta: 'false', '0', 'no', 'off' (case insensitive) → disable.
- * Cualquier otro valor (incluyendo no setear nada) → enable.
+ * Acepta: 'true', '1', 'yes', 'on' (case insensitive) → enable.
+ * Cualquier otro valor (incluyendo no setear nada) → disable.
+ *
+ * Para activar en produccion (sesion de diagnostico):
+ *   nssm set bAItPrintAgent AppEnvironmentExtra BAIT_PRINT_CAPTURE_ENABLED=true
+ *   nssm restart bAItPrintAgent
+ * Y para apagar despues:
+ *   nssm set bAItPrintAgent AppEnvironmentExtra BAIT_PRINT_CAPTURE_ENABLED=false
+ *   nssm restart bAItPrintAgent
  */
 export function isCaptureEnabled(): boolean {
   const raw = process.env.BAIT_PRINT_CAPTURE_ENABLED?.trim().toLowerCase();
-  if (raw === undefined || raw === '') return true;
-  if (['false', '0', 'no', 'off'].includes(raw)) return false;
-  return true;
+  if (raw === undefined || raw === '') return false;
+  return ['true', '1', 'yes', 'on'].includes(raw);
 }
 
 /**
