@@ -196,10 +196,16 @@ export type PrinterPayloadInfo = {
  *    UTF-8 a la termica y salian como `?`. Fix: ASCII puro siempre imprime.
  *  - slogan: max 40 chars, usado por el style 'brand' bajo el nombre del local.
  *
+ * v0.9.7: sumado `rut` opcional para que los renderers respeten el toggle
+ * showRut. La RPC enqueue_bill_* todavia no envia este campo en el payload —
+ * cuando llegue, el agente lo respeta sin cambios adicionales. Ver concern
+ * en DONE_WITH_CONCERNS.
+ *
  * Todos opcionales para mantener backwards compat con RPCs pre-mig 058.
  */
 export type RestaurantPrintInfo = {
   name: string;
+  rut?: string | null;
   address?: string | null;
   comuna?: string | null;
   phone?: string | null;

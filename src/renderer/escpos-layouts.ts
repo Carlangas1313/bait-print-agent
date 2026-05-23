@@ -122,14 +122,28 @@ function printRestaurantHeader(tp: Printer, r: RestaurantPrintInfo): void {
 /**
  * Footer comun a bill_preview y bill_proforma: separator + QR opcional + frase.
  *
- * - Si `print_qr_url` esta seteado, imprime QR centrado con label encima.
- *   Usamos correction 'M' (medium) y cellSize 6 para que escanee bien en 58mm.
- * - Frase: si `print_footer_phrase` viene, se imprime tal cual; sino "Gracias
- *   por su preferencia".
+ * - Si `print_qr_url` esta seteado Y el toggle `showQr !== false`, imprime
+ *   QR centrado con label encima. Usamos correction 'M' (medium) y cellSize 6
+ *   para que escanee bien en 58mm.
+ *   NOTE GENERICIDAD: `printQR` envia `GS ( k` (estandar ESC/POS para QR).
+ *   En termicas baratas SIN soporte QR el comando se ignora y el papel sale
+ *   sin codigo — el ticket sigue legible. Si en el futuro queremos fallback
+ *   a texto plano, agregar un flag de capability detection y switchear aca.
+ * - Frase: si `print_footer_phrase` viene, se imprime tal cual; sino
+ *   "Gracias por su preferencia".
+ *
+ * Fix v0.9.7 (bug A3): respetar el toggle `showQr`. Antes el QR siempre se
+ * imprimia cuando `print_qr_url` estaba seteado, ignorando la opcion del
+ * dueno en /settings/print-templates.
  */
-function printBillFooter(tp: Printer, r: RestaurantPrintInfo): void {
+function printBillFooter(
+  tp: Printer,
+  r: RestaurantPrintInfo,
+  opts?: { showQr?: boolean }
+): void {
+  const showQr = opts?.showQr !== false; // default true
   const qrUrl = r.print_qr_url?.trim();
-  if (qrUrl && qrUrl.length > 0) {
+  if (showQr && qrUrl && qrUrl.length > 0) {
     tp.alignCenter();
     const label = r.print_qr_label?.trim();
     if (label && label.length > 0) {
@@ -220,25 +234,23 @@ function printBadge(tp: Printer, text: string): void {
 }
 
 /**
- * Imprime el TOTAL en XL (doble altura + doble ancho) con la etiqueta a la
- * izquierda y el monto a la derecha. `setTextSize(height, width)` espera
- * height primero en node-thermal-printer 4.6.x.
+ * Imprime el TOTAL destacado (doble altura) con la etiqueta a la izquierda y
+ * el monto a la derecha. Centrado para dar enfasis visual sin necesitar
+ * `GS ! n` (que no es universal).
  *
- * Nota: en setTextSize(2,2) el width efectivo del printer no cambia, asi que
- * usamos `println` con padding manual en vez de `leftRight` (que asume width
- * normal). Calculamos un layout simple "TOTAL  $X" centrado.
+ * v0.9.7: solo aplicamos `setTextDoubleHeight()` (ESC ! 0x10) — un comando
+ * ESC/POS basico que cualquier termica respeta. Antes habia un setTextSize(1,1)
+ * dead-code arriba del doubleHeight; eliminado.
+ *
+ * Si en el futuro se quiere doble ancho tambien, sumar `setTextDoubleWidth()`
+ * — ambos via ESC ! n. Por ahora preferimos solo doble altura para evitar
+ * que la linea "TOTAL $999.999" pase del ancho del papel en 58mm.
  */
 function printXLTotal(tp: Printer, label: string, amount: number): void {
   const formatted = formatCLP(amount); // "$ 24.500"
-  // En doble width el ancho efectivo se divide por 2 (16 chars en 58mm).
-  // Centramos manualmente "TOTAL $24.500" o similar.
   const line = `${label} ${formatted}`;
   tp.alignCenter();
   tp.bold(true);
-  tp.setTextSize(1, 1); // height=1, width=1 → un poco mas grande que normal
-  // setTextSize(h,w) en node-thermal-printer: valores 0..7, donde 0=normal
-  // y 1=2x. Para TOTAL queremos 2x altura y 1x ancho (mas legible y entra
-  // mejor en 58mm que el quad area).
   tp.setTextDoubleHeight();
   tp.println(line);
   tp.setTextNormal();
@@ -380,8 +392,8 @@ async function printLogoIfEnabled(
 /**
  * Aplica el tamano de letra "large" del header. SOLO afecta nombre del
  * restaurant + titulo del ticket. Items, totales y payment siempre quedan
- * en normal — si aplicaramos (2,2) a items el width efectivo se divide por
- * 2 (32 cols pasan a 16) y los montos quedan en otra linea.
+ * en normal — si aplicaramos doble width a items el ancho efectivo se
+ * divide por 2 (32 cols pasan a 16) y los montos quedan en otra linea.
  *
  * Llamadores: usarlo asi al inicio del bloque de header:
  *   applyHeaderFontSize(tp, fontSize);   // empieza a imprimir en grande
@@ -389,54 +401,67 @@ async function printLogoIfEnabled(
  *   tp.println(title);
  *   resetHeaderFontSize(tp);             // vuelve a normal antes de items
  *
- * fontSize='small' tambien se aplica al header (encoge nombre + titulo).
- * fontSize='normal' es noop.
+ * GENERICIDAD ESC/POS (v0.9.7): usamos `setTextDoubleHeight()` +
+ * `setTextDoubleWidth()` en vez de `setTextSize(2,2)`. Razon:
+ *  - `setTextSize(h, w)` envia `GS ! n` (0x1D 0x21 n) con multiplicadores
+ *    1..7. MUCHAS termicas baratas chinas NO implementan `GS ! n` o solo
+ *    soportan un subset reducido. Resultado: el agente envia el comando,
+ *    el sensor de captura ESC/POS lo registra como aplicado, pero la
+ *    termica fisica imprime en tamano normal.
+ *  - `setTextDoubleHeight` y `setTextDoubleWidth` envian `ESC ! n`
+ *    (0x1B 0x21 n) con bits 4 (alto) y 5 (ancho). Este es el comando
+ *    ESC/POS original y casi universal en cualquier termica que respeta
+ *    el estandar basico.
  *
- * NOTE: node-thermal-printer `setTextSize(h, w)` espera valores 0..7, donde
- * 0=1x y 1=2x (es un multiplier indice, no factor). 0=font B (~6x10px),
- * 1=2x doble alto/ancho. Mantener acotado para no romper el papel.
+ * NOTA sobre fontSize='small' (eliminado v0.9.7): antes hacia
+ * `setTextSize(0, 0)` que en muchas termicas era NOOP (no soportan font B
+ * por GS!). Carlos decidio eliminar 'small' del enum — solo quedan
+ * 'normal' y 'large'. Si llega un payload pre-v0.9.7 con fontSize='small',
+ * el switch cae al default (normal) silenciosamente.
  */
 function applyHeaderFontSize(
   tp: Printer,
-  fontSize: 'small' | 'normal' | 'large' | undefined
+  fontSize: 'normal' | 'large' | undefined
 ): void {
-  if (fontSize === 'small') {
-    // setTextSize(0, 0) -> font B / small. En termicas Rongta sin font B
-    // efectivamente queda en normal (no rompe nada).
-    tp.setTextSize(0, 0);
-  } else if (fontSize === 'large') {
-    // setTextSize(h, w) en node-thermal-printer es factor 1..7 donde 1=normal,
-    // 2=doble. setTextSize(1,1) era NOOP (= normal). El comentario anterior
-    // estaba mal. Para realmente doble alto y ancho usar (2, 2).
-    tp.setTextSize(2, 2);
+  if (fontSize === 'large') {
+    // Combinar doble alto + doble ancho via ESC ! n (universal).
+    // Internamente node-thermal-printer setTextDoubleHeight envia ESC ! 0x10
+    // y setTextDoubleWidth envia ESC ! 0x20. setTextQuadArea() envia
+    // ESC ! 0x30 (combo) tambien universal — usamos los toggles individuales
+    // para que el orden quede explicito y debuggeable en captures.
+    tp.setTextDoubleHeight();
+    tp.setTextDoubleWidth();
   }
   // 'normal' o undefined: noop.
 }
 
 /**
  * Resetea el tamano de letra a normal. Llamar SIEMPRE despues del bloque
- * de header en grande/chico para que items/totales no hereden el size.
+ * de header en grande para que items/totales no hereden el size.
  *
- * Equivalente a setTextSize(0, 0) en node-thermal-printer (rara API:
- * setTextNormal() resetea pero ademas saca el bold). Usamos setTextSize
- * explicito para no tocar bold/invert que el caller pudo haber prendido.
+ * `setTextNormal()` envia `ESC ! 0x00` que limpia los bits de doble alto
+ * y doble ancho (entre otros flags como bold y underline que igual los
+ * volvemos a setear donde se necesiten).
  */
 function resetHeaderFontSize(tp: Printer): void {
-  // setTextNormal() resetea size + bold + double height. Es lo que usan
-  // otros helpers del file. Para no interferir con bold/invert lo dejamos
-  // en setTextNormal pero el caller debe re-aplicar bold/invert si los
-  // necesita despues.
   tp.setTextNormal();
 }
 
 /**
  * Lee el fontSize de un print_options de cualquier ticket. Defensa: si el
- * payload viene de una RPC pre-fontSize, devuelve 'normal'.
+ * payload viene de una RPC pre-fontSize O trae el legacy 'small', devuelve
+ * 'normal'.
+ *
+ * v0.9.7: eliminamos 'small' del enum publico pero aceptamos payloads
+ * legacy con `fontSize: 'small'` y los tratamos como 'normal' silenciosamente.
  */
 function getFontSize(
   print_options?: { fontSize?: 'small' | 'normal' | 'large' }
-): 'small' | 'normal' | 'large' {
-  return print_options?.fontSize ?? 'normal';
+): 'normal' | 'large' {
+  const v = print_options?.fontSize;
+  if (v === 'large') return 'large';
+  // 'small' (legacy), 'normal', undefined o cualquier otro -> normal.
+  return 'normal';
 }
 
 // ====================================================================
@@ -545,9 +570,13 @@ function renderKitchenOrderClassic(
   resetHeaderFontSize(tp);
   tp.bold(false);
 
-  // Subtitle line 1: hora (siempre) + "Hace X min" si showOpenTime
-  const headerLineParts: string[] = [time];
+  // Subtitle line 1: hora + "Hace X min" si showOpenTime.
+  // Fix v0.9.7 (consistencia con bug A5): la hora absoluta tambien sale gated
+  // por showOpenTime. Antes la hora se imprimia siempre y el toggle solo
+  // afectaba al "Hace X min".
+  const headerLineParts: string[] = [];
   if (showOpenTime) {
+    headerLineParts.push(time);
     const elapsedMin = minutesSinceOpened(payload.opened_at);
     if (elapsedMin != null) {
       headerLineParts.push(`Hace ${elapsedMin} min`);
@@ -764,14 +793,50 @@ async function renderBillPreviewClassic(
   const width = getPayloadWidth(payload);
   const fontSize = getFontSize(payload.print_options);
 
+  // Toggles bill_preview (mig 058). Defaults rich del Anexo C.
+  // Fix v0.9.7 (bugs A1+A2+A3): respetar showAddress / showRut / showQr.
+  const opts = (payload.print_options ?? {}) as {
+    showAddress?: boolean;
+    showRut?: boolean;
+    showQr?: boolean;
+  };
+  const showAddress = opts.showAddress !== false; // default true
+  const showRut = opts.showRut === true;           // default false en bill_preview
+  const showQr = opts.showQr !== false;            // default true
+
   // Logo si esta activo (D4 + D5 del spec). Si falla, sigue sin logo.
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
-  // Header del local (nombre + direccion + comuna/fono).
-  // fontSize='large': nombre/direccion en grande. resetHeaderFontSize antes
-  // de los items para que los montos no se descuadren.
+  // Header del local. fontSize='large': nombre/direccion en grande.
+  // resetHeaderFontSize antes de los items para que los montos no se
+  // descuadren.
+  //
+  // Antes (pre-v0.9.7) llamabamos a `printRestaurantHeader` que SIEMPRE
+  // imprimia address + comuna ignorando el toggle showAddress. Ahora
+  // inline para gate explicito.
   applyHeaderFontSize(tp, fontSize);
-  printRestaurantHeader(tp, payload.restaurant);
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println(payload.restaurant.name);
+  tp.bold(false);
+  if (showAddress) {
+    const address = payload.restaurant.address?.trim();
+    if (address && address.length > 0) tp.println(address);
+    const comuna = payload.restaurant.comuna?.trim() ?? '';
+    const phone = payload.restaurant.phone?.trim() ?? '';
+    if (comuna.length > 0 || phone.length > 0) {
+      const parts: string[] = [];
+      if (comuna.length > 0) parts.push(comuna);
+      if (phone.length > 0) parts.push(`Fono ${phone}`);
+      tp.println(parts.join(' · '));
+    }
+  }
+  // RUT: default OFF en bill_preview (no es doc legal).
+  if (showRut && payload.restaurant.rut) {
+    tp.println(`RUT: ${payload.restaurant.rut}`);
+  }
+  tp.alignLeft();
+  tp.drawLine();
   resetHeaderFontSize(tp);
 
   // Slogan si esta seteado (mig 058).
@@ -843,8 +908,8 @@ async function renderBillPreviewClassic(
   // Separador con vineta antes del footer
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
-  // Footer (QR opcional + frase custom)
-  printBillFooter(tp, payload.restaurant);
+  // Footer (QR opcional + frase custom). Fix v0.9.7 bug A3: pasar showQr.
+  printBillFooter(tp, payload.restaurant, { showQr });
   tp.newLine();
 }
 
@@ -866,14 +931,49 @@ async function renderBillProformaClassic(
   const width = getPayloadWidth(payload);
   const fontSize = getFontSize(payload.print_options);
 
+  // Toggles bill_proforma (mig 058). Defaults rich del Anexo C — notar que
+  // showRut default es TRUE en proforma (es la boleta final, sí queremos
+  // mostrar RUT del local).
+  const opts = (payload.print_options ?? {}) as {
+    showAddress?: boolean;
+    showRut?: boolean;
+    showQr?: boolean;
+  };
+  const showAddress = opts.showAddress !== false; // default true
+  const showRut = opts.showRut !== false;          // default true en bill_proforma
+  const showQr = opts.showQr !== false;            // default true
+
   // Logo si esta activo (D4 + D5 del spec). Si falla, sigue sin logo.
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   // Header del local (nombre + direccion + comuna/fono).
   // fontSize='large' agranda nombre+direccion. resetHeaderFontSize antes de
   // items para no romper el layout 32/42/48.
+  //
+  // v0.9.7: inline en vez de printRestaurantHeader para respetar showAddress
+  // y agregar showRut (bug A1+A2).
   applyHeaderFontSize(tp, fontSize);
-  printRestaurantHeader(tp, payload.restaurant);
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println(payload.restaurant.name);
+  tp.bold(false);
+  if (showAddress) {
+    const address = payload.restaurant.address?.trim();
+    if (address && address.length > 0) tp.println(address);
+    const comuna = payload.restaurant.comuna?.trim() ?? '';
+    const phone = payload.restaurant.phone?.trim() ?? '';
+    if (comuna.length > 0 || phone.length > 0) {
+      const parts: string[] = [];
+      if (comuna.length > 0) parts.push(comuna);
+      if (phone.length > 0) parts.push(`Fono ${phone}`);
+      tp.println(parts.join(' · '));
+    }
+  }
+  if (showRut && payload.restaurant.rut) {
+    tp.println(`RUT: ${payload.restaurant.rut}`);
+  }
+  tp.alignLeft();
+  tp.drawLine();
   resetHeaderFontSize(tp);
 
   // Slogan si esta seteado (mig 058).
@@ -952,8 +1052,8 @@ async function renderBillProformaClassic(
   // Separador con vineta antes del footer.
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
-  // Footer (QR opcional + frase custom)
-  printBillFooter(tp, payload.restaurant);
+  // Footer (QR opcional + frase custom). Fix v0.9.7 bug A3: pasar showQr.
+  printBillFooter(tp, payload.restaurant, { showQr });
   tp.newLine();
 }
 
@@ -1292,6 +1392,19 @@ async function renderBillPreviewMinimal(
   const width = getPayloadWidth(payload);
   const fontSize = getFontSize(payload.print_options);
 
+  // Toggles bill_preview (mig 058). Defaults rich del Anexo C.
+  // Fix v0.9.7 (bugs A1+A2+A3): respetar showAddress / showRut / showQr en
+  // minimal style. Antes el minimal imprimia address siempre y no soportaba
+  // showRut ni showQr.
+  const opts = (payload.print_options ?? {}) as {
+    showAddress?: boolean;
+    showRut?: boolean;
+    showQr?: boolean;
+  };
+  const showAddress = opts.showAddress !== false; // default true
+  const showRut = opts.showRut === true;           // default false en bill_preview
+  const showQr = opts.showQr !== false;            // default true
+
   // Logo respetando el toggle (en minimal generalmente OFF, pero respetamos
   // la config del dueño).
   await printLogoIfEnabled(tp, payload, supabase, logger);
@@ -1302,9 +1415,18 @@ async function renderBillPreviewMinimal(
   tp.alignLeft();
   applyHeaderFontSize(tp, fontSize);
   tp.println(payload.restaurant.name);
-  const address = payload.restaurant.address?.trim();
-  if (address && address.length > 0) {
-    tp.println(address);
+  if (showAddress) {
+    const address = payload.restaurant.address?.trim();
+    if (address && address.length > 0) {
+      tp.println(address);
+    }
+    const comuna = payload.restaurant.comuna?.trim();
+    if (comuna && comuna.length > 0) {
+      tp.println(comuna);
+    }
+  }
+  if (showRut && payload.restaurant.rut) {
+    tp.println(`RUT: ${payload.restaurant.rut}`);
   }
   tp.newLine();
 
@@ -1341,6 +1463,19 @@ async function renderBillPreviewMinimal(
   printAmountRow(tp, 'Con propina', payload.total_with_suggested_tip);
   tp.newLine();
 
+  // QR opcional segun toggle (fix v0.9.7 bug A3): si el dueno configuro QR
+  // url y showQr no esta explicitamente OFF, lo imprimimos chico al pie.
+  // Minimal style mantiene la estetica zen pero respeta el toggle.
+  const qrUrl = payload.restaurant.print_qr_url?.trim();
+  if (showQr && qrUrl && qrUrl.length > 0) {
+    tp.alignCenter();
+    const label = payload.restaurant.print_qr_label?.trim();
+    if (label && label.length > 0) tp.println(label);
+    tp.printQR(qrUrl, { cellSize: 5, correction: 'M' });
+    tp.alignLeft();
+    tp.newLine();
+  }
+
   // Footer simple
   const phrase = payload.restaurant.print_footer_phrase?.trim() || 'Gracias.';
   tp.println(phrase);
@@ -1366,13 +1501,26 @@ async function renderBillPreviewBrand(
   const width = getPayloadWidth(payload);
   const fontSize = getFontSize(payload.print_options);
 
+  // Toggles del bill_preview con defaults rich (mig 058).
+  //  - showAddress default true: nombre del local sale con direccion debajo.
+  //  - showRut default false en bill_preview (no es doc legal).
+  //  - showQr default true (si print_qr_url seteado).
+  // Bug v0.9.6: estos 3 toggles se ignoraban en brand.
+  const opts = (payload.print_options ?? {}) as {
+    showAddress?: boolean;
+    showRut?: boolean;
+    showQr?: boolean;
+  };
+  const showAddress = opts.showAddress !== false; // default true
+  const showRut = opts.showRut === true;           // default false en bill_preview
+  const showQr = opts.showQr !== false;            // default true
+
   const ornament = payload.restaurant.print_ornament_char ?? null;
 
   // Logo grande arriba (toggle del usuario).
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   // Nombre del local centrado + bold + doble altura.
-  // fontSize='large' suma a doubleHeight (mayoria de termicas cap a 2x).
   tp.alignCenter();
   tp.bold(true);
   applyHeaderFontSize(tp, fontSize);
@@ -1385,6 +1533,22 @@ async function renderBillPreviewBrand(
   const slogan = payload.restaurant.slogan?.trim();
   if (slogan && slogan.length > 0) {
     tp.println(`"${slogan}"`);
+  }
+
+  // Direccion + comuna (toggle showAddress). Fix v0.9.7 (bug A1).
+  if (showAddress) {
+    const addr = payload.restaurant.address?.trim();
+    if (addr && addr.length > 0) tp.println(addr);
+    const comuna = payload.restaurant.comuna?.trim();
+    if (comuna && comuna.length > 0) tp.println(comuna);
+  }
+
+  // RUT (toggle showRut, default OFF para bill_preview). Fix v0.9.7 (bug A2).
+  // El RestaurantPrintInfo del agente acepta `rut` opcional desde v0.9.7;
+  // RPCs viejas no lo envian todavia (Carlos lo agrega aparte) — el bloque
+  // se skipa silenciosamente cuando no llega.
+  if (showRut && payload.restaurant.rut) {
+    tp.println(`RUT: ${payload.restaurant.rut}`);
   }
   tp.alignLeft();
 
@@ -1436,8 +1600,9 @@ async function renderBillPreviewBrand(
 
   ornamentSep(tp, ornament, width);
 
-  // Footer: QR + frase con vinetas
-  printBillFooter(tp, payload.restaurant);
+  // Footer: QR + frase con vinetas. Fix v0.9.7 bug A3: pasamos { showQr }
+  // para que printBillFooter gateee el QR segun el toggle del dueno.
+  printBillFooter(tp, payload.restaurant, { showQr });
 
   // Frase final destacada con ornament a los lados (si hay ornament safe-ASCII).
   // Si llega un char legacy CP437 (♥, ♦, etc), fallback a `*` igual que ornamentSep.
@@ -1473,6 +1638,16 @@ async function renderBillPreviewThermalPro(
   const width = getPayloadWidth(payload);
   const fontSize = getFontSize(payload.print_options);
 
+  // Toggles bill_preview (fix v0.9.7 bugs A1+A2+A3).
+  const opts = (payload.print_options ?? {}) as {
+    showAddress?: boolean;
+    showRut?: boolean;
+    showQr?: boolean;
+  };
+  const showAddress = opts.showAddress !== false; // default true
+  const showRut = opts.showRut === true;           // default false en bill_preview
+  const showQr = opts.showQr !== false;            // default true
+
   // Logo respetando el toggle (en thermal_pro generalmente OFF para
   // priorizar densidad de info).
   await printLogoIfEnabled(tp, payload, supabase, logger);
@@ -1483,21 +1658,27 @@ async function renderBillPreviewThermalPro(
   applyHeaderFontSize(tp, fontSize);
   const name = payload.restaurant.name;
   const addr = payload.restaurant.address?.trim();
-  if (addr && addr.length > 0) {
+  if (showAddress && addr && addr.length > 0) {
     tp.println(`${name} · ${addr}`);
   } else {
     tp.println(name);
   }
 
-  // Comuna + telefono
-  const comuna = payload.restaurant.comuna?.trim();
-  const phone = payload.restaurant.phone?.trim();
-  if (comuna && phone) {
-    tp.println(`${comuna} · Tel ${phone}`);
-  } else if (comuna) {
-    tp.println(comuna);
-  } else if (phone) {
-    tp.println(`Tel ${phone}`);
+  // Comuna + telefono (gated por showAddress)
+  if (showAddress) {
+    const comuna = payload.restaurant.comuna?.trim();
+    const phone = payload.restaurant.phone?.trim();
+    if (comuna && phone) {
+      tp.println(`${comuna} · Tel ${phone}`);
+    } else if (comuna) {
+      tp.println(comuna);
+    } else if (phone) {
+      tp.println(`Tel ${phone}`);
+    }
+  }
+  // RUT (default OFF en bill_preview).
+  if (showRut && payload.restaurant.rut) {
+    tp.println(`RUT: ${payload.restaurant.rut}`);
   }
   resetHeaderFontSize(tp);
   tp.println('='.repeat(width));
@@ -1553,8 +1734,8 @@ async function renderBillPreviewThermalPro(
   }
   tp.println('='.repeat(width));
 
-  // Footer (sin ornament, mantener look pro)
-  printBillFooter(tp, payload.restaurant);
+  // Footer (sin ornament, mantener look pro). Fix v0.9.7 bug A3: showQr.
+  printBillFooter(tp, payload.restaurant, { showQr });
   tp.newLine();
 }
 
@@ -1574,14 +1755,33 @@ async function renderBillProformaMinimal(
   const width = getPayloadWidth(payload);
   const fontSize = getFontSize(payload.print_options);
 
+  // Toggles bill_proforma (fix v0.9.7 bugs A1+A2+A3). showRut default TRUE.
+  const opts = (payload.print_options ?? {}) as {
+    showAddress?: boolean;
+    showRut?: boolean;
+    showQr?: boolean;
+  };
+  const showAddress = opts.showAddress !== false; // default true
+  const showRut = opts.showRut !== false;          // default true en bill_proforma
+  const showQr = opts.showQr !== false;            // default true
+
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   tp.alignLeft();
   applyHeaderFontSize(tp, fontSize);
   tp.println(payload.restaurant.name);
-  const address = payload.restaurant.address?.trim();
-  if (address && address.length > 0) {
-    tp.println(address);
+  if (showAddress) {
+    const address = payload.restaurant.address?.trim();
+    if (address && address.length > 0) {
+      tp.println(address);
+    }
+    const comuna = payload.restaurant.comuna?.trim();
+    if (comuna && comuna.length > 0) {
+      tp.println(comuna);
+    }
+  }
+  if (showRut && payload.restaurant.rut) {
+    tp.println(`RUT: ${payload.restaurant.rut}`);
   }
   tp.newLine();
 
@@ -1632,6 +1832,17 @@ async function renderBillProformaMinimal(
     tp.newLine();
   }
 
+  // QR opcional segun toggle (fix v0.9.7 bug A3) — minimal usa cellSize chico.
+  const qrUrl = payload.restaurant.print_qr_url?.trim();
+  if (showQr && qrUrl && qrUrl.length > 0) {
+    tp.alignCenter();
+    const label = payload.restaurant.print_qr_label?.trim();
+    if (label && label.length > 0) tp.println(label);
+    tp.printQR(qrUrl, { cellSize: 5, correction: 'M' });
+    tp.alignLeft();
+    tp.newLine();
+  }
+
   const phrase = payload.restaurant.print_footer_phrase?.trim() || 'Gracias.';
   tp.println(phrase);
   tp.newLine();
@@ -1652,6 +1863,16 @@ async function renderBillProformaBrand(
   const width = getPayloadWidth(payload);
   const fontSize = getFontSize(payload.print_options);
 
+  // Toggles bill_proforma (fix v0.9.7 bugs A1+A2+A3). showRut default TRUE.
+  const opts = (payload.print_options ?? {}) as {
+    showAddress?: boolean;
+    showRut?: boolean;
+    showQr?: boolean;
+  };
+  const showAddress = opts.showAddress !== false; // default true
+  const showRut = opts.showRut !== false;          // default true en bill_proforma
+  const showQr = opts.showQr !== false;            // default true
+
   const ornament = payload.restaurant.print_ornament_char ?? null;
 
   await printLogoIfEnabled(tp, payload, supabase, logger);
@@ -1667,6 +1888,17 @@ async function renderBillProformaBrand(
   const slogan = payload.restaurant.slogan?.trim();
   if (slogan && slogan.length > 0) {
     tp.println(`"${slogan}"`);
+  }
+  // Direccion + comuna (toggle showAddress). Fix v0.9.7 bug A1.
+  if (showAddress) {
+    const addr = payload.restaurant.address?.trim();
+    if (addr && addr.length > 0) tp.println(addr);
+    const comuna = payload.restaurant.comuna?.trim();
+    if (comuna && comuna.length > 0) tp.println(comuna);
+  }
+  // RUT (default ON en proforma — es la boleta final, OK mostrarlo).
+  if (showRut && payload.restaurant.rut) {
+    tp.println(`RUT: ${payload.restaurant.rut}`);
   }
   tp.alignLeft();
 
@@ -1736,7 +1968,8 @@ async function renderBillProformaBrand(
   }
 
   ornamentSep(tp, ornament, width);
-  printBillFooter(tp, payload.restaurant);
+  // Fix v0.9.7 bug A3: respetar showQr.
+  printBillFooter(tp, payload.restaurant, { showQr });
 
   // Frase final destacada con ornament safe-ASCII (fallback `*` si llega CP437).
   if (ornament) {
@@ -1769,25 +2002,40 @@ async function renderBillProformaThermalPro(
   const width = getPayloadWidth(payload);
   const fontSize = getFontSize(payload.print_options);
 
+  // Toggles bill_proforma (fix v0.9.7 bugs A1+A2+A3). showRut default TRUE.
+  const opts = (payload.print_options ?? {}) as {
+    showAddress?: boolean;
+    showRut?: boolean;
+    showQr?: boolean;
+  };
+  const showAddress = opts.showAddress !== false; // default true
+  const showRut = opts.showRut !== false;          // default true en bill_proforma
+  const showQr = opts.showQr !== false;            // default true
+
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   tp.println('='.repeat(width));
   applyHeaderFontSize(tp, fontSize);
   const name = payload.restaurant.name;
   const addr = payload.restaurant.address?.trim();
-  if (addr && addr.length > 0) {
+  if (showAddress && addr && addr.length > 0) {
     tp.println(`${name} · ${addr}`);
   } else {
     tp.println(name);
   }
-  const comuna = payload.restaurant.comuna?.trim();
-  const phone = payload.restaurant.phone?.trim();
-  if (comuna && phone) {
-    tp.println(`${comuna} · Tel ${phone}`);
-  } else if (comuna) {
-    tp.println(comuna);
-  } else if (phone) {
-    tp.println(`Tel ${phone}`);
+  if (showAddress) {
+    const comuna = payload.restaurant.comuna?.trim();
+    const phone = payload.restaurant.phone?.trim();
+    if (comuna && phone) {
+      tp.println(`${comuna} · Tel ${phone}`);
+    } else if (comuna) {
+      tp.println(comuna);
+    } else if (phone) {
+      tp.println(`Tel ${phone}`);
+    }
+  }
+  if (showRut && payload.restaurant.rut) {
+    tp.println(`RUT: ${payload.restaurant.rut}`);
   }
   resetHeaderFontSize(tp);
   tp.println('='.repeat(width));
@@ -1848,7 +2096,8 @@ async function renderBillProformaThermalPro(
     tp.println('='.repeat(width));
   }
 
-  printBillFooter(tp, payload.restaurant);
+  // Fix v0.9.7 bug A3: respetar showQr.
+  printBillFooter(tp, payload.restaurant, { showQr });
   tp.newLine();
 }
 
@@ -1913,6 +2162,12 @@ function renderKitchenOrderMinimal(
   resetHeaderFontSize(tp);
 
   // Subtitle en linea unica: mesero . hora . "Hace X min".
+  //
+  // Fix v0.9.7 bug A5: la hora absoluta (e.g. "03:15") solo sale si
+  // showOpenTime no esta explicitamente OFF. Antes la hora se pushaba
+  // siempre, ignorando el toggle del dueno. El toggle "Hora apertura"
+  // controla la hora completa (absoluta + "Hace X min"), no solo el
+  // "Hace X min".
   const subtitleParts: string[] = [];
   if (showWaiter) {
     const waiter = payload.waiter_name?.trim() || '-';
@@ -1926,8 +2181,8 @@ function renderKitchenOrderMinimal(
     if (elapsedMin != null) {
       subtitleParts.push(`Hace ${elapsedMin} min`);
     }
+    subtitleParts.push(time);
   }
-  subtitleParts.push(time);
   if (subtitleParts.length > 0) {
     tp.println(subtitleParts.join(' . '));
   }
@@ -2021,9 +2276,11 @@ function renderKitchenOrderBrand(
   tp.alignLeft();
   ornamentSep(tp, ornament, width);
 
-  // Subtitle (igual estructura que Classic)
-  const headerLineParts: string[] = [time];
+  // Subtitle (igual estructura que Classic).
+  // Fix v0.9.7 bug A5: hora absoluta gated por showOpenTime.
+  const headerLineParts: string[] = [];
   if (showOpenTime) {
+    headerLineParts.push(time);
     const elapsedMin = minutesSinceOpened(payload.opened_at);
     if (elapsedMin != null) {
       headerLineParts.push(`Hace ${elapsedMin} min`);
@@ -2118,6 +2375,7 @@ function renderKitchenOrderThermalPro(
   tp.println('='.repeat(width));
 
   // Meta: mesero, pax, "Hace X min", hora — todo en una linea.
+  // Fix v0.9.7 bug A5: hora absoluta gated por showOpenTime.
   const meta: string[] = [];
   if (showWaiter) {
     const waiter = payload.waiter_name?.trim() || '-';
@@ -2131,8 +2389,8 @@ function renderKitchenOrderThermalPro(
     if (elapsedMin != null) {
       meta.push(`Hace ${elapsedMin} min`);
     }
+    meta.push(time);
   }
-  meta.push(time);
   if (meta.length > 0) tp.println(meta.join(' . '));
   tp.drawLine();
 
