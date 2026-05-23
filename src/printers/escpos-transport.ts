@@ -66,6 +66,19 @@ const PRINTER_WIDTH_DEFAULT = 32;
 const CONNECT_TIMEOUT_MS = 5_000;
 
 /**
+ * Threshold minimo de bytes en el buffer ESC/POS para considerarlo "util"
+ * (no solo bytes de init de codepage). Ver explicacion completa en el check
+ * defensivo de sendUsbViaSpooler.
+ *
+ * Numero racional:
+ *  - Tras `tp.clear()` el buffer tiene 3 bytes (cambio de codepage PC858).
+ *  - Un ticket REAL minimo (1 linea + LF + cut) son ~30 bytes ESC/POS.
+ *  - 16 bytes esta 5x sobre el "solo init" y muy debajo del ticket minimo,
+ *    asi que detecta el caso patologico sin falsos positivos.
+ */
+const MIN_USEFUL_BUFFER_BYTES = 16;
+
+/**
  * Callback que el renderer usa para poblar el ThermalPrinter con el
  * contenido del ticket (lineas, bold, beep, cut). El helper ya hizo
  * `tp.clear()` antes de llamarte, asi que arrancas con buffer limpio.
@@ -151,6 +164,35 @@ async function sendUsbViaSpooler(
   tp.clear();
   await populate(tp);
   const buffer = tp.getBuffer();
+
+  // Defensa anti "ticket fantasma" (v0.9.3):
+  //
+  // Tras `tp.clear()` el buffer NO queda en 0 bytes — queda con la secuencia
+  // de cambio de codepage (PC858_EURO) que son ~3 bytes (0x1B 0x74 0x13). Si
+  // por algun bug regresivo el populate no agrega contenido REAL al buffer
+  // (ej: un callsite futuro pierde el `await` sobre un populate async, una
+  // promesa intermedia tira sin propagar, etc.), `getBuffer()` retornaria
+  // SOLO esos bytes de init y `sendRawToWindowsPrinter` los mandaria al
+  // spooler sin queja. Resultado en papel: NADA visible. Resultado en DB:
+  // status='printed', sin error. El operador ve jobs marcados printed pero
+  // la termica nunca se movio.
+  //
+  // Para detectar ese escenario, exigimos que el buffer tenga al menos
+  // `MIN_USEFUL_BUFFER_BYTES` mas alla de los bytes de init. Si no llega,
+  // tiramos error claro — el caller (claimAndRun de realtime.ts) lo clasifica
+  // como transient y el job NO se marca printed. Asi el bug es VISIBLE en
+  // last_error en lugar de quedar silencioso.
+  //
+  // El threshold de 16 bytes es conservador: el ticket mas corto razonable
+  // (1 println con "X" + cut) son >= 30 bytes ESC/POS. 16 bytes es 5x mas
+  // grande que los 3 bytes de init, asi que cualquier render real lo pasa.
+  if (buffer.length < MIN_USEFUL_BUFFER_BYTES) {
+    throw new Error(
+      `Buffer ESC/POS vacio o solo init (${buffer.length} bytes) para printer "${printer.name}". ` +
+        `El renderer no agrego contenido — probable regresion del populate sync/async ` +
+        `o type guard del payload fallando. No mando al spooler para evitar ticket fantasma.`
+    );
+  }
 
   // Resolver el QUEUE NAME que Win32 OpenPrinter espera.
   //
@@ -262,6 +304,19 @@ async function sendViaThermalPrinter(
 
   tp.clear();
   await populate(tp);
+
+  // Misma defensa anti "ticket fantasma" que sendUsbViaSpooler. Si el buffer
+  // de ThermalPrinter quedo solo con bytes de init (populate vacio), no
+  // queremos que el execute() socket-TCP/COM-write marque ok sin haber
+  // mandado contenido util. Ver comentario detallado arriba en sendUsbViaSpooler.
+  const buffer = tp.getBuffer();
+  if (buffer.length < MIN_USEFUL_BUFFER_BYTES) {
+    throw new Error(
+      `Buffer ESC/POS vacio o solo init (${buffer.length} bytes) para printer "${printer.name}" (${printer.connection_type}). ` +
+        `El renderer no agrego contenido — probable regresion del populate sync/async. ` +
+        `No ejecuto el send para evitar ticket fantasma.`
+    );
+  }
 
   try {
     await tp.execute();
