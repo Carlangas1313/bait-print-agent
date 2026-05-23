@@ -36,7 +36,7 @@ import { formatJob } from './console.js';
 import type { PrinterRow } from '../printers/registry.js';
 import type { DiscoveredPrinter } from '../printers/discover.js';
 import { AGENT_VERSION } from '../constants.js';
-import { sendEscPos, type PopulatePrinter } from '../printers/escpos-transport.js';
+import { sendEscPos, type PopulatePrinter, type CaptureContext } from '../printers/escpos-transport.js';
 import {
   renderKitchenOrderEscPos,
   renderKitchenCancelEscPos,
@@ -64,6 +64,29 @@ const PRINTER_WIDTH_DEFAULT = 32;
  *   - Pasarlo a los layouts ESC/POS para que los separadores `'='.repeat(W)`
  *     ocupen el ancho real del papel.
  */
+/**
+ * Extrae el `style` del print_options del payload para etiquetar la captura
+ * ESC/POS. Util para que Claude pueda filtrar capturas por estilo cuando
+ * diagnostica un layout especifico.
+ *
+ * Si el payload no tiene print_options o el style no esta seteado, retorna
+ * null y el captor escribe "(default)" en el header del .txt. No tiramos.
+ */
+function resolvePrintStyle(payload: unknown): string | null {
+  if (
+    payload &&
+    typeof payload === 'object' &&
+    'print_options' in payload &&
+    payload.print_options &&
+    typeof payload.print_options === 'object' &&
+    'style' in payload.print_options
+  ) {
+    const s = (payload.print_options as { style?: unknown }).style;
+    if (typeof s === 'string' && s.length > 0) return s;
+  }
+  return null;
+}
+
 function resolvePaperWidth(payload: unknown, printer: PrinterRow): number {
   const fromPayload =
     payload &&
@@ -238,10 +261,21 @@ export async function renderJobToPrinter(
   // printer.width_chars > 32.
   const width = resolvePaperWidth(job.payload, printer);
 
+  // Contexto de captura ESC/POS (v0.9.6). Solo aplica al flow USB exitoso —
+  // el transport ignora captureContext en network/bluetooth porque ahi no
+  // tenemos visibilidad del buffer final (lo construye/manda ThermalPrinter
+  // directo al socket).
+  const style = resolvePrintStyle(job.payload);
+
   for (let copy = 1; copy <= copies; copy++) {
     const populate = buildPopulate(job, printer, logger, supabase);
+    const captureContext: CaptureContext = {
+      jobId: copies === 1 ? job.id : `${job.id}_copy${copy}`,
+      jobType: job.job_type,
+      style
+    };
     try {
-      await sendEscPos(printer, populate, logger, width);
+      await sendEscPos(printer, populate, logger, width, captureContext);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(
@@ -406,6 +440,14 @@ export async function renderTestPage(
   const printer = discoveredToSyntheticPrinter(discovered);
   const lines = buildTestPageLines(discovered, agentName, locationName);
 
+  // CaptureContext sintetico para test page. Asi el .txt queda etiquetado
+  // como tipo "test" y el operador lo distingue facil de un kitchen_order.
+  const captureContext: CaptureContext = {
+    jobId: `testpage-${discovered.device_id}-${Date.now()}`,
+    jobType: 'test',
+    style: null
+  };
+
   try {
     await sendEscPos(printer, (tp) => {
       for (const raw of lines) {
@@ -419,7 +461,7 @@ export async function renderTestPage(
         if (bold) tp.bold(false);
       }
       tp.cut();
-    }, logger);
+    }, logger, undefined, captureContext);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(

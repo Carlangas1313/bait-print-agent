@@ -46,6 +46,7 @@ import {
 import type { Logger } from '../logger.js';
 import type { PrinterRow } from './registry.js';
 import { sendRawToWindowsPrinter } from './win-raw-print.js';
+import { captureJob } from './escpos-capture.js';
 
 /**
  * Default del ancho del papel en chars. Se usa como fallback cuando el caller
@@ -209,6 +210,25 @@ export type PopulatePrinter = (
 ) => void | Promise<void>;
 
 /**
+ * Contexto del job para etiquetar la captura ESC/POS (v0.9.6).
+ *
+ * Threaded down desde el dispatcher (renderJobToPrinter pasa job.id +
+ * job.job_type + style del print_options del payload). Para callsites que
+ * no son jobs reales (renderTestPage del companion), el caller pasa un
+ * objeto sintetico — el captor no diferencia.
+ *
+ * Es opcional en `sendEscPos` para no romper callsites legacy / tests
+ * unitarios que aun llaman con la signature vieja (3 args). En esos casos
+ * no se genera captura y no pasa nada.
+ */
+export type CaptureContext = {
+  jobId: string;
+  jobType: string;
+  /** Estilo de print_options (classic/minimal/brand/thermal_pro) o null. */
+  style: string | null;
+};
+
+/**
  * Manda un ticket ESC/POS a la impresora segun su `connection_type`.
  *
  * El renderer (caller) NO necesita saber si la impresora es USB queue,
@@ -220,6 +240,11 @@ export type PopulatePrinter = (
  * Si no se especifica, default 32 (compat con Rongta 58mm que era el
  * comportamiento previo a mig 060).
  *
+ * `captureContext` (v0.9.6): si se especifica, el flow USB exitoso captura
+ * el buffer ESC/POS a un .txt humano-legible en `~/.bait-print-agent/captures/`.
+ * Sensor de diagnostico para que Claude pueda inspeccionar que se imprimio
+ * sin tener el papel fisico. Optional para callsites legacy.
+ *
  * Lanza si falla en cualquier paso (connect, send, write). El caller decide
  * el retry path (productivo: el claimAndRun de realtime.ts; test: el handler
  * de /v1/printers/:id/test).
@@ -228,11 +253,12 @@ export async function sendEscPos(
   printer: PrinterRow,
   populate: PopulatePrinter,
   logger: Logger,
-  width: number = PRINTER_WIDTH_DEFAULT
+  width: number = PRINTER_WIDTH_DEFAULT,
+  captureContext?: CaptureContext
 ): Promise<void> {
   switch (printer.connection_type) {
     case 'usb':
-      await sendUsbViaSpooler(printer, populate, logger, width);
+      await sendUsbViaSpooler(printer, populate, logger, width, captureContext);
       return;
 
     case 'network':
@@ -272,7 +298,8 @@ async function sendUsbViaSpooler(
   printer: PrinterRow,
   populate: PopulatePrinter,
   logger: Logger,
-  width: number
+  width: number,
+  captureContext?: CaptureContext
 ): Promise<void> {
   // Resolver el QUEUE NAME que Win32 OpenPrinter espera.
   //
@@ -365,6 +392,20 @@ async function sendUsbViaSpooler(
     { printer: printer.name, queueName, bytes: buffer.length },
     'sendEscPos USB via spooler RAW completado'
   );
+
+  // Captura ESC/POS (v0.9.6): sensor de diagnostico. Si tenemos contexto del
+  // job, decodea el buffer a .txt y lo guarda en ~/.bait-print-agent/captures/.
+  // Es no-throwing por contrato — si falla, el job sigue marcado printed y
+  // solo queda un warn en el log. Ver `escpos-capture.ts`.
+  if (captureContext) {
+    await captureJob(
+      captureContext.jobId,
+      captureContext.jobType,
+      captureContext.style,
+      buffer,
+      logger
+    );
+  }
 }
 
 /**
