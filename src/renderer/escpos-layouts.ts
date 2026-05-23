@@ -531,6 +531,72 @@ function getFontSize(
   return 'normal';
 }
 
+/**
+ * Lee el density de un print_options de cualquier ticket. Defensa: si el
+ * payload viene de una RPC pre-density (pre-mig 058/059) o trae un valor
+ * desconocido, devuelve 'normal' (legacy behavior, sin spacing extra).
+ *
+ * v0.9.10: el toggle `density` (compact/normal/spacious) ya existia en la
+ * UI + el JSONB `restaurants.print_options.{tipoTicket}.density` desde
+ * mig 058, pero el renderer ESC/POS lo IGNORABA — los 3 valores producian
+ * el mismo output. Esta funcion + `densitySpacing()` cierran el loop.
+ */
+function getDensity(
+  print_options?: { density?: 'compact' | 'normal' | 'spacious' }
+): 'compact' | 'normal' | 'spacious' {
+  const v = print_options?.density;
+  if (v === 'compact' || v === 'spacious') return v;
+  return 'normal';
+}
+
+/**
+ * Mapea el toggle `density` a 2 metricas de spacing usadas por los
+ * renderers (v0.9.10):
+ *
+ *  - `itemGap`: newlines extra ENTRE items (loop). Si =0, los items quedan
+ *    uno seguido del otro. Si =1, hay una linea en blanco despues de cada
+ *    item — util en spacious para que el ticket "respire".
+ *  - `sectionGap`: newlines extra ENTRE bloques principales (header → items,
+ *    items → totales, totales → footer). Si =0, los bloques se pegan;
+ *    si =1, hay separacion suave; si =2, separacion amplia.
+ *
+ * Mapping (consistente con el preview ASCII en bait-pos):
+ *  - compact:  { itemGap: 0, sectionGap: 0 }  — papel maximo aprovechado
+ *  - normal:   { itemGap: 0, sectionGap: 1 }  — default/legacy behavior
+ *  - spacious: { itemGap: 1, sectionGap: 2 }  — papel premium, mas blanco
+ *
+ * Los renderers iteran `tp.newLine(N)` o invocan un helper que skipea
+ * cuando N=0. La idea es que cualquier value que llegue de la UI tenga
+ * efecto VISIBLE end-to-end (UI → DB → RPC payload → renderer → papel).
+ */
+function densitySpacing(
+  density: 'compact' | 'normal' | 'spacious'
+): { itemGap: number; sectionGap: number } {
+  switch (density) {
+    case 'compact':
+      return { itemGap: 0, sectionGap: 0 };
+    case 'spacious':
+      return { itemGap: 1, sectionGap: 2 };
+    case 'normal':
+    default:
+      return { itemGap: 0, sectionGap: 1 };
+  }
+}
+
+/**
+ * Helper para imprimir N newlines sin que el caller tenga que `if (N > 0)`
+ * cada vez. Si N=0, no hace nada — equivale al comportamiento "compact"
+ * donde queremos cero whitespace entre bloques.
+ *
+ * Usado en los renderers v0.9.10 para aplicar `sectionGap` / `itemGap`
+ * sin abultar el codigo con guards triviales.
+ */
+function newLines(tp: Printer, n: number): void {
+  for (let i = 0; i < n; i++) {
+    tp.newLine();
+  }
+}
+
 // ====================================================================
 // Resolvers compartidos
 // ====================================================================
@@ -615,6 +681,7 @@ function renderKitchenOrderClassic(
     showWaiter?: boolean;
     showGuests?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showOpenTime = opts.showOpenTime ?? true;
   const showHighlightedNotes = opts.showHighlightedNotes ?? true;
@@ -623,6 +690,9 @@ function renderKitchenOrderClassic(
   const showWaiter = opts.showWaiter ?? true;
   const showGuests = opts.showGuests ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density define itemGap (newlines entre items) y sectionGap
+  // (newlines entre bloques principales del ticket).
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Header XL en 2 lineas: estacion arriba, destino abajo.
   // fontSize=large encima del setTextDoubleHeight: en termicas con soporte
@@ -667,19 +737,25 @@ function renderKitchenOrderClassic(
 
   tp.alignLeft();
   tp.drawLine();
-  tp.newLine();
+  // v0.9.10: separacion header → items respeta sectionGap (compact=0, normal=1, spacious=2).
+  newLines(tp, sectionGap);
 
-  // Items con toggles aplicados.
-  for (const item of payload.items) {
+  // Items con toggles aplicados. v0.9.10: itemGap=1 en spacious agrega
+  // newline entre items para que el ticket "respire". compact/normal=0.
+  payload.items.forEach((item, idx) => {
     printKitchenItemWithToggles(tp, item, {
       showHighlightedNotes,
       showGiftMark,
       showPrices,
     });
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
   // Nota del cliente (siempre — es parte del payload, no de los items)
   if (payload.customer_note && payload.customer_note.trim().length > 0) {
+    newLines(tp, sectionGap);
     tp.drawLine();
     if (showHighlightedNotes) {
       tp.bold(true);
@@ -694,6 +770,7 @@ function renderKitchenOrderClassic(
 
   // Total items destacado (suma de quantities)
   const totalItems = payload.items.reduce((acc, it) => acc + it.quantity, 0);
+  newLines(tp, sectionGap);
   tp.drawLine();
   tp.alignCenter();
   tp.bold(true);
@@ -792,10 +869,15 @@ function renderKitchenCancelClassic(
     showReason?: boolean;
     showWaiter?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showReason = opts.showReason ?? true;
   const showWaiter = opts.showWaiter ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing. Default de kitchen_cancel es 'compact' (segun
+  // DEFAULT_PRINT_OPTIONS de print-options.ts) — anulacion compacta por
+  // naturaleza, pero respetamos cualquier override del dueno.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Header: badge invertido "ANULACION" + destino en doble altura.
   // fontSize='large' suma a doubleHeight (ver renderKitchenOrderClassic).
@@ -819,9 +901,10 @@ function renderKitchenCancelClassic(
   }
   tp.alignLeft();
   tp.drawLine();
-  tp.newLine();
+  // v0.9.10: separacion header → items respeta sectionGap.
+  newLines(tp, sectionGap);
 
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     tp.bold(true);
     tp.println(`[X] ${item.quantity}x ${item.name}`);
     tp.bold(false);
@@ -831,14 +914,19 @@ function renderKitchenCancelClassic(
     if (item.note && item.note.trim().length > 0) {
       tp.println(`    [${item.note.trim()}]`);
     }
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
   // Motivo (customer_note) — solo si showReason
   if (showReason && payload.customer_note && payload.customer_note.trim().length > 0) {
+    newLines(tp, sectionGap);
     tp.drawLine();
     tp.println(`Motivo: ${payload.customer_note.trim()}`);
   }
 
+  newLines(tp, sectionGap);
   tp.drawLine();
   tp.newLine();
 }
@@ -868,10 +956,13 @@ async function renderBillPreviewClassic(
     showAddress?: boolean;
     showRut?: boolean;
     showQr?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showAddress = opts.showAddress !== false; // default true
   const showRut = opts.showRut === true;           // default false en bill_preview
   const showQr = opts.showQr !== false;            // default true
+  // v0.9.10: density spacing (compact / normal / spacious).
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Logo si esta activo (D4 + D5 del spec). Si falla, sigue sin logo.
   await printLogoIfEnabled(tp, payload, supabase, logger);
@@ -921,7 +1012,8 @@ async function renderBillPreviewClassic(
 
   // Badge PRE-CUENTA + numero de orden
   printBadge(tp, `PRE-CUENTA #${payload.order_number}`);
-  tp.newLine();
+  // v0.9.10: bloque header → meta-info usa sectionGap.
+  newLines(tp, sectionGap);
 
   // Linea de mesa/comensales/hora/mozo
   const time = formatTime(payload.opened_at);
@@ -935,14 +1027,17 @@ async function renderBillPreviewClassic(
     tp.println(`Mesero: ${payload.waiter_name.trim()}`);
   }
   tp.drawLine();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     printBillItem(tp, item, width);
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
-  tp.newLine();
+  newLines(tp, sectionGap);
   tp.drawLine();
 
   // Subtotal + IVA
@@ -956,7 +1051,7 @@ async function renderBillPreviewClassic(
   // del modo grande prematuramente y el resto del ticket vuelve a normal.
   printXLTotal(tp, 'TOTAL', payload.total, fontSize);
   tp.drawLine();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Sugerencia de propina
   tp.bold(true);
@@ -965,7 +1060,7 @@ async function renderBillPreviewClassic(
   printAmountRow(tp, '  Propina', payload.suggested_tip_amount, false);
   printAmountRow(tp, 'TOTAL CON PROPINA', payload.total_with_suggested_tip);
   tp.drawLine();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Aviso NO tributario
   tp.alignCenter();
@@ -975,7 +1070,7 @@ async function renderBillPreviewClassic(
   tp.println('La boleta SII se entrega');
   tp.println('al momento del pago.');
   tp.alignLeft();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Separador con vineta antes del footer
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
@@ -1010,10 +1105,13 @@ async function renderBillProformaClassic(
     showAddress?: boolean;
     showRut?: boolean;
     showQr?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showAddress = opts.showAddress !== false; // default true
   const showRut = opts.showRut !== false;          // default true en bill_proforma
   const showQr = opts.showQr !== false;            // default true
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Logo si esta activo (D4 + D5 del spec). Si falla, sigue sin logo.
   await printLogoIfEnabled(tp, payload, supabase, logger);
@@ -1061,7 +1159,7 @@ async function renderBillProformaClassic(
 
   // Badge BOLETA + numero
   printBadge(tp, `BOLETA #${payload.order_number}`);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Linea de mesa/comensales/hora/mozo
   const time = formatTime(payload.opened_at);
@@ -1075,14 +1173,17 @@ async function renderBillProformaClassic(
     tp.println(`Mesero: ${payload.waiter_name.trim()}`);
   }
   tp.drawLine();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     printBillItem(tp, item, width);
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
-  tp.newLine();
+  newLines(tp, sectionGap);
   tp.drawLine();
 
   // Subtotal + IVA
@@ -1103,13 +1204,13 @@ async function renderBillProformaClassic(
   // v0.9.8: pasamos fontSize (ver nota arriba en classic).
   printXLTotal(tp, 'TOTAL', payload.total + tip, fontSize);
   tp.drawLine();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Metodo de pago
   if (payload.payment) {
     printPaymentSection(tp, payload.payment, payload.total + tip);
     tp.drawLine();
-    tp.newLine();
+    newLines(tp, sectionGap);
   }
 
   // Aviso NO tributario
@@ -1120,7 +1221,7 @@ async function renderBillProformaClassic(
   tp.println('La boleta SII se entrega');
   tp.println('aparte si corresponde.');
   tp.alignLeft();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Separador con vineta antes del footer.
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
@@ -1184,10 +1285,16 @@ function renderCashCloseClassic(
     showHighlightedDiff?: boolean;
     showMethodBreakdown?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showHighlightedDiff = opts.showHighlightedDiff ?? true;
   const showMethodBreakdown = opts.showMethodBreakdown ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing.
+  // En cash_close NO hay loop de items con itemGap (la "lista" son lineas
+  // fijas de Ventas/Efectivo/Tarjeta/etc), pero sectionGap si separa los
+  // bloques principales (header → ventas → totales → diferencia → footer).
+  const { sectionGap } = densitySpacing(getDensity(opts));
 
   // Header: usa restaurant (mig 058+) si esta disponible para incluir logo
   // y ornament. Si no, fallback al header generico de cash close.
@@ -1235,7 +1342,8 @@ function renderCashCloseClassic(
 
   tp.alignLeft();
   tp.drawLine();
-  tp.newLine();
+  // v0.9.10: separacion header → bloque ventas usa sectionGap.
+  newLines(tp, sectionGap);
 
   // Ventas totales (siempre)
   tp.bold(true);
@@ -1248,14 +1356,14 @@ function renderCashCloseClassic(
     printAmountRow(tp, 'Tarjeta MP', payload.total_card_mp, true);
     printAmountRow(tp, 'Otras tarjetas', payload.total_card_other, true);
     printAmountRow(tp, 'Transferencia', payload.total_transfer, true);
-    tp.newLine();
+    newLines(tp, sectionGap);
   }
 
   // Propinas + devoluciones + comandas (siempre)
   printAmountRow(tp, 'Propinas', payload.total_tips);
   printAmountRow(tp, 'Devoluciones', payload.total_refunds);
   tp.leftRight('Comandas totales:', String(payload.order_count));
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Caja esperada vs declarada (siempre)
   tp.drawLine();
@@ -1278,12 +1386,14 @@ function renderCashCloseClassic(
 
   // Notas
   if (payload.notes && payload.notes.trim().length > 0) {
+    newLines(tp, sectionGap);
     tp.drawLine();
     tp.println(`Notas: ${payload.notes.trim()}`);
   }
 
   // Si tenemos restaurant, cerrar con ornament + frase del footer.
   if (payload.restaurant) {
+    newLines(tp, sectionGap);
     ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
     printBillFooter(tp, payload.restaurant);
   }
@@ -1536,10 +1646,13 @@ async function renderBillPreviewMinimal(
     showAddress?: boolean;
     showRut?: boolean;
     showQr?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showAddress = opts.showAddress !== false; // default true
   const showRut = opts.showRut === true;           // default false en bill_preview
   const showQr = opts.showQr !== false;            // default true
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Logo respetando el toggle (en minimal generalmente OFF, pero respetamos
   // la config del dueño).
@@ -1564,7 +1677,7 @@ async function renderBillPreviewMinimal(
   if (showRut && payload.restaurant.rut) {
     tp.println(`RUT: ${payload.restaurant.rut}`);
   }
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Titulo simple "PRE-CUENTA"
   tp.println('PRE-CUENTA');
@@ -1580,24 +1693,27 @@ async function renderBillPreviewMinimal(
   meta.push(time);
   meta.push(`${payload.guests} pax`);
   tp.println(meta.join(' · '));
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items con formato "qty  nombre  monto" sin doble altura
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     printBillItem(tp, item, width);
-  }
-  tp.newLine();
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
+  newLines(tp, sectionGap);
 
   // Totales sin separadores fuertes, sin XL.
   printAmountRow(tp, 'Subtotal', payload.subtotal);
   printAmountRow(tp, 'IVA', payload.iva);
   printAmountRow(tp, 'Total', payload.total);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Propina sugerida simple
   printAmountRow(tp, 'Propina 10%', payload.suggested_tip_amount);
   printAmountRow(tp, 'Con propina', payload.total_with_suggested_tip);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // QR opcional segun toggle (fix v0.9.7 bug A3): si el dueno configuro QR
   // url y showQr no esta explicitamente OFF, lo imprimimos chico al pie.
@@ -1609,7 +1725,7 @@ async function renderBillPreviewMinimal(
     if (label && label.length > 0) tp.println(label);
     tp.printQR(qrUrl, { cellSize: 5, correction: 'M' });
     tp.alignLeft();
-    tp.newLine();
+    newLines(tp, sectionGap);
   }
 
   // Footer simple
@@ -1646,10 +1762,13 @@ async function renderBillPreviewBrand(
     showAddress?: boolean;
     showRut?: boolean;
     showQr?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showAddress = opts.showAddress !== false; // default true
   const showRut = opts.showRut === true;           // default false en bill_preview
   const showQr = opts.showQr !== false;            // default true
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   const ornament = payload.restaurant.print_ornament_char ?? null;
 
@@ -1711,13 +1830,16 @@ async function renderBillPreviewBrand(
   if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
     tp.println(`Mesero: ${payload.waiter_name.trim()}`);
   }
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     printBillItem(tp, item, width);
-  }
-  tp.newLine();
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
+  newLines(tp, sectionGap);
 
   // Totales con énfasis brand
   printAmountRow(tp, '  Subtotal', payload.subtotal, true);
@@ -1727,7 +1849,7 @@ async function renderBillPreviewBrand(
   // del emphasis. Sin esto, el setTextNormal interno del helper nos saca
   // del modo grande prematuramente y el resto del ticket vuelve a normal.
   printXLTotal(tp, 'TOTAL', payload.total, fontSize);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Sugerencia de propina
   tp.bold(true);
@@ -1737,7 +1859,7 @@ async function renderBillPreviewBrand(
   tp.bold(true);
   printAmountRow(tp, 'CON PROPINA', payload.total_with_suggested_tip);
   tp.bold(false);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   ornamentSep(tp, ornament, width);
 
@@ -1784,10 +1906,13 @@ async function renderBillPreviewThermalPro(
     showAddress?: boolean;
     showRut?: boolean;
     showQr?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showAddress = opts.showAddress !== false; // default true
   const showRut = opts.showRut === true;           // default false en bill_preview
   const showQr = opts.showQr !== false;            // default true
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Logo respetando el toggle (en thermal_pro generalmente OFF para
   // priorizar densidad de info).
@@ -1841,15 +1966,20 @@ async function renderBillPreviewThermalPro(
   meta.push(`${payload.guests} comensales`);
   tp.println(meta.join(' · '));
   tp.drawLine();
+  newLines(tp, sectionGap);
 
   // Items con precio unitario debajo
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     tp.println(`${item.quantity} ${item.name}`);
     const unit = formatCLP(item.unit_price);
     const sub = formatCLP(item.subtotal);
     tp.leftRight(`   ${unit} c/u`, sub);
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
   tp.drawLine();
+  newLines(tp, sectionGap);
 
   // Subtotal + IVA simple
   printAmountRow(tp, 'Subtotal', payload.subtotal);
@@ -1858,6 +1988,7 @@ async function renderBillPreviewThermalPro(
   printAmountRow(tp, 'TOTAL', payload.total);
   tp.bold(false);
   tp.println('='.repeat(width));
+  newLines(tp, sectionGap);
 
   // 3 sugerencias de propina
   tp.bold(true);
@@ -1901,10 +2032,13 @@ async function renderBillProformaMinimal(
     showAddress?: boolean;
     showRut?: boolean;
     showQr?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showAddress = opts.showAddress !== false; // default true
   const showRut = opts.showRut !== false;          // default true en bill_proforma
   const showQr = opts.showQr !== false;            // default true
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
@@ -1924,7 +2058,7 @@ async function renderBillProformaMinimal(
   if (showRut && payload.restaurant.rut) {
     tp.println(`RUT: ${payload.restaurant.rut}`);
   }
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   tp.println(`BOLETA #${payload.order_number}`);
   resetHeaderFontSize(tp);
@@ -1938,13 +2072,16 @@ async function renderBillProformaMinimal(
   meta.push(time);
   meta.push(`${payload.guests} pax`);
   tp.println(meta.join(' · '));
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     printBillItem(tp, item, width);
-  }
-  tp.newLine();
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
+  newLines(tp, sectionGap);
 
   // Totales
   const tip = payload.tip_amount ?? 0;
@@ -1954,7 +2091,7 @@ async function renderBillProformaMinimal(
     printAmountRow(tp, 'Propina', tip);
   }
   printAmountRow(tp, 'Total', payload.total + tip);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Payment simple (sin XL ni decoraciones)
   if (payload.payment) {
@@ -1970,7 +2107,7 @@ async function renderBillProformaMinimal(
       const last4 = payload.payment.mp_last_four?.trim();
       if (last4) tp.println(`  Tarjeta •••• ${last4}`);
     }
-    tp.newLine();
+    newLines(tp, sectionGap);
   }
 
   // QR opcional segun toggle (fix v0.9.7 bug A3) — minimal usa cellSize chico.
@@ -1981,7 +2118,7 @@ async function renderBillProformaMinimal(
     if (label && label.length > 0) tp.println(label);
     tp.printQR(qrUrl, { cellSize: 5, correction: 'M' });
     tp.alignLeft();
-    tp.newLine();
+    newLines(tp, sectionGap);
   }
 
   const phrase = payload.restaurant.print_footer_phrase?.trim() || 'Gracias.';
@@ -2009,10 +2146,13 @@ async function renderBillProformaBrand(
     showAddress?: boolean;
     showRut?: boolean;
     showQr?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showAddress = opts.showAddress !== false; // default true
   const showRut = opts.showRut !== false;          // default true en bill_proforma
   const showQr = opts.showQr !== false;            // default true
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   const ornament = payload.restaurant.print_ornament_char ?? null;
 
@@ -2063,13 +2203,16 @@ async function renderBillProformaBrand(
   if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
     tp.println(`Mesero: ${payload.waiter_name.trim()}`);
   }
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     printBillItem(tp, item, width);
-  }
-  tp.newLine();
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
+  newLines(tp, sectionGap);
 
   // Totales
   const tip = payload.tip_amount ?? 0;
@@ -2081,7 +2224,7 @@ async function renderBillProformaBrand(
   tp.drawLine();
   // v0.9.8: pasamos fontSize (ver nota arriba en classic).
   printXLTotal(tp, 'TOTAL', payload.total + tip, fontSize);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Payment destacado (centrado + bold)
   if (payload.payment) {
@@ -2108,7 +2251,7 @@ async function renderBillProformaBrand(
         tp.println(`  Cod. autorizacion: ${auth}`);
       }
     }
-    tp.newLine();
+    newLines(tp, sectionGap);
   }
 
   ornamentSep(tp, ornament, width);
@@ -2151,10 +2294,13 @@ async function renderBillProformaThermalPro(
     showAddress?: boolean;
     showRut?: boolean;
     showQr?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showAddress = opts.showAddress !== false; // default true
   const showRut = opts.showRut !== false;          // default true en bill_proforma
   const showQr = opts.showQr !== false;            // default true
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
@@ -2199,14 +2345,19 @@ async function renderBillProformaThermalPro(
   meta.push(`${payload.guests} comensales`);
   tp.println(meta.join(' · '));
   tp.drawLine();
+  newLines(tp, sectionGap);
 
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     tp.println(`${item.quantity} ${item.name}`);
     const unit = formatCLP(item.unit_price);
     const sub = formatCLP(item.subtotal);
     tp.leftRight(`   ${unit} c/u`, sub);
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
   tp.drawLine();
+  newLines(tp, sectionGap);
 
   const tip = payload.tip_amount ?? 0;
   printAmountRow(tp, 'Subtotal', payload.subtotal);
@@ -2218,6 +2369,7 @@ async function renderBillProformaThermalPro(
   printAmountRow(tp, 'TOTAL', payload.total + tip);
   tp.bold(false);
   tp.println('='.repeat(width));
+  newLines(tp, sectionGap);
 
   // Payment compacto
   if (payload.payment) {
@@ -2288,6 +2440,7 @@ function renderKitchenOrderMinimal(
     showWaiter?: boolean;
     showGuests?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showOpenTime = opts.showOpenTime ?? true;
   const showHighlightedNotes = opts.showHighlightedNotes ?? true;
@@ -2296,6 +2449,8 @@ function renderKitchenOrderMinimal(
   const showWaiter = opts.showWaiter ?? true;
   const showGuests = opts.showGuests ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Header simple: nombre estacion + destino, sin doble altura. fontSize
   // sigue aplicandose si el dueno explicitamente eligio 'large'.
@@ -2330,10 +2485,10 @@ function renderKitchenOrderMinimal(
   if (subtitleParts.length > 0) {
     tp.println(subtitleParts.join(' . '));
   }
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items pelados, sin bold ni invert por defecto.
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     tp.println(`${item.quantity}x ${item.name}`);
     if (showGiftMark && item.is_gift) {
       tp.println('   * cortesia');
@@ -2356,16 +2511,19 @@ function renderKitchenOrderMinimal(
         tp.println(`   ${item.note.trim()}`);
       }
     }
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
   if (payload.customer_note && payload.customer_note.trim().length > 0) {
-    tp.newLine();
+    newLines(tp, sectionGap);
     tp.println(`Notas mesa: ${payload.customer_note.trim()}`);
   }
 
   // Total items al final, en linea normal (sin doble altura).
   const totalItems = payload.items.reduce((acc, it) => acc + it.quantity, 0);
-  tp.newLine();
+  newLines(tp, sectionGap);
   tp.println(`Total items: ${totalItems}`);
   tp.newLine();
 }
@@ -2394,6 +2552,7 @@ function renderKitchenOrderBrand(
     showWaiter?: boolean;
     showGuests?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showOpenTime = opts.showOpenTime ?? true;
   const showHighlightedNotes = opts.showHighlightedNotes ?? true;
@@ -2402,6 +2561,8 @@ function renderKitchenOrderBrand(
   const showWaiter = opts.showWaiter ?? true;
   const showGuests = opts.showGuests ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Restaurant del payload (mig 058 lo agrego para kitchen_order). Si llega
   // undefined, el ornament cae a null y el separador queda plano.
@@ -2440,18 +2601,22 @@ function renderKitchenOrderBrand(
   if (showGuests) {
     tp.println(`Comensales: ${payload.guests}`);
   }
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items igual que Classic (con toggles)
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     printKitchenItemWithToggles(tp, item, {
       showHighlightedNotes,
       showGiftMark,
       showPrices,
     });
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
   if (payload.customer_note && payload.customer_note.trim().length > 0) {
+    newLines(tp, sectionGap);
     ornamentSep(tp, ornament, width);
     if (showHighlightedNotes) {
       tp.bold(true);
@@ -2466,6 +2631,7 @@ function renderKitchenOrderBrand(
 
   // TOTAL ITEMS XL con ornament a los lados del separador previo.
   const totalItems = payload.items.reduce((acc, it) => acc + it.quantity, 0);
+  newLines(tp, sectionGap);
   ornamentSep(tp, ornament, width);
   tp.alignCenter();
   tp.bold(true);
@@ -2502,6 +2668,7 @@ function renderKitchenOrderThermalPro(
     showWaiter?: boolean;
     showGuests?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showOpenTime = opts.showOpenTime ?? true;
   const showHighlightedNotes = opts.showHighlightedNotes ?? true;
@@ -2510,6 +2677,8 @@ function renderKitchenOrderThermalPro(
   const showWaiter = opts.showWaiter ?? true;
   const showGuests = opts.showGuests ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Header denso: estacion + destino en una sola linea con `.`.
   tp.println('='.repeat(width));
@@ -2539,9 +2708,10 @@ function renderKitchenOrderThermalPro(
   }
   if (meta.length > 0) tp.println(meta.join(' . '));
   tp.drawLine();
+  newLines(tp, sectionGap);
 
   // Items con prices/notes en compact (sin bold, sin newlines extra)
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     tp.println(`${item.quantity}x ${item.name}`);
     if (showGiftMark && item.is_gift) {
       tp.println('   * CORTESIA');
@@ -2563,15 +2733,20 @@ function renderKitchenOrderThermalPro(
         tp.println(`   [${item.note.trim()}]`);
       }
     }
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
   if (payload.customer_note && payload.customer_note.trim().length > 0) {
+    newLines(tp, sectionGap);
     tp.drawLine();
     tp.println(`Notas mesa: ${payload.customer_note.trim()}`);
   }
 
   // TOTAL ITEMS sin doble altura, alineado izquierda.
   const totalItems = payload.items.reduce((acc, it) => acc + it.quantity, 0);
+  newLines(tp, sectionGap);
   tp.println('='.repeat(width));
   tp.bold(true);
   tp.println(`TOTAL ITEMS: ${totalItems}`);
@@ -2595,10 +2770,13 @@ function renderKitchenCancelMinimal(
     showReason?: boolean;
     showWaiter?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showReason = opts.showReason ?? true;
   const showWaiter = opts.showWaiter ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Header minimal: "ANULACION" en bold + destino debajo. Sin invertido,
   // sin doble altura.
@@ -2617,10 +2795,10 @@ function renderKitchenCancelMinimal(
   } else {
     tp.println(time);
   }
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items con prefijo [X], sin bold
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     tp.println(`[X] ${item.quantity}x ${item.name}`);
     for (const mod of item.modifiers) {
       tp.println(`    - ${mod.name}`);
@@ -2628,10 +2806,13 @@ function renderKitchenCancelMinimal(
     if (item.note && item.note.trim().length > 0) {
       tp.println(`    ${item.note.trim()}`);
     }
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
   if (showReason && payload.customer_note && payload.customer_note.trim().length > 0) {
-    tp.newLine();
+    newLines(tp, sectionGap);
     tp.println(`Motivo: ${payload.customer_note.trim()}`);
   }
   tp.newLine();
@@ -2654,10 +2835,13 @@ function renderKitchenCancelBrand(
     showReason?: boolean;
     showWaiter?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showReason = opts.showReason ?? true;
   const showWaiter = opts.showWaiter ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   const ornament = payload.restaurant?.print_ornament_char ?? null;
 
@@ -2682,9 +2866,9 @@ function renderKitchenCancelBrand(
   } else {
     tp.println(time);
   }
-  tp.newLine();
+  newLines(tp, sectionGap);
 
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     tp.bold(true);
     tp.println(`[X] ${item.quantity}x ${item.name}`);
     tp.bold(false);
@@ -2694,12 +2878,17 @@ function renderKitchenCancelBrand(
     if (item.note && item.note.trim().length > 0) {
       tp.println(`    [${item.note.trim()}]`);
     }
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
   if (showReason && payload.customer_note && payload.customer_note.trim().length > 0) {
+    newLines(tp, sectionGap);
     ornamentSep(tp, ornament, width);
     tp.println(`Motivo: ${payload.customer_note.trim()}`);
   }
+  newLines(tp, sectionGap);
   ornamentSep(tp, ornament, width);
   tp.newLine();
 }
@@ -2720,10 +2909,13 @@ function renderKitchenCancelThermalPro(
     showReason?: boolean;
     showWaiter?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showReason = opts.showReason ?? true;
   const showWaiter = opts.showWaiter ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   tp.println('='.repeat(width));
   applyHeaderFontSize(tp, fontSize);
@@ -2740,8 +2932,9 @@ function renderKitchenCancelThermalPro(
     tp.println(time);
   }
   tp.drawLine();
+  newLines(tp, sectionGap);
 
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     tp.println(`[X] ${item.quantity}x ${item.name}`);
     for (const mod of item.modifiers) {
       tp.println(`    - ${mod.name}`);
@@ -2749,12 +2942,17 @@ function renderKitchenCancelThermalPro(
     if (item.note && item.note.trim().length > 0) {
       tp.println(`    [${item.note.trim()}]`);
     }
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
   if (showReason && payload.customer_note && payload.customer_note.trim().length > 0) {
+    newLines(tp, sectionGap);
     tp.drawLine();
     tp.println(`Motivo: ${payload.customer_note.trim()}`);
   }
+  newLines(tp, sectionGap);
   tp.println('='.repeat(width));
   tp.newLine();
 }
@@ -2772,10 +2970,13 @@ function renderCashCloseMinimal(
     showHighlightedDiff?: boolean;
     showMethodBreakdown?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showHighlightedDiff = opts.showHighlightedDiff ?? true;
   const showMethodBreakdown = opts.showMethodBreakdown ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing (cash_close no tiene loop de items, solo sectionGap).
+  const { sectionGap } = densitySpacing(getDensity(opts));
 
   // Header simple: nombre del local + direccion si existe.
   tp.alignLeft();
@@ -2788,7 +2989,7 @@ function renderCashCloseMinimal(
     }
     resetHeaderFontSize(tp);
   }
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Titulo simple
   tp.println('Cierre de caja diario');
@@ -2799,7 +3000,7 @@ function renderCashCloseMinimal(
   const openedBy = payload.opened_by_name?.trim() || '-';
   const closedBy = payload.closed_by_name?.trim() || '-';
   tp.println(`Turno: ${openedBy} -> ${closedBy}`);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Ventas sin bold
   printAmountRow(tp, 'Ventas totales', payload.total_sales);
@@ -2809,13 +3010,13 @@ function renderCashCloseMinimal(
     printAmountRow(tp, 'Tarjeta MP', payload.total_card_mp, true);
     printAmountRow(tp, 'Otras tarjetas', payload.total_card_other, true);
     printAmountRow(tp, 'Transferencia', payload.total_transfer, true);
-    tp.newLine();
+    newLines(tp, sectionGap);
   }
 
   printAmountRow(tp, 'Propinas', payload.total_tips);
   printAmountRow(tp, 'Devoluciones', payload.total_refunds);
   tp.leftRight('Comandas:', String(payload.order_count));
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   printAmountRow(tp, 'Esperado', payload.expected_cash);
   printAmountRow(tp, 'Declarado', payload.closing_cash);
@@ -2829,13 +3030,13 @@ function renderCashCloseMinimal(
   }
 
   if (payload.notes && payload.notes.trim().length > 0) {
-    tp.newLine();
+    newLines(tp, sectionGap);
     tp.println(`Notas: ${payload.notes.trim()}`);
   }
 
   // Footer simple (sin ornament)
   if (payload.restaurant) {
-    tp.newLine();
+    newLines(tp, sectionGap);
     const phrase =
       payload.restaurant.print_footer_phrase?.trim() || 'Gracias.';
     tp.println(phrase);
@@ -2858,10 +3059,13 @@ function renderCashCloseBrand(
     showHighlightedDiff?: boolean;
     showMethodBreakdown?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showHighlightedDiff = opts.showHighlightedDiff ?? true;
   const showMethodBreakdown = opts.showMethodBreakdown ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing (cash_close no tiene items loop).
+  const { sectionGap } = densitySpacing(getDensity(opts));
 
   const ornament = payload.restaurant?.print_ornament_char ?? null;
 
@@ -2904,7 +3108,7 @@ function renderCashCloseBrand(
   const openedBy = payload.opened_by_name?.trim() || '-';
   const closedBy = payload.closed_by_name?.trim() || '-';
   tp.println(`Turno: ${openedBy} -> ${closedBy}`);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Ventas
   tp.bold(true);
@@ -2916,13 +3120,13 @@ function renderCashCloseBrand(
     printAmountRow(tp, 'Tarjeta MP', payload.total_card_mp, true);
     printAmountRow(tp, 'Otras tarjetas', payload.total_card_other, true);
     printAmountRow(tp, 'Transferencia', payload.total_transfer, true);
-    tp.newLine();
+    newLines(tp, sectionGap);
   }
 
   printAmountRow(tp, 'Propinas', payload.total_tips);
   printAmountRow(tp, 'Devoluciones', payload.total_refunds);
   tp.leftRight('Comandas totales:', String(payload.order_count));
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   ornamentSep(tp, ornament, width);
   printAmountRow(tp, 'Efectivo esperado', payload.expected_cash);
@@ -2941,11 +3145,13 @@ function renderCashCloseBrand(
   }
 
   if (payload.notes && payload.notes.trim().length > 0) {
+    newLines(tp, sectionGap);
     ornamentSep(tp, ornament, width);
     tp.println(`Notas: ${payload.notes.trim()}`);
   }
 
   if (payload.restaurant) {
+    newLines(tp, sectionGap);
     ornamentSep(tp, ornament, width);
     printBillFooter(tp, payload.restaurant);
   }
@@ -2967,10 +3173,13 @@ function renderCashCloseThermalPro(
     showHighlightedDiff?: boolean;
     showMethodBreakdown?: boolean;
     fontSize?: 'small' | 'normal' | 'large';
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showHighlightedDiff = opts.showHighlightedDiff ?? true;
   const showMethodBreakdown = opts.showMethodBreakdown ?? true;
   const fontSize = getFontSize(opts);
+  // v0.9.10: density spacing (cash_close no tiene items loop).
+  const { sectionGap } = densitySpacing(getDensity(opts));
 
   // Header denso del local
   tp.println('='.repeat(width));
@@ -2998,6 +3207,7 @@ function renderCashCloseThermalPro(
   const closedBy = payload.closed_by_name?.trim() || '-';
   tp.println(`Turno: ${openedBy} -> ${closedBy}`);
   tp.drawLine();
+  newLines(tp, sectionGap);
 
   printAmountRow(tp, 'Ventas totales', payload.total_sales);
   if (showMethodBreakdown) {
@@ -3010,6 +3220,7 @@ function renderCashCloseThermalPro(
   printAmountRow(tp, 'Devoluciones', payload.total_refunds);
   tp.leftRight('Comandas totales:', String(payload.order_count));
   tp.println('='.repeat(width));
+  newLines(tp, sectionGap);
 
   printAmountRow(tp, 'Efectivo esperado', payload.expected_cash);
   printAmountRow(tp, 'Efectivo declarado', payload.closing_cash);
@@ -3022,9 +3233,11 @@ function renderCashCloseThermalPro(
   }
 
   if (payload.notes && payload.notes.trim().length > 0) {
+    newLines(tp, sectionGap);
     tp.drawLine();
     tp.println(`Notas: ${payload.notes.trim()}`);
   }
+  newLines(tp, sectionGap);
   tp.println('='.repeat(width));
 
   if (payload.restaurant) {
@@ -3146,10 +3359,13 @@ async function renderFacturaFinalClassic(
     showAddress?: boolean;
     showRut?: boolean;
     showQr?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showAddress = opts.showAddress !== false;
   const showRut = opts.showRut !== false;
   const showQr = opts.showQr !== false;
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   // Logo si esta activo
   await printLogoIfEnabled(tp, payload, supabase, logger);
@@ -3206,11 +3422,11 @@ async function renderFacturaFinalClassic(
   restoreFontSize(tp, fontSize);
   tp.bold(false);
   tp.alignLeft();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Bloque RECEPTOR — el otro elemento critico vs bill_proforma.
   printReceiverBlock(tp, payload.receiver, width);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Linea de mesa/comensales/hora/mozo (similar a boleta)
   const time = formatTime(payload.opened_at);
@@ -3224,14 +3440,17 @@ async function renderFacturaFinalClassic(
     tp.println(`Mesero: ${payload.waiter_name.trim()}`);
   }
   tp.drawLine();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     printBillItem(tp, item, width);
-  }
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
 
-  tp.newLine();
+  newLines(tp, sectionGap);
   tp.drawLine();
 
   // Subtotal + IVA
@@ -3250,13 +3469,13 @@ async function renderFacturaFinalClassic(
   tp.drawLine();
   printXLTotal(tp, 'TOTAL', payload.total + tip, fontSize);
   tp.drawLine();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Pago
   if (payload.payment) {
     printPaymentSection(tp, payload.payment, payload.total + tip);
     tp.drawLine();
-    tp.newLine();
+    newLines(tp, sectionGap);
   }
 
   // Aviso legal correcto para factura tributaria
@@ -3266,7 +3485,7 @@ async function renderFacturaFinalClassic(
   tp.bold(false);
   tp.println('Verifique en www.sii.cl');
   tp.alignLeft();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
@@ -3358,10 +3577,13 @@ async function renderNotaCreditoFinalClassic(
     showAddress?: boolean;
     showRut?: boolean;
     showQr?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
   };
   const showAddress = opts.showAddress !== false;
   const showRut = opts.showRut !== false;
   const showQr = opts.showQr !== false;
+  // v0.9.10: density spacing.
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
@@ -3407,19 +3629,22 @@ async function renderNotaCreditoFinalClassic(
   restoreFontSize(tp, fontSize);
   tp.bold(false);
   tp.alignLeft();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   printReceiverBlock(tp, payload.receiver, width);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   printNCReferenceBlock(tp, payload.reference);
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   // Items (los items anulados — los mismos del DTE original)
-  for (const item of payload.items) {
+  payload.items.forEach((item, idx) => {
     printBillItem(tp, item, width);
-  }
-  tp.newLine();
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
+  newLines(tp, sectionGap);
   tp.drawLine();
 
   // Total a anular. El monto puede ser parcial (nc_amount), en cuyo caso
@@ -3431,7 +3656,7 @@ async function renderNotaCreditoFinalClassic(
       : 'TOTAL ANULADO';
   printXLTotal(tp, totalLabel, ncAmount, fontSize);
   tp.drawLine();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   tp.alignCenter();
   tp.bold(true);
@@ -3439,7 +3664,7 @@ async function renderNotaCreditoFinalClassic(
   tp.bold(false);
   tp.println('Verifique en www.sii.cl');
   tp.alignLeft();
-  tp.newLine();
+  newLines(tp, sectionGap);
 
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
