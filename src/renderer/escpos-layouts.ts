@@ -246,7 +246,12 @@ function printBadge(tp: Printer, text: string): void {
  * — ambos via ESC ! n. Por ahora preferimos solo doble altura para evitar
  * que la linea "TOTAL $999.999" pase del ancho del papel en 58mm.
  */
-function printXLTotal(tp: Printer, label: string, amount: number): void {
+function printXLTotal(
+  tp: Printer,
+  label: string,
+  amount: number,
+  fontSize: 'normal' | 'large' | undefined = 'normal'
+): void {
   const formatted = formatCLP(amount); // "$ 24.500"
   const line = `${label} ${formatted}`;
   tp.alignCenter();
@@ -254,6 +259,9 @@ function printXLTotal(tp: Printer, label: string, amount: number): void {
   tp.setTextDoubleHeight();
   tp.println(line);
   tp.setTextNormal();
+  // v0.9.8: si el ticket global esta en large, restaurarlo despues del
+  // emphasis para no salirnos del modo grande hasta el final del render.
+  restoreFontSize(tp, fontSize);
   tp.bold(false);
   tp.alignLeft();
 }
@@ -390,61 +398,117 @@ async function printLogoIfEnabled(
 }
 
 /**
- * Aplica el tamano de letra "large" del header. SOLO afecta nombre del
- * restaurant + titulo del ticket. Items, totales y payment siempre quedan
- * en normal — si aplicaramos doble width a items el ancho efectivo se
- * divide por 2 (32 cols pasan a 16) y los montos quedan en otra linea.
+ * Aplica el tamano de letra "large" a TODA la salida del render. Antes
+ * (v0.9.7) solo afectaba al header (nombre + titulo). Carlos pidio en
+ * 2026-05-23 que afecte al ticket completo — items, totales, payment,
+ * etc. — para que el efecto sea visible y consistente.
  *
- * Llamadores: usarlo asi al inicio del bloque de header:
- *   applyHeaderFontSize(tp, fontSize);   // empieza a imprimir en grande
- *   tp.println(name);
- *   tp.println(title);
- *   resetHeaderFontSize(tp);             // vuelve a normal antes de items
+ * Llamadores (v0.9.8): aplicar UNA VEZ al inicio de cada render* function
+ * (despues de leer fontSize de payload.print_options, antes del primer
+ * println) y reset UNA VEZ al final del render. No es necesario aplicar
+ * en el bracket del header: la salida queda en large hasta el reset.
  *
- * GENERICIDAD ESC/POS (v0.9.7): usamos `setTextDoubleHeight()` +
- * `setTextDoubleWidth()` en vez de `setTextSize(2,2)`. Razon:
- *  - `setTextSize(h, w)` envia `GS ! n` (0x1D 0x21 n) con multiplicadores
- *    1..7. MUCHAS termicas baratas chinas NO implementan `GS ! n` o solo
- *    soportan un subset reducido. Resultado: el agente envia el comando,
- *    el sensor de captura ESC/POS lo registra como aplicado, pero la
- *    termica fisica imprime en tamano normal.
- *  - `setTextDoubleHeight` y `setTextDoubleWidth` envian `ESC ! n`
- *    (0x1B 0x21 n) con bits 4 (alto) y 5 (ancho). Este es el comando
- *    ESC/POS original y casi universal en cualquier termica que respeta
- *    el estandar basico.
+ *   applyFontSize(tp, fontSize);   // toda la salida en large
+ *   ... render entero ...
+ *   resetFontSize(tp);             // vuelve a normal antes de cut/feed
+ *
+ * Para emphasis blocks intermedios (ej. TOTAL XL, badge ANULACION) que
+ * usan tp.setTextDoubleHeight() + tp.setTextNormal() para crear contraste,
+ * usar restoreFontSize(tp, fontSize) DESPUES del setTextNormal para volver
+ * al estado "large global" si corresponde.
+ *
+ * GENERICIDAD ESC/POS (v0.9.7): usamos `setTextDoubleHeight()` via
+ * `ESC ! n` (0x1B 0x21 0x10), el comando original universal en cualquier
+ * termica que respeta el estandar ESC/POS basico.
+ *
+ * CAVEAT DOBLE ANCHO (v0.9.8, conservador): la decision actual es aplicar
+ * SOLO `setTextDoubleHeight()` y NO `setTextDoubleWidth()`. Razon: con
+ * doble ancho el numero efectivo de chars por linea cae a la mitad
+ * (32 cols pasan a 16, 48 cols pasan a 24), lo que rompe items con
+ * nombres largos y montos a la derecha. Mantener solo doble alto preserva
+ * el layout 32/42/48 cols actual.
+ *
+ * TODO (Carlos decide): si quieres double-double (alto+ancho) descomenta
+ * la linea `tp.setTextDoubleWidth()` abajo. Aspecto: texto MUCHO mas
+ * grande pero corres riesgo de truncamiento en items con nombres largos.
  *
  * NOTA sobre fontSize='small' (eliminado v0.9.7): antes hacia
- * `setTextSize(0, 0)` que en muchas termicas era NOOP (no soportan font B
- * por GS!). Carlos decidio eliminar 'small' del enum — solo quedan
- * 'normal' y 'large'. Si llega un payload pre-v0.9.7 con fontSize='small',
- * el switch cae al default (normal) silenciosamente.
+ * `setTextSize(0, 0)` que en muchas termicas era NOOP. Carlos elimino
+ * 'small' del enum — solo quedan 'normal' y 'large'. Si llega un payload
+ * pre-v0.9.7 con fontSize='small', el switch cae al default silenciosamente.
  */
-function applyHeaderFontSize(
+function applyFontSize(
   tp: Printer,
   fontSize: 'normal' | 'large' | undefined
 ): void {
   if (fontSize === 'large') {
-    // Combinar doble alto + doble ancho via ESC ! n (universal).
-    // Internamente node-thermal-printer setTextDoubleHeight envia ESC ! 0x10
-    // y setTextDoubleWidth envia ESC ! 0x20. setTextQuadArea() envia
-    // ESC ! 0x30 (combo) tambien universal — usamos los toggles individuales
-    // para que el orden quede explicito y debuggeable en captures.
     tp.setTextDoubleHeight();
-    tp.setTextDoubleWidth();
+    // TODO: si Carlos prefiere double-double, descomentar la linea siguiente.
+    // tp.setTextDoubleWidth();
   }
   // 'normal' o undefined: noop.
 }
 
 /**
- * Resetea el tamano de letra a normal. Llamar SIEMPRE despues del bloque
- * de header en grande para que items/totales no hereden el size.
+ * Resetea el tamano de letra a normal. Llamar al final del render para
+ * que el siguiente job (otro ticket en la misma sesion) no herede large.
  *
  * `setTextNormal()` envia `ESC ! 0x00` que limpia los bits de doble alto
- * y doble ancho (entre otros flags como bold y underline que igual los
- * volvemos a setear donde se necesiten).
+ * y doble ancho (entre otros flags como bold y underline — los volvemos a
+ * setear donde se necesiten).
  */
-function resetHeaderFontSize(tp: Printer): void {
+function resetFontSize(tp: Printer): void {
   tp.setTextNormal();
+}
+
+/**
+ * Restaura el fontSize del usuario despues de un emphasis block intermedio
+ * (TOTAL XL, badge ANULACION, etc). El patron usa setTextDoubleHeight ->
+ * println -> setTextNormal para crear contraste; con fontSize='large' global
+ * el setTextNormal nos sacaria del modo grande prematuramente, asi que
+ * llamamos a restoreFontSize para volver a aplicar.
+ *
+ * Si fontSize='normal' o undefined: noop (el ticket ya esta en normal).
+ */
+function restoreFontSize(
+  tp: Printer,
+  fontSize: 'normal' | 'large' | undefined
+): void {
+  if (fontSize === 'large') {
+    tp.setTextDoubleHeight();
+    // TODO: si Carlos prefiere double-double, descomentar la linea siguiente.
+    // tp.setTextDoubleWidth();
+  }
+}
+
+/**
+ * @deprecated v0.9.8: usar applyFontSize. Alias mantenido para no romper
+ * imports/callsites que aun no migraron.
+ */
+function applyHeaderFontSize(
+  tp: Printer,
+  fontSize: 'normal' | 'large' | undefined
+): void {
+  applyFontSize(tp, fontSize);
+}
+
+/**
+ * @deprecated v0.9.8: NO HACE NADA — antes salia del modo large despues
+ * del bloque de header. Con la decision v0.9.8 de aplicar 'large' a TODO
+ * el ticket, este "reset intermedio" rompe el flow (apaga large antes
+ * de items/totales).
+ *
+ * Mantenemos la funcion como NO-OP para no tener que tocar todos los
+ * callsites legacy en cada render*Style. El reset real ocurre UNA VEZ
+ * al final del render via resetFontSize(tp) llamado desde el dispatcher
+ * publico (render*EscPos).
+ *
+ * Si necesitas resetear en medio del render por una razon especifica,
+ * llama directo a resetFontSize(tp). Pero la regla general es "large
+ * persiste hasta el final del render".
+ */
+function resetHeaderFontSize(_tp: Printer): void {
+  // intencionalmente vacio — ver docstring arriba.
 }
 
 /**
@@ -633,6 +697,8 @@ function renderKitchenOrderClassic(
   tp.setTextDoubleHeight();
   tp.println(`TOTAL ÍTEMS: ${totalItems}`);
   tp.setTextNormal();
+  // v0.9.8: restaurar fontSize global despues del emphasis intermedio.
+  restoreFontSize(tp, fontSize);
   tp.bold(false);
   tp.alignLeft();
   tp.newLine();
@@ -882,7 +948,10 @@ async function renderBillPreviewClassic(
 
   // TOTAL XL
   tp.drawLine();
-  printXLTotal(tp, 'TOTAL', payload.total);
+  // v0.9.8: pasamos fontSize para que el helper restaure large despues
+  // del emphasis. Sin esto, el setTextNormal interno del helper nos saca
+  // del modo grande prematuramente y el resto del ticket vuelve a normal.
+  printXLTotal(tp, 'TOTAL', payload.total, fontSize);
   tp.drawLine();
   tp.newLine();
 
@@ -1028,7 +1097,8 @@ async function renderBillProformaClassic(
   // Para evitar ambiguedad: imprimimos total tal cual viene; si la RPC ya
   // incluye propina, no la sumamos.
   tp.drawLine();
-  printXLTotal(tp, 'TOTAL', payload.total + tip);
+  // v0.9.8: pasamos fontSize (ver nota arriba en classic).
+  printXLTotal(tp, 'TOTAL', payload.total + tip, fontSize);
   tp.drawLine();
   tp.newLine();
 
@@ -1146,6 +1216,8 @@ function renderCashCloseClassic(
   tp.setTextDoubleHeight();
   tp.println('CIERRE DE CAJA');
   tp.setTextNormal();
+  // v0.9.8: restaurar fontSize global tras el emphasis.
+  restoreFontSize(tp, fontSize);
   tp.println('DIARIO');
   tp.bold(false);
 
@@ -1247,17 +1319,34 @@ export async function renderBillPreviewEscPos(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
-  const style = payload.print_options?.style ?? 'classic';
-  switch (style) {
-    case 'minimal':
-      return renderBillPreviewMinimal(tp, payload, supabase, logger);
-    case 'brand':
-      return renderBillPreviewBrand(tp, payload, supabase, logger);
-    case 'thermal_pro':
-      return renderBillPreviewThermalPro(tp, payload, supabase, logger);
-    case 'classic':
-    default:
-      return renderBillPreviewClassic(tp, payload, supabase, logger);
+  // v0.9.8: aplicar fontSize globalmente al inicio + reset al final para
+  // que 'large' afecte TODA la salida del ticket (no solo el header).
+  // Los renderers internos siguen llamando applyHeaderFontSize por compat,
+  // pero como resetHeaderFontSize ahora es no-op, large persiste hasta el
+  // resetFontSize que cierra este dispatcher.
+  const fontSize = getFontSize(payload.print_options);
+  applyFontSize(tp, fontSize);
+  try {
+    const style = payload.print_options?.style ?? 'classic';
+    switch (style) {
+      case 'minimal':
+        await renderBillPreviewMinimal(tp, payload, supabase, logger);
+        break;
+      case 'brand':
+        await renderBillPreviewBrand(tp, payload, supabase, logger);
+        break;
+      case 'thermal_pro':
+        await renderBillPreviewThermalPro(tp, payload, supabase, logger);
+        break;
+      case 'classic':
+      default:
+        await renderBillPreviewClassic(tp, payload, supabase, logger);
+        break;
+    }
+  } finally {
+    // Reset SIEMPRE — aunque el render tire un error, no queremos que el
+    // proximo job en la misma sesion herede large.
+    resetFontSize(tp);
   }
 }
 
@@ -1270,17 +1359,28 @@ export async function renderBillProformaEscPos(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
-  const style = payload.print_options?.style ?? 'classic';
-  switch (style) {
-    case 'minimal':
-      return renderBillProformaMinimal(tp, payload, supabase, logger);
-    case 'brand':
-      return renderBillProformaBrand(tp, payload, supabase, logger);
-    case 'thermal_pro':
-      return renderBillProformaThermalPro(tp, payload, supabase, logger);
-    case 'classic':
-    default:
-      return renderBillProformaClassic(tp, payload, supabase, logger);
+  // v0.9.8: fontSize global (ver nota en renderBillPreviewEscPos).
+  const fontSize = getFontSize(payload.print_options);
+  applyFontSize(tp, fontSize);
+  try {
+    const style = payload.print_options?.style ?? 'classic';
+    switch (style) {
+      case 'minimal':
+        await renderBillProformaMinimal(tp, payload, supabase, logger);
+        break;
+      case 'brand':
+        await renderBillProformaBrand(tp, payload, supabase, logger);
+        break;
+      case 'thermal_pro':
+        await renderBillProformaThermalPro(tp, payload, supabase, logger);
+        break;
+      case 'classic':
+      default:
+        await renderBillProformaClassic(tp, payload, supabase, logger);
+        break;
+    }
+  } finally {
+    resetFontSize(tp);
   }
 }
 
@@ -1301,17 +1401,28 @@ export async function renderKitchenOrderEscPos(
   _supabase?: SupabaseClient | undefined,
   _logger?: Logger
 ): Promise<void> {
-  const style = payload.print_options?.style ?? 'classic';
-  switch (style) {
-    case 'minimal':
-      return renderKitchenOrderMinimal(tp, payload, jobType);
-    case 'brand':
-      return renderKitchenOrderBrand(tp, payload, jobType);
-    case 'thermal_pro':
-      return renderKitchenOrderThermalPro(tp, payload, jobType);
-    case 'classic':
-    default:
-      return renderKitchenOrderClassic(tp, payload, jobType);
+  // v0.9.8: fontSize global (ver nota en renderBillPreviewEscPos).
+  const fontSize = getFontSize(payload.print_options);
+  applyFontSize(tp, fontSize);
+  try {
+    const style = payload.print_options?.style ?? 'classic';
+    switch (style) {
+      case 'minimal':
+        renderKitchenOrderMinimal(tp, payload, jobType);
+        break;
+      case 'brand':
+        renderKitchenOrderBrand(tp, payload, jobType);
+        break;
+      case 'thermal_pro':
+        renderKitchenOrderThermalPro(tp, payload, jobType);
+        break;
+      case 'classic':
+      default:
+        renderKitchenOrderClassic(tp, payload, jobType);
+        break;
+    }
+  } finally {
+    resetFontSize(tp);
   }
 }
 
@@ -1324,17 +1435,28 @@ export async function renderKitchenCancelEscPos(
   _supabase?: SupabaseClient | undefined,
   _logger?: Logger
 ): Promise<void> {
-  const style = payload.print_options?.style ?? 'classic';
-  switch (style) {
-    case 'minimal':
-      return renderKitchenCancelMinimal(tp, payload);
-    case 'brand':
-      return renderKitchenCancelBrand(tp, payload);
-    case 'thermal_pro':
-      return renderKitchenCancelThermalPro(tp, payload);
-    case 'classic':
-    default:
-      return renderKitchenCancelClassic(tp, payload);
+  // v0.9.8: fontSize global (ver nota en renderBillPreviewEscPos).
+  const fontSize = getFontSize(payload.print_options);
+  applyFontSize(tp, fontSize);
+  try {
+    const style = payload.print_options?.style ?? 'classic';
+    switch (style) {
+      case 'minimal':
+        renderKitchenCancelMinimal(tp, payload);
+        break;
+      case 'brand':
+        renderKitchenCancelBrand(tp, payload);
+        break;
+      case 'thermal_pro':
+        renderKitchenCancelThermalPro(tp, payload);
+        break;
+      case 'classic':
+      default:
+        renderKitchenCancelClassic(tp, payload);
+        break;
+    }
+  } finally {
+    resetFontSize(tp);
   }
 }
 
@@ -1349,17 +1471,28 @@ export async function renderCashCloseEscPos(
   _supabase?: SupabaseClient | undefined,
   _logger?: Logger
 ): Promise<void> {
-  const style = payload.print_options?.style ?? 'classic';
-  switch (style) {
-    case 'minimal':
-      return renderCashCloseMinimal(tp, payload);
-    case 'brand':
-      return renderCashCloseBrand(tp, payload);
-    case 'thermal_pro':
-      return renderCashCloseThermalPro(tp, payload);
-    case 'classic':
-    default:
-      return renderCashCloseClassic(tp, payload);
+  // v0.9.8: fontSize global (ver nota en renderBillPreviewEscPos).
+  const fontSize = getFontSize(payload.print_options);
+  applyFontSize(tp, fontSize);
+  try {
+    const style = payload.print_options?.style ?? 'classic';
+    switch (style) {
+      case 'minimal':
+        renderCashCloseMinimal(tp, payload);
+        break;
+      case 'brand':
+        renderCashCloseBrand(tp, payload);
+        break;
+      case 'thermal_pro':
+        renderCashCloseThermalPro(tp, payload);
+        break;
+      case 'classic':
+      default:
+        renderCashCloseClassic(tp, payload);
+        break;
+    }
+  } finally {
+    resetFontSize(tp);
   }
 }
 
@@ -1527,6 +1660,8 @@ async function renderBillPreviewBrand(
   tp.setTextDoubleHeight();
   tp.println(payload.restaurant.name);
   tp.setTextNormal();
+  // v0.9.8: restaurar fontSize global tras el emphasis del nombre.
+  restoreFontSize(tp, fontSize);
   tp.bold(false);
 
   // Slogan en lineas debajo del nombre — invitacion + caracter brand.
@@ -1585,7 +1720,10 @@ async function renderBillPreviewBrand(
   printAmountRow(tp, '  Subtotal', payload.subtotal, true);
   printAmountRow(tp, '  IVA 19%', payload.iva, true);
   tp.drawLine();
-  printXLTotal(tp, 'TOTAL', payload.total);
+  // v0.9.8: pasamos fontSize para que el helper restaure large despues
+  // del emphasis. Sin esto, el setTextNormal interno del helper nos saca
+  // del modo grande prematuramente y el resto del ticket vuelve a normal.
+  printXLTotal(tp, 'TOTAL', payload.total, fontSize);
   tp.newLine();
 
   // Sugerencia de propina
@@ -1883,6 +2021,8 @@ async function renderBillProformaBrand(
   tp.setTextDoubleHeight();
   tp.println(payload.restaurant.name);
   tp.setTextNormal();
+  // v0.9.8: restaurar fontSize global tras el emphasis del nombre.
+  restoreFontSize(tp, fontSize);
   tp.bold(false);
 
   const slogan = payload.restaurant.slogan?.trim();
@@ -1936,7 +2076,8 @@ async function renderBillProformaBrand(
     printAmountRow(tp, '  Propina', tip, true);
   }
   tp.drawLine();
-  printXLTotal(tp, 'TOTAL', payload.total + tip);
+  // v0.9.8: pasamos fontSize (ver nota arriba en classic).
+  printXLTotal(tp, 'TOTAL', payload.total + tip, fontSize);
   tp.newLine();
 
   // Payment destacado (centrado + bold)
@@ -2328,6 +2469,8 @@ function renderKitchenOrderBrand(
   tp.setTextDoubleHeight();
   tp.println(`TOTAL ITEMS: ${totalItems}`);
   tp.setTextNormal();
+  // v0.9.8: restaurar fontSize global tras el emphasis.
+  restoreFontSize(tp, fontSize);
   tp.bold(false);
   tp.alignLeft();
   tp.newLine();
@@ -2728,6 +2871,8 @@ function renderCashCloseBrand(
     tp.setTextDoubleHeight();
     tp.println(payload.restaurant.name);
     tp.setTextNormal();
+    // v0.9.8: restaurar fontSize global tras el emphasis del nombre.
+    restoreFontSize(tp, fontSize);
     tp.bold(false);
 
     const slogan = payload.restaurant.slogan?.trim();
