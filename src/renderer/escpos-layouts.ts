@@ -405,8 +405,10 @@ function applyHeaderFontSize(
     // efectivamente queda en normal (no rompe nada).
     tp.setTextSize(0, 0);
   } else if (fontSize === 'large') {
-    // setTextSize(1, 1) -> doble alto y ancho.
-    tp.setTextSize(1, 1);
+    // setTextSize(h, w) en node-thermal-printer es factor 1..7 donde 1=normal,
+    // 2=doble. setTextSize(1,1) era NOOP (= normal). El comentario anterior
+    // estaba mal. Para realmente doble alto y ancho usar (2, 2).
+    tp.setTextSize(2, 2);
   }
   // 'normal' o undefined: noop.
 }
