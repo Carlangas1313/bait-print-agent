@@ -3318,6 +3318,31 @@ function printReceiverBlock(
  * FACTURA FINAL classic style. Mismo flow visual que renderBillProformaClassic
  * (header emisor → items → totales → pago) PERO con marca legal "FACTURA"
  * en lugar de "BOLETA" + bloque RECEPTOR + footer ajustado.
+ *
+ * v0.9.12: respeta los toggles del slice `print_options.factura_final`:
+ *   - showLogo:           logo del emisor (default true)
+ *   - showSloganEmisor:   slogan del local (default true)
+ *   - showAddressEmisor:  direccion + comuna + fono del emisor (default true)
+ *   - showQr:             QR del DTE (default true)
+ *   - showPaymentDetails: bloque "Pago: ... / Recibido / Vuelto" (default true)
+ *   - density:            compact/normal/spacious (mismo helper que el resto)
+ *   - fontSize:           normal/large (mismo helper que el resto)
+ *
+ * RESTRICCION SII: los siguientes datos SIEMPRE se imprimen, sin importar
+ * los toggles:
+ *   - Nombre del emisor + RUT emisor
+ *   - Marca legal "FACTURA ELECTRONICA"/"FACTURA EXENTA ELECTRONICA" + folio
+ *   - Bloque RECEPTOR completo (RUT + razon social + giro + direccion + comuna)
+ *   - Items, subtotal, IVA 19%, total
+ *   - Fecha y hora de emision
+ *   - Aviso legal "Documento Tributario Electronico — Verifique en www.sii.cl"
+ *
+ * Carlos decidio 2026-05-23 noche: el dueno solo varia estetica/aire, no
+ * datos fiscales obligatorios.
+ *
+ * Backwards-compat: si llega un payload pre-v0.9.12 con los toggles viejos
+ * (showAddress, showRut) los tratamos como aliases (showAddress -> showAddressEmisor)
+ * para que un agente nuevo no rompa con payloads viejos en la cola.
  */
 async function renderFacturaFinalClassic(
   tp: Printer,
@@ -3329,18 +3354,30 @@ async function renderFacturaFinalClassic(
   const fontSize = getFontSize(payload.print_options);
 
   const opts = (payload.print_options ?? {}) as {
+    // v0.9.12 — set nuevo
+    showLogo?: boolean;
+    showSloganEmisor?: boolean;
+    showAddressEmisor?: boolean;
+    showQr?: boolean;
+    showPaymentDetails?: boolean;
+    // legacy (pre-0.9.12)
     showAddress?: boolean;
     showRut?: boolean;
-    showQr?: boolean;
     density?: 'compact' | 'normal' | 'spacious';
   };
-  const showAddress = opts.showAddress !== false;
-  const showRut = opts.showRut !== false;
+  // Defaults rich (default ON). Acepta legacy `showAddress` como alias de
+  // `showAddressEmisor` para que payloads viejos en la cola no rompan.
+  const showAddressEmisor =
+    opts.showAddressEmisor !== undefined
+      ? opts.showAddressEmisor !== false
+      : opts.showAddress !== false;
+  const showSloganEmisor = opts.showSloganEmisor !== false;
   const showQr = opts.showQr !== false;
+  const showPaymentDetails = opts.showPaymentDetails !== false;
   // v0.9.10: density spacing.
   const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
-  // Logo si esta activo
+  // Logo si esta activo (printLogoIfEnabled ya respeta opts.showLogo internamente)
   await printLogoIfEnabled(tp, payload, supabase, logger);
 
   // Header EMISOR (idem bill_proforma — el local que emite la factura)
@@ -3349,7 +3386,7 @@ async function renderFacturaFinalClassic(
   tp.bold(true);
   tp.println(payload.restaurant.name);
   tp.bold(false);
-  if (showAddress) {
+  if (showAddressEmisor) {
     const address = payload.restaurant.address?.trim();
     if (address && address.length > 0) tp.println(address);
     const comuna = payload.restaurant.comuna?.trim() ?? '';
@@ -3361,25 +3398,27 @@ async function renderFacturaFinalClassic(
       tp.println(parts.join(' · '));
     }
   }
-  if (showRut && payload.restaurant.rut) {
+  // RUT EMISOR — OBLIGATORIO SII, sin toggle (ignoramos opts.showRut legacy).
+  if (payload.restaurant.rut) {
     tp.println(`RUT: ${payload.restaurant.rut}`);
   }
   tp.alignLeft();
   tp.drawLine();
   resetHeaderFontSize(tp);
 
-  const slogan = payload.restaurant.slogan?.trim();
-  if (slogan && slogan.length > 0) {
-    tp.alignCenter();
-    tp.println(`"${slogan}"`);
-    tp.alignLeft();
+  // Slogan (toggleable v0.9.12 via showSloganEmisor).
+  if (showSloganEmisor) {
+    const slogan = payload.restaurant.slogan?.trim();
+    if (slogan && slogan.length > 0) {
+      tp.alignCenter();
+      tp.println(`"${slogan}"`);
+      tp.alignLeft();
+    }
   }
 
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
-  // MARCA LEGAL: "FACTURA ELECTRONICA Nº<folio>" — la diferencia critica
-  // vs bill_proforma. Usamos badge invertido + doble altura para que sea
-  // imposible confundirla con boleta.
+  // MARCA LEGAL: "FACTURA ELECTRONICA Nº<folio>" — OBLIGATORIO SII, sin toggle.
   const legalMark = getFacturaLegalMark(payload.dte.type);
   const folioStr =
     payload.dte.folio != null ? `Nº ${payload.dte.folio}` : 'FOLIO PENDIENTE';
@@ -3397,7 +3436,7 @@ async function renderFacturaFinalClassic(
   tp.alignLeft();
   newLines(tp, sectionGap);
 
-  // Bloque RECEPTOR — el otro elemento critico vs bill_proforma.
+  // Bloque RECEPTOR — OBLIGATORIO SII, sin toggle.
   printReceiverBlock(tp, payload.receiver, width);
   newLines(tp, sectionGap);
 
@@ -3415,7 +3454,7 @@ async function renderFacturaFinalClassic(
   tp.drawLine();
   newLines(tp, sectionGap);
 
-  // Items
+  // Items — OBLIGATORIO SII.
   payload.items.forEach((item, idx) => {
     printBillItem(tp, item, width);
     if (itemGap > 0 && idx < payload.items.length - 1) {
@@ -3426,7 +3465,7 @@ async function renderFacturaFinalClassic(
   newLines(tp, sectionGap);
   tp.drawLine();
 
-  // Subtotal + IVA
+  // Subtotal + IVA — OBLIGATORIO SII.
   printAmountRow(tp, 'Subtotal', payload.subtotal);
   // Factura exenta no tiene IVA — si dte_type es factura_exenta_34, omitir
   // la linea IVA. El subtotal=total en ese caso.
@@ -3444,14 +3483,14 @@ async function renderFacturaFinalClassic(
   tp.drawLine();
   newLines(tp, sectionGap);
 
-  // Pago
-  if (payload.payment) {
+  // Pago (toggleable v0.9.12 via showPaymentDetails)
+  if (showPaymentDetails && payload.payment) {
     printPaymentSection(tp, payload.payment, payload.total + tip);
     tp.drawLine();
     newLines(tp, sectionGap);
   }
 
-  // Aviso legal correcto para factura tributaria
+  // Aviso legal correcto para factura tributaria — OBLIGATORIO SII.
   tp.alignCenter();
   tp.bold(true);
   tp.println('Documento Tributario Electronico');
@@ -3462,6 +3501,7 @@ async function renderFacturaFinalClassic(
 
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
+  // printBillFooter respeta showQr (toggle del QR del DTE).
   printBillFooter(tp, payload.restaurant, { showQr });
   tp.newLine();
 }
@@ -3537,6 +3577,16 @@ function printNCReferenceBlock(
   tp.drawLine();
 }
 
+/**
+ * NOTA DE CREDITO FINAL classic style.
+ *
+ * v0.9.12: mismos toggles que factura_final (slice `print_options.nota_credito_final`).
+ * Mismas restricciones SII — todos los datos legales SIEMPRE se imprimen.
+ *
+ * `showPaymentDetails` es un toggle existente del shared type, aunque la NC
+ * tipica no tiene payload.payment (es un reverso contable). Si el payload
+ * trae payment (raro), respetamos el toggle igual.
+ */
 async function renderNotaCreditoFinalClassic(
   tp: Printer,
   payload: NotaCreditoFinalPayload,
@@ -3547,15 +3597,24 @@ async function renderNotaCreditoFinalClassic(
   const fontSize = getFontSize(payload.print_options);
 
   const opts = (payload.print_options ?? {}) as {
+    // v0.9.12 — set nuevo
+    showLogo?: boolean;
+    showSloganEmisor?: boolean;
+    showAddressEmisor?: boolean;
+    showQr?: boolean;
+    showPaymentDetails?: boolean;
+    // legacy
     showAddress?: boolean;
     showRut?: boolean;
-    showQr?: boolean;
     density?: 'compact' | 'normal' | 'spacious';
   };
-  const showAddress = opts.showAddress !== false;
-  const showRut = opts.showRut !== false;
+  const showAddressEmisor =
+    opts.showAddressEmisor !== undefined
+      ? opts.showAddressEmisor !== false
+      : opts.showAddress !== false;
+  const showSloganEmisor = opts.showSloganEmisor !== false;
   const showQr = opts.showQr !== false;
-  // v0.9.10: density spacing.
+  const showPaymentDetails = opts.showPaymentDetails !== false;
   const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
 
   await printLogoIfEnabled(tp, payload, supabase, logger);
@@ -3566,7 +3625,7 @@ async function renderNotaCreditoFinalClassic(
   tp.bold(true);
   tp.println(payload.restaurant.name);
   tp.bold(false);
-  if (showAddress) {
+  if (showAddressEmisor) {
     const address = payload.restaurant.address?.trim();
     if (address && address.length > 0) tp.println(address);
     const comuna = payload.restaurant.comuna?.trim() ?? '';
@@ -3578,16 +3637,26 @@ async function renderNotaCreditoFinalClassic(
       tp.println(parts.join(' · '));
     }
   }
-  if (showRut && payload.restaurant.rut) {
+  // RUT EMISOR — OBLIGATORIO SII, sin toggle.
+  if (payload.restaurant.rut) {
     tp.println(`RUT: ${payload.restaurant.rut}`);
   }
   tp.alignLeft();
   tp.drawLine();
   resetHeaderFontSize(tp);
 
+  if (showSloganEmisor) {
+    const slogan = payload.restaurant.slogan?.trim();
+    if (slogan && slogan.length > 0) {
+      tp.alignCenter();
+      tp.println(`"${slogan}"`);
+      tp.alignLeft();
+    }
+  }
+
   ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
 
-  // MARCA LEGAL
+  // MARCA LEGAL — OBLIGATORIA SII, sin toggle.
   const folioStr =
     payload.dte.folio != null ? `Nº ${payload.dte.folio}` : 'FOLIO PENDIENTE';
 
@@ -3604,13 +3673,15 @@ async function renderNotaCreditoFinalClassic(
   tp.alignLeft();
   newLines(tp, sectionGap);
 
+  // Bloque RECEPTOR — OBLIGATORIO SII.
   printReceiverBlock(tp, payload.receiver, width);
   newLines(tp, sectionGap);
 
+  // Bloque REFERENCIA al folio anulado — OBLIGATORIO SII.
   printNCReferenceBlock(tp, payload.reference);
   newLines(tp, sectionGap);
 
-  // Items (los items anulados — los mismos del DTE original)
+  // Items (los items anulados — los mismos del DTE original) — OBLIGATORIO SII.
   payload.items.forEach((item, idx) => {
     printBillItem(tp, item, width);
     if (itemGap > 0 && idx < payload.items.length - 1) {
@@ -3630,6 +3701,15 @@ async function renderNotaCreditoFinalClassic(
   printXLTotal(tp, totalLabel, ncAmount, fontSize);
   tp.drawLine();
   newLines(tp, sectionGap);
+
+  // Pago (toggleable v0.9.12 via showPaymentDetails). Tipicamente la NC no
+  // trae payload.payment porque es un reverso contable, pero si vino,
+  // respetamos el toggle.
+  if (showPaymentDetails && payload.payment) {
+    printPaymentSection(tp, payload.payment, payload.total);
+    tp.drawLine();
+    newLines(tp, sectionGap);
+  }
 
   tp.alignCenter();
   tp.bold(true);
