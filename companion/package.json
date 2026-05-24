@@ -1,9 +1,9 @@
-ï»¿{
+{
   "name": "bait-print-companion",
   "private": true,
-  "version": "0.9.11",
+  "version": "0.9.12",
   "type": "module",
-  "description": "Companion app del agente bait-print-agent â€” tray icon + ventana flotante de control en la sesiÃ³n del usuario",
+  "description": "Companion app del agente bait-print-agent — tray icon + ventana flotante de control en la sesión del usuario",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",

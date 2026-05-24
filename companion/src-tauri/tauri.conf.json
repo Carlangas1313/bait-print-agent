@@ -1,7 +1,7 @@
-ï»¿{
+{
   "$schema": "https://schema.tauri.app/config/2.0.0",
   "productName": "bAIt Print Companion",
-  "version": "0.9.11",
+  "version": "0.9.12",
   "identifier": "cl.bait.print-companion",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -52,8 +52,8 @@
       "icons/128x128@2x.png"
     ],
     "category": "Utility",
-    "shortDescription": "Companion del agente de impresiÃ³n bAIt",
-    "longDescription": "Ventana flotante + tray icon que se conecta al servicio bait-print-agent corriendo como servicio Windows. Muestra estado de impresoras, cola de jobs y permite tests de impresiÃ³n sin abrir el dashboard."
+    "shortDescription": "Companion del agente de impresión bAIt",
+    "longDescription": "Ventana flotante + tray icon que se conecta al servicio bait-print-agent corriendo como servicio Windows. Muestra estado de impresoras, cola de jobs y permite tests de impresión sin abrir el dashboard."
   },
   "plugins": {}
 }
