@@ -33,6 +33,7 @@ import {
   isCashClosePayload,
   isFacturaFinalPayload,
   isNotaCreditoFinalPayload,
+  isTicketInternoFinalPayload,
 } from '../types.js';
 import { formatJob } from './console.js';
 import type { PrinterRow } from '../printers/registry.js';
@@ -47,6 +48,7 @@ import {
   renderCashCloseEscPos,
   renderFacturaFinalEscPos,
   renderNotaCreditoFinalEscPos,
+  renderTicketInternoFinalEscPos,
 } from './escpos-layouts.js';
 
 /**
@@ -199,6 +201,13 @@ function buildPopulate(
       case 'nota_credito_final': {
         if (isNotaCreditoFinalPayload(job.payload)) {
           await renderNotaCreditoFinalEscPos(tp, job.payload, supabase, logger);
+          usedEscPosLayout = true;
+        }
+        break;
+      }
+      case 'ticket_interno_final': {
+        if (isTicketInternoFinalPayload(job.payload)) {
+          await renderTicketInternoFinalEscPos(tp, job.payload, supabase, logger);
           usedEscPosLayout = true;
         }
         break;

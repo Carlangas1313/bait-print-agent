@@ -38,6 +38,7 @@ import {
   type FacturaFinalPayload,
   type NotaCreditoFinalPayload,
   type DteReceiverInfo,
+  type TicketInternoFinalPayload,
 } from '../types.js';
 import type { Logger } from '../logger.js';
 import { formatCLP, formatTime, formatDateTime } from './format.js';
@@ -3738,6 +3739,194 @@ export async function renderNotaCreditoFinalEscPos(
   applyFontSize(tp, fontSize);
   try {
     await renderNotaCreditoFinalClassic(tp, payload, supabase, logger);
+  } finally {
+    resetFontSize(tp);
+  }
+}
+
+// ====================================================================
+// ticket_interno_final · marca legal anti-fraude (mig 089 / v0.9.13)
+// ====================================================================
+//
+// Cuando una orden se cobra con method='consumo_interno' (staff meal),
+// el agente imprime un ticket que:
+//   - Lleva marca legal "CONSUMO INTERNO" + "NO ES BOLETA" en grande
+//     y destacado (doble altura + invertido) — anti-fraude visual claro.
+//   - Lleva folio TI-xxx (proviene del InternalTicketAdapter en
+//     bait-pos — dtes.sii_track_id).
+//   - Lleva nombre del staff que consumio (audit trail) — la RPC ya
+//     lo resolvio desde restaurant_users.full_name.
+//   - Items + total normales.
+//   - Footer "Documento NO tributario / Solo control interno".
+//
+// Estos elementos SIEMPRE se imprimen — sin posibilidad de toggle —
+// porque son la razon de ser del ticket. Los unicos toggles permitidos
+// son del emisor (logo, slogan, address) + density/fontSize.
+
+/**
+ * Layout classic del ticket de consumo interno. Sigue el mismo orden visual
+ * que renderBillProformaClassic / renderFacturaFinalClassic pero reemplaza
+ * la marca legal por "CONSUMO INTERNO" y suma el bloque `staff`.
+ */
+async function renderTicketInternoFinalClassic(
+  tp: Printer,
+  payload: TicketInternoFinalPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
+  const width = getPayloadWidth(payload);
+  const fontSize = getFontSize(payload.print_options);
+
+  const opts = (payload.print_options ?? {}) as {
+    showLogo?: boolean;
+    showSloganEmisor?: boolean;
+    showAddressEmisor?: boolean;
+    density?: 'compact' | 'normal' | 'spacious';
+  };
+  // Defaults para ticket interno: address y slogan OFF por default (doc
+  // interno, sin marketing). Si el dueno los activa explicitamente, los
+  // mostramos. NB: showLogo default ON (consistente con resto del agente).
+  const showSloganEmisor = opts.showSloganEmisor === true;
+  const showAddressEmisor = opts.showAddressEmisor === true;
+  const { itemGap, sectionGap } = densitySpacing(getDensity(opts));
+
+  // Logo si esta activo (printLogoIfEnabled respeta opts.showLogo internamente)
+  await printLogoIfEnabled(tp, payload, supabase, logger);
+
+  // Header EMISOR. RUT NO se imprime (no es relevante para doc interno —
+  // los datos legales del emisor se imprimen solo en docs tributarios).
+  applyHeaderFontSize(tp, fontSize);
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println(payload.restaurant.name);
+  tp.bold(false);
+  if (showAddressEmisor) {
+    const address = payload.restaurant.address?.trim();
+    if (address && address.length > 0) tp.println(address);
+    const comuna = payload.restaurant.comuna?.trim() ?? '';
+    const phone = payload.restaurant.phone?.trim() ?? '';
+    if (comuna.length > 0 || phone.length > 0) {
+      const parts: string[] = [];
+      if (comuna.length > 0) parts.push(comuna);
+      if (phone.length > 0) parts.push(`Fono ${phone}`);
+      tp.println(parts.join(' · '));
+    }
+  }
+  tp.alignLeft();
+  resetHeaderFontSize(tp);
+
+  // Slogan (toggleable).
+  if (showSloganEmisor) {
+    const slogan = payload.restaurant.slogan?.trim();
+    if (slogan && slogan.length > 0) {
+      tp.alignCenter();
+      tp.println(`"${slogan}"`);
+      tp.alignLeft();
+    }
+  }
+
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
+
+  // ---------- MARCA LEGAL ANTI-FRAUDE — SIEMPRE ----------
+  // Doble linea destacada para que el cliente vea esto en la primera mirada
+  // al ticket. Doble altura + invertido + bold + ASCII puro para que sea
+  // legible en cualquier termica que soporte ESC ! 0x10 + GS B 1 (universales).
+  tp.alignCenter();
+  tp.bold(true);
+  tp.invert(true);
+  tp.println(' CONSUMO INTERNO ');
+  tp.invert(false);
+  tp.setTextDoubleHeight();
+  tp.println('NO ES BOLETA');
+  tp.setTextNormal();
+  restoreFontSize(tp, fontSize);
+  tp.bold(false);
+  tp.alignLeft();
+  newLines(tp, sectionGap);
+
+  // ---------- DATOS DEL TICKET — SIEMPRE ----------
+  // Folio TI-xxx + fecha + nombre del staff (audit trail). Estos NO son
+  // toggleables — son la razon de ser del ticket.
+  tp.leftRight('Folio:', payload.folio);
+  const issuedAt = formatDateTime(payload.issued_at);
+  tp.leftRight('Fecha:', issuedAt);
+  // Truncado defensivo del nombre del staff (algunos nombres largos
+  // pueden no caber con leftRight — leftRight de node-thermal-printer
+  // hace su propio truncado pero preferimos formatear consistente).
+  const staffName = payload.staff?.name?.trim() ?? 'Sin identificar';
+  tp.leftRight('Staff:', staffName);
+
+  // Mesa / mesero como info contextual (no obligatorio anti-fraude).
+  if (payload.table_number) {
+    const time = formatTime(payload.opened_at);
+    tp.println(`Mesa ${payload.table_number} · Hora ${time}`);
+  }
+  if (payload.waiter_name && payload.waiter_name.trim().length > 0) {
+    tp.println(`Mesero: ${payload.waiter_name.trim()}`);
+  }
+
+  tp.drawLine();
+  // Subheader de items para reforzar el contexto (no es boleta, es
+  // un detalle de consumo).
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println('ITEMS CONSUMIDOS');
+  tp.bold(false);
+  tp.alignLeft();
+  tp.drawLine();
+  newLines(tp, sectionGap);
+
+  // Items (usa el helper compartido con bill_proforma / factura).
+  payload.items.forEach((item, idx) => {
+    printBillItem(tp, item, width);
+    if (itemGap > 0 && idx < payload.items.length - 1) {
+      newLines(tp, itemGap);
+    }
+  });
+
+  newLines(tp, sectionGap);
+  tp.drawLine();
+
+  // ---------- TOTAL — SIEMPRE ----------
+  // El staff meal NO lleva IVA visible (es interno, no se factura). El
+  // total = payload.total (la RPC ya consolido subtotal+iva).
+  printXLTotal(tp, 'TOTAL', payload.total, fontSize);
+  tp.drawLine();
+  newLines(tp, sectionGap);
+
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
+
+  // ---------- FOOTER NO TRIBUTARIO — SIEMPRE ----------
+  // Linea final de defensa anti-fraude. Si alguien corta el ticket por
+  // arriba para esconder la marca legal, el footer recuerda que no es
+  // boleta SII. Bold para que destaque incluso si la termica imprime
+  // texto pequeno.
+  tp.alignCenter();
+  tp.bold(true);
+  tp.println('Documento NO tributario');
+  tp.bold(false);
+  tp.println('Solo para control interno');
+  tp.alignLeft();
+
+  ornamentSep(tp, payload.restaurant.print_ornament_char ?? null, width);
+  tp.newLine();
+}
+
+/**
+ * Dispatcher publico para ticket_interno_final. V1 solo classic — no hay
+ * styles para este job_type (layout fijo anti-fraude). Si en el futuro
+ * se necesitan styles, sumar render*Style aqui y rutear.
+ */
+export async function renderTicketInternoFinalEscPos(
+  tp: Printer,
+  payload: TicketInternoFinalPayload,
+  supabase: SupabaseClient | undefined,
+  logger: Logger
+): Promise<void> {
+  const fontSize = getFontSize(payload.print_options);
+  applyFontSize(tp, fontSize);
+  try {
+    await renderTicketInternoFinalClassic(tp, payload, supabase, logger);
   } finally {
     resetFontSize(tp);
   }

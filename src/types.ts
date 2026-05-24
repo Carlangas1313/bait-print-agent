@@ -11,6 +11,7 @@ import type {
   KitchenOrderOptions,
   KitchenCancelOptions,
   CashCloseOptions,
+  TicketInternoFinalOptions,
 } from './types/print-options.js';
 
 export type JobType =
@@ -25,7 +26,11 @@ export type JobType =
   // notas de credito (61) con bloque RECEPTOR y marca legal correcta.
   // Antes salian como bill_proforma -> ticket identico a boleta -> invalido.
   | 'factura_final'
-  | 'nota_credito_final';
+  | 'nota_credito_final'
+  // mig 089 bait-pos: tickets de consumo interno (staff meals) con marca
+  // legal anti-fraude "CONSUMO INTERNO — NO ES BOLETA" + folio TI-xxx +
+  // nombre del staff. v0.9.13 del agente.
+  | 'ticket_interno_final';
 
 export type JobStatus =
   | 'pending'
@@ -505,5 +510,76 @@ export function isCashClosePayload(p: unknown): p is CashClosePayload {
     typeof p === 'object' &&
     'session_id' in p &&
     'total_sales' in p
+  );
+}
+
+/**
+ * Datos del staff que consumió (audit trail anti-fraude).
+ *
+ * Mig 089 / v0.9.13. Se imprime siempre — sin toggle — en el ticket de
+ * consumo interno. `name` viene resuelto desde la RPC enqueue_ticket_interno_final
+ * (lookup payments.staff_user_id -> restaurant_users.full_name con fallback
+ * a email split + "Sin identificar").
+ */
+export type InternalTicketStaffInfo = {
+  id: string;
+  name: string;
+};
+
+/**
+ * TICKET DE CONSUMO INTERNO (staff meals). NO es DTE tributario.
+ *
+ * Diferencias clave vs BillProforma / FacturaFinal:
+ *   - `folio`: string TI-xxx (no number) — generado por InternalTicketAdapter.
+ *   - `staff`: bloque obligatorio con id + nombre del consumidor.
+ *   - SIN bloque `receiver` SII.
+ *   - SIN bloque `dte` tributario (no hay folio numérico SII).
+ *   - SIN tip_amount (los staff meals no llevan propina).
+ *   - SIN iva (campo presente por shape pero generalmente 0 — la RPC lo
+ *     traspasa como esté en orders.iva_amount).
+ *
+ * El renderer imprime marca legal anti-fraude + footer no-tributario
+ * (siempre, sin toggle) para cerrar el flow anti-fraude que abre mig 084.
+ */
+export type TicketInternoFinalPayload = {
+  order_id: string;
+  order_number: number;
+  table_number?: string | null;
+  guests: number;
+  opened_at: string;
+  waiter_name?: string | null;
+  items: BillItem[];
+  subtotal: number;
+  iva: number;
+  total: number;
+  folio: string;
+  staff: InternalTicketStaffInfo;
+  issued_at: string;
+  payment_amount?: number | null;
+  restaurant: RestaurantPrintInfo;
+  print_options?: TicketInternoFinalOptions;
+  printer?: PrinterPayloadInfo;
+};
+
+/**
+ * Discriminante para ticket_interno_final. El campo distintivo es `staff`
+ * (object con id+name) — ningun otro payload lo tiene. Tambien chequeamos
+ * que folio sea string para distinguir del factura (folio number SII).
+ */
+export function isTicketInternoFinalPayload(
+  p: unknown
+): p is TicketInternoFinalPayload {
+  return (
+    !!p &&
+    typeof p === 'object' &&
+    'items' in p &&
+    Array.isArray((p as TicketInternoFinalPayload).items) &&
+    'total' in p &&
+    'restaurant' in p &&
+    'staff' in p &&
+    typeof (p as TicketInternoFinalPayload).staff === 'object' &&
+    (p as TicketInternoFinalPayload).staff !== null &&
+    'folio' in p &&
+    typeof (p as TicketInternoFinalPayload).folio === 'string'
   );
 }

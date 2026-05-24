@@ -82,6 +82,31 @@ export type CashCloseOptions = {
 };
 
 /**
+ * Toggles para tickets de Consumo Interno (staff meals).
+ *
+ * Mig 089 / agente v0.9.13 — staff meals con marca legal anti-fraude.
+ *
+ * MARCO ANTI-FRAUDE: los siguientes elementos SIEMPRE se imprimen, sin
+ * posibilidad de toggle (audit trail + prevenir uso indebido):
+ *   - Marca legal "CONSUMO INTERNO — NO ES BOLETA" (header destacado)
+ *   - Folio TI-xxx (proviene de dtes.sii_track_id del InternalTicketAdapter)
+ *   - Nombre del staff que consumió (de payments.staff_user_id)
+ *   - Items + total
+ *   - Fecha y hora
+ *   - Footer "Documento NO tributario — Solo control interno"
+ *
+ * Los toggles abajo controlan solo estética/aire/datos opcionales del
+ * emisor. Sin `style` — el layout es unico anti-fraude.
+ */
+export type TicketInternoFinalOptions = {
+  showLogo?: boolean;            // default true (depende de print_logo_path)
+  showSloganEmisor?: boolean;    // default false — doc interno, sin marketing
+  showAddressEmisor?: boolean;   // default false — doc interno, sin contacto
+  density?: PrintDensity;        // default 'normal'
+  fontSize?: FontSize;           // default 'normal'
+};
+
+/**
  * Union helper: el renderer no necesita esta forma pero ayuda a tipear los
  * helpers que reciben "cualquier print_options" para leer `style` o `density`.
  */
@@ -90,4 +115,5 @@ export type AnyPrintOptions =
   | BillProformaOptions
   | KitchenOrderOptions
   | KitchenCancelOptions
-  | CashCloseOptions;
+  | CashCloseOptions
+  | TicketInternoFinalOptions;
