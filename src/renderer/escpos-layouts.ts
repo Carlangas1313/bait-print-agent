@@ -1329,7 +1329,11 @@ function renderCashCloseClassic(
 
   const openedBy = payload.opened_by_name?.trim() || '-';
   const closedBy = payload.closed_by_name?.trim() || '-';
-  tp.println(`Turno: ${openedBy} → ${closedBy}`);
+  // v0.9.15: ASCII '->' en vez de '→' Unicode (U+2192) — el char Unicode
+  // mete garbage en CP858 ("Sof¡a [INTL-CHARSET 8]¢ª Sof«¿a") porque
+  // node-thermal-printer intenta fallback de charset cuando ve UTF-8 fuera
+  // de CP858. Los otros 3 layouts de cash_close ya usan '->' ASCII.
+  tp.println(`Turno: ${openedBy} -> ${closedBy}`);
 
   tp.alignLeft();
   tp.drawLine();
@@ -3699,6 +3703,26 @@ async function renderNotaCreditoFinalClassic(
     payload.dte.nc_amount != null && payload.dte.nc_amount < payload.total
       ? 'MONTO ANULADO'
       : 'TOTAL ANULADO';
+
+  // v0.9.15: desglose Subtotal + IVA del monto anulado (Carlos QA feedback
+  // 2026-05-25). Antes la NC saltaba directo al TOTAL ANULADO sin desglose
+  // tributario, que es inconsistente con la factura original (que sí lo
+  // muestra). El SII requiere que la NC permita conciliar el IVA reversado.
+  //
+  // Si la anulacion es total (nc_amount == total o null), usamos los
+  // payload.subtotal/payload.iva tal cual. Si es parcial, calculamos
+  // proporcionalmente: subtotal = nc_amount/1.19 redondeado, iva = nc_amount
+  // - subtotal. Esto evita drift por redondeo y mantiene la suma exacta.
+  const isPartialNc =
+    payload.dte.nc_amount != null && payload.dte.nc_amount < payload.total;
+  const ncSubtotal = isPartialNc
+    ? Math.round(ncAmount / 1.19)
+    : payload.subtotal;
+  const ncIva = isPartialNc ? ncAmount - ncSubtotal : payload.iva;
+  printAmountRow(tp, 'Subtotal anulado', ncSubtotal);
+  printAmountRow(tp, 'IVA (19%)', ncIva);
+  tp.drawLine();
+
   printXLTotal(tp, totalLabel, ncAmount, fontSize);
   tp.drawLine();
   newLines(tp, sectionGap);
