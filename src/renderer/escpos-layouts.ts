@@ -210,6 +210,39 @@ function printAmountRow(
  * para cada impresora (default 32 sigue funcionando para Rongta 58mm).
  * --------------------------------------------------------------------
  */
+/**
+ * v0.9.16 — Agrupa items idénticos (mismo `name` + `unit_price`) sumando
+ * `quantity` y `subtotal`. Carlos QA feedback 2026-05-25: las precuentas,
+ * boletas, facturas y NC mostraban cada click del mesero como linea
+ * separada (`chorrillana x1` cuatro veces) en vez de consolidar
+ * (`chorrillana x4`).
+ *
+ * Solo se aplica a docs al cliente (Pre-cuenta, Boleta, Factura, NC). NO
+ * se aplica a kitchen_order/kitchen_cancel (la cocina necesita ver
+ * cada line item separado por si tienen mods distintos — y aunque
+ * BillItem no tenga mods, el agrupamiento sigue siendo seguro).
+ *
+ * Firma de "idénticos": `name` exacto + `unit_price` igual (la igualdad de
+ * unit_price evita mezclar happy-hour vs precio normal del mismo
+ * producto en la misma cuenta). Si el web app llega a soportar variantes
+ * con `notes` o `modifiers` en BillItem en el futuro, extender la firma
+ * aqui.
+ */
+function groupBillItems(items: readonly BillItem[]): BillItem[] {
+  const grouped = new Map<string, BillItem>();
+  for (const item of items) {
+    const sig = `${item.name}|${item.unit_price}`;
+    const existing = grouped.get(sig);
+    if (existing) {
+      existing.quantity += item.quantity;
+      existing.subtotal += item.subtotal;
+    } else {
+      grouped.set(sig, { ...item });
+    }
+  }
+  return Array.from(grouped.values());
+}
+
 function printBillItem(tp: Printer, item: BillItem, width: number = ESCPOS_WIDTH): void {
   const amount = formatCLP(item.subtotal);
   const qtyPart = `x${item.quantity}`;
@@ -1427,6 +1460,8 @@ export async function renderBillPreviewEscPos(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // v0.9.16: consolidar items idénticos (Carlos QA feedback 2026-05-25).
+  payload = { ...payload, items: groupBillItems(payload.items) };
   // v0.9.8: aplicar fontSize globalmente al inicio + reset al final para
   // que 'large' afecte TODA la salida del ticket (no solo el header).
   // Los renderers internos siguen llamando applyHeaderFontSize por compat,
@@ -1467,6 +1502,8 @@ export async function renderBillProformaEscPos(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // v0.9.16: consolidar items idénticos (Carlos QA feedback 2026-05-25).
+  payload = { ...payload, items: groupBillItems(payload.items) };
   // v0.9.8: fontSize global (ver nota en renderBillPreviewEscPos).
   const fontSize = getFontSize(payload.print_options);
   applyFontSize(tp, fontSize);
@@ -3521,6 +3558,10 @@ export async function renderFacturaFinalEscPos(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // v0.9.16: consolidar items idénticos (Carlos QA feedback 2026-05-25).
+  // SII-safe: agrupar por (name + unit_price) NO altera subtotal/IVA totales
+  // ni el folio. Solo cambia el detalle visible — la suma final coincide.
+  payload = { ...payload, items: groupBillItems(payload.items) };
   const fontSize = getFontSize(payload.print_options);
   applyFontSize(tp, fontSize);
   try {
@@ -3759,6 +3800,9 @@ export async function renderNotaCreditoFinalEscPos(
   supabase: SupabaseClient | undefined,
   logger: Logger
 ): Promise<void> {
+  // v0.9.16: consolidar items idénticos (Carlos QA feedback 2026-05-25).
+  // SII-safe igual que factura — suma de items y total no cambia.
+  payload = { ...payload, items: groupBillItems(payload.items) };
   const fontSize = getFontSize(payload.print_options);
   applyFontSize(tp, fontSize);
   try {
