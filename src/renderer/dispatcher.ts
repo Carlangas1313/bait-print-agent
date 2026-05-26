@@ -143,7 +143,19 @@ export async function dispatchJob(
    * `getLogoPath` (signed URL + cache). Opcional: si no viene, el helper
    * `printLogoIfEnabled` skipa silencionasmente el logo (no rompe).
    */
-  supabase?: SupabaseClient
+  supabase?: SupabaseClient,
+  /**
+   * v0.9.17: callback para refresh on-demand del cache de printers cuando
+   * el job apunta a un target_printer_id que NO esta en el cache actual.
+   * Cubre el caso comun: user crea una impresora en /settings/printers
+   * y enseguida prueba imprimir, antes del proximo refresh programado
+   * (cada 5 min). Sin esto los primeros jobs fallan con "permanent"
+   * aunque la printer si exista en DB.
+   *
+   * El callback debe (a) re-fetch desde Supabase y (b) actualizar el cache
+   * compartido. Si lanza, se loguea y seguimos con el cache anterior.
+   */
+  refreshPrinters?: () => Promise<PrinterRow[]>
 ): Promise<DispatchResult> {
   try {
     // Caso debug: bypass del renderer productivo. Util en dev y para
@@ -159,7 +171,35 @@ export async function dispatchJob(
     }
 
     // Productivo: imprimir en hardware real via ESC/POS.
-    const printer = pickPrinterForJob(printers, job);
+    let printer = pickPrinterForJob(printers, job);
+
+    // v0.9.17: si el cache miss vino con target_printer_id explicito,
+    // intentamos refresh on-demand antes de fallar permanent. Cubre el bug
+    // que reporto Sobors (2026-05-25): printer creada 1.5 min antes del
+    // primer job y el cache del agente no la tenia hasta el siguiente
+    // refresh programado.
+    if (!printer && job.target_printer_id && refreshPrinters) {
+      logger.info(
+        { jobId: job.id, targetPrinterId: job.target_printer_id },
+        'Cache miss con target_printer_id explicito — refresh on-demand antes de fallar'
+      );
+      try {
+        const fresh = await refreshPrinters();
+        printer = pickPrinterForJob(fresh, job);
+        if (printer) {
+          logger.info(
+            { jobId: job.id, printerName: printer.name },
+            'Refresh on-demand encontro la printer — sigo el dispatch'
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Refresh on-demand fallo, sigo sin printer (el job va a permanent)'
+        );
+      }
+    }
+
     if (!printer) {
       // El "donde" depende del path de routing que tomo pickPrinterForJob:
       //   - target_printer_id seteado -> el caller pidio una printer concreta

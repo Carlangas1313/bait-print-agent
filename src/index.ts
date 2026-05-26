@@ -538,13 +538,29 @@ async function runAgent(): Promise<void> {
   // procesamos un job (sin importar el outcome). Asi el companion puede
   // mostrar "Ultimo job: hace 12s" en su panel.
   // ------------------------------------------------------------------
+  // v0.9.17: callback de refresh on-demand para dispatchJob. Si llega un job
+  // con target_printer_id que no esta en el cache (printer recien creada),
+  // recargamos desde Supabase antes de fallar permanent. Tambien sincronizamos
+  // el printersCache global para que jobs subsiguientes la encuentren sin
+  // refresh.
+  const refreshPrintersOnDemand = async (): Promise<PrinterRow[]> => {
+    const fresh = await loadPrintersForLocation(
+      supabase,
+      config.location_id,
+      logger
+    );
+    printersCache = fresh;
+    return fresh;
+  };
+
   const jobHandler = async (job: Parameters<typeof dispatchJob>[0]) => {
     const result = await dispatchJob(
       job,
       config.debug_renderer,
       printersCache,
       logger,
-      supabase
+      supabase,
+      refreshPrintersOnDemand
     );
     runtimeState.last_job_at = new Date().toISOString();
     return result;
